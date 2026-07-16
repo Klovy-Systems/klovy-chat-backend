@@ -15,7 +15,9 @@ use actix_web_lab::middleware::Next;
 
 use crate::model::bot_token_model::BotToken;
 use crate::model::user_model::User;
+use crate::utils::auth::admin_session::is_admin_user_id;
 use crate::utils::db::get_db;
+use crate::utils::whitelist::is_whitelist_enabled;
 
 #[derive(Debug, Clone)]
 pub struct RequestBotId(pub String);
@@ -62,6 +64,26 @@ pub async fn verify_bot_token(
         let res = HttpResponse::Forbidden()
             .json(serde_json::json!({ "message": "Konto bota jest nieaktywne." }));
         return Ok(ServiceResponse::new(req, res));
+    }
+
+    // Bot runtime must follow the owner's whitelist status.
+    if is_whitelist_enabled() {
+        let owner_ok = match bot.owner_id {
+            Some(owner_oid) => match User::find_by_id(&db, owner_oid).await {
+                Ok(Some(owner)) => {
+                    owner.is_whitelisted || is_admin_user_id(&owner_oid.to_hex())
+                }
+                _ => false,
+            },
+            None => false,
+        };
+        if !owner_ok {
+            let (req, _) = req.into_parts();
+            let res = HttpResponse::Forbidden().json(serde_json::json!({
+                "message": "Właściciel bota nie jest zatwierdzony (whitelist)."
+            }));
+            return Ok(ServiceResponse::new(req, res));
+        }
     }
 
     BotToken::touch_last_used(&db, bot_id).await;

@@ -127,11 +127,14 @@ impl R2Storage {
     }
 
     pub async fn delete_attachment_key(&self, key: &str) -> Result<(), StorageError> {
-        if crate::utils::storage::is_attachment_key(key) {
-            self.delete_public(key).await
-        } else {
-            Ok(())
+        if !crate::utils::storage::is_attachment_key(key) {
+            return Ok(());
         }
+        let result = self.delete_public(key).await;
+        if let Some(thumb) = crate::utils::storage::attachment_thumb_key(key) {
+            let _ = self.delete_public(&thumb).await;
+        }
+        result
     }
 
     pub async fn delete_avatar_key(&self, key: &str) -> Result<(), StorageError> {

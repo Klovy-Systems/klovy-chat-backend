@@ -1,9 +1,8 @@
 use std::io::Cursor;
 use std::path::Path;
 
-use image::codecs::webp::WebPEncoder;
+use image::imageops::FilterType;
 use image::GenericImageView;
-use image::ImageEncoder;
 
 #[derive(Debug)]
 pub enum ImageReencodeError {
@@ -26,13 +25,25 @@ impl std::fmt::Display for ImageReencodeError {
 
 impl std::error::Error for ImageReencodeError {}
 
-pub fn reencode_error_message(err: &ImageReencodeError) -> &'static str {
-    match err {
-        ImageReencodeError::DimensionTooLarge => {
-            "Image dimensions too large. Maximum size is 4096×4096 pixels."
+impl ImageReencodeError {
+    pub fn user_message(&self) -> &'static str {
+        match self {
+            Self::DimensionTooLarge => {
+                "Image dimensions too large. Maximum size is 4096×4096 pixels."
+            }
+            _ => "Invalid image file.",
         }
-        _ => "Invalid image file.",
     }
+}
+
+pub fn reencode_error_message(err: &ImageReencodeError) -> &'static str {
+    err.user_message()
+}
+
+#[derive(Debug, Clone)]
+pub struct EncodedImageVariants {
+    pub full: Vec<u8>,
+    pub thumb: Vec<u8>,
 }
 
 fn read_image_dimensions(bytes: &[u8]) -> Result<(u32, u32), ImageReencodeError> {
@@ -43,7 +54,7 @@ fn read_image_dimensions(bytes: &[u8]) -> Result<(u32, u32), ImageReencodeError>
         .map_err(|_| ImageReencodeError::DecodeFailed)
 }
 
-fn ensure_dimensions_ok(width: u32, height: u32) -> Result<(), ImageReencodeError> {
+fn ensure_source_dimensions_ok(width: u32, height: u32) -> Result<(), ImageReencodeError> {
     let max = crate::utils::upload_limits::MAX_IMAGE_DIMENSION;
     if width == 0 || height == 0 || width > max || height > max {
         return Err(ImageReencodeError::DimensionTooLarge);
@@ -51,24 +62,62 @@ fn ensure_dimensions_ok(width: u32, height: u32) -> Result<(), ImageReencodeErro
     Ok(())
 }
 
-fn reencode_decoded_image(img: image::DynamicImage) -> Result<Vec<u8>, ImageReencodeError> {
+fn resize_to_max_edge(img: image::DynamicImage, max_edge: u32) -> image::DynamicImage {
     let (width, height) = img.dimensions();
-    ensure_dimensions_ok(width, height)?;
-    let rgba = img.to_rgba8();
-
-    let mut out = Vec::new();
-    WebPEncoder::new_lossless(&mut out)
-        .write_image(rgba.as_raw(), width, height, image::ExtendedColorType::Rgba8)
-        .map_err(|_| ImageReencodeError::EncodeFailed)?;
-
-    Ok(out)
+    if width <= max_edge && height <= max_edge {
+        return img;
+    }
+    img.resize(max_edge, max_edge, FilterType::Triangle)
 }
 
-/// Decode an uploaded image and re-encode it as WebP to strip embedded payloads.
+fn encode_lossy_webp(img: &image::DynamicImage, quality: f32) -> Result<Vec<u8>, ImageReencodeError> {
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let encoder = webp::Encoder::from_rgba(rgba.as_raw(), width, height);
+    let encoded = encoder.encode(quality);
+    if encoded.is_empty() {
+        return Err(ImageReencodeError::EncodeFailed);
+    }
+    Ok(encoded.to_vec())
+}
+
+/// Decode an uploaded image, downscale, and re-encode as lossy WebP (full + thumb).
+pub fn reencode_upload_to_webp_variants(source: &Path) -> Result<EncodedImageVariants, ImageReencodeError> {
+    let bytes = std::fs::read(source).map_err(|_| ImageReencodeError::IoFailed)?;
+    let (width, height) = read_image_dimensions(&bytes)?;
+    ensure_source_dimensions_ok(width, height)?;
+    let img = image::load_from_memory(&bytes).map_err(|_| ImageReencodeError::DecodeFailed)?;
+
+    let full_img = resize_to_max_edge(
+        img,
+        crate::utils::upload_limits::MAX_CHAT_IMAGE_EDGE,
+    );
+    let thumb_img = resize_to_max_edge(
+        full_img.clone(),
+        crate::utils::upload_limits::MAX_CHAT_THUMB_EDGE,
+    );
+
+    let full = encode_lossy_webp(
+        &full_img,
+        crate::utils::upload_limits::CHAT_IMAGE_WEBP_QUALITY,
+    )?;
+    let thumb = encode_lossy_webp(
+        &thumb_img,
+        crate::utils::upload_limits::CHAT_THUMB_WEBP_QUALITY,
+    )?;
+
+    Ok(EncodedImageVariants { full, thumb })
+}
+
+/// Avatar/banner: lossy WebP, capped at avatar edge.
 pub fn reencode_upload_to_webp(source: &Path) -> Result<Vec<u8>, ImageReencodeError> {
     let bytes = std::fs::read(source).map_err(|_| ImageReencodeError::IoFailed)?;
     let (width, height) = read_image_dimensions(&bytes)?;
-    ensure_dimensions_ok(width, height)?;
+    ensure_source_dimensions_ok(width, height)?;
     let img = image::load_from_memory(&bytes).map_err(|_| ImageReencodeError::DecodeFailed)?;
-    reencode_decoded_image(img)
+    let resized = resize_to_max_edge(img, crate::utils::upload_limits::MAX_AVATAR_EDGE);
+    encode_lossy_webp(
+        &resized,
+        crate::utils::upload_limits::AVATAR_WEBP_QUALITY,
+    )
 }

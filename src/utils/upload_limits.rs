@@ -1,11 +1,32 @@
-/// Maximum size for chat message attachments (10 MB).
+/// Maximum size for non-image chat attachments (10 MB).
 pub const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Maximum size for chat image uploads before re-encode (3 MB).
+pub const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 3 * 1024 * 1024;
 
 /// Maximum size for profile/channel avatars and banners (5 MB).
 pub const MAX_AVATAR_BYTES: u64 = 5 * 1024 * 1024;
 
-/// Maximum width/height for uploaded images (decompression bomb protection).
+/// Maximum width/height for uploaded source images (decompression bomb protection).
 pub const MAX_IMAGE_DIMENSION: u32 = 4096;
+
+/// Max edge length for stored chat images (full).
+pub const MAX_CHAT_IMAGE_EDGE: u32 = 2048;
+
+/// Max edge length for chat image thumbnails.
+pub const MAX_CHAT_THUMB_EDGE: u32 = 480;
+
+/// Max edge length for avatars/banners after re-encode.
+pub const MAX_AVATAR_EDGE: u32 = 512;
+
+/// Lossy WebP quality for chat full images (0–100).
+pub const CHAT_IMAGE_WEBP_QUALITY: f32 = 80.0;
+
+/// Lossy WebP quality for chat thumbnails (0–100).
+pub const CHAT_THUMB_WEBP_QUALITY: f32 = 70.0;
+
+/// Lossy WebP quality for avatars/banners (0–100).
+pub const AVATAR_WEBP_QUALITY: f32 = 85.0;
 
 /// Maximum pending (not yet sent in a message) attachment uploads per user.
 pub const MAX_PENDING_UPLOADS_PER_USER: u64 = 20;
@@ -32,4 +53,11 @@ pub fn file_bytes_within_limit(size: u64, max: u64) -> bool {
 
 pub fn local_file_size(path: impl AsRef<std::path::Path>) -> Option<u64> {
     std::fs::metadata(path.as_ref()).ok().map(|m| m.len())
+}
+
+pub fn is_image_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "webp"
+    )
 }

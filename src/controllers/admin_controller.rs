@@ -30,6 +30,7 @@ use crate::utils::user::badges::{
 };
 use crate::utils::user::serialize_user::resolve_display_name;
 use crate::utils::validators::badge::{is_valid_badge_icon, normalize_badge_color};
+use crate::utils::validators::pwned_password::{check_password_breach, PasswordBreachCheck};
 use crate::utils::whitelist::is_whitelist_enabled;
 
 fn param<'a>(req: &'a HttpRequest, name: &str) -> &'a str {
@@ -328,6 +329,81 @@ pub async fn set_user_whitelist(req: HttpRequest, body: web::Json<SetWhitelistBo
         Err(_) => HttpResponse::InternalServerError()
             .json(json!({ "error": "Nie udało się zaktualizować whitelisty." })),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetUserPasswordBody {
+    pub new_password: Option<String>,
+}
+
+/// Admin-forced password reset (e.g. forgotten password). Terminates all sessions.
+pub async fn set_user_password(
+    req: HttpRequest,
+    body: web::Json<SetUserPasswordBody>,
+) -> HttpResponse {
+    let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
+        return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
+    };
+
+    let new_password = body.new_password.as_deref().unwrap_or("").trim();
+    if new_password.is_empty() {
+        return HttpResponse::BadRequest().json(json!({
+            "error": "Nowe hasło jest wymagane."
+        }));
+    }
+
+    let db = get_db();
+    let user = match User::find_by_id(&db, uid).await {
+        Ok(Some(u)) => u,
+        _ => return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." })),
+    };
+
+    if user.is_bot {
+        return HttpResponse::BadRequest().json(json!({
+            "error": "Nie można zmienić hasła konta bota."
+        }));
+    }
+
+    match check_password_breach(new_password).await {
+        PasswordBreachCheck::Breached => {
+            return HttpResponse::BadRequest().json(json!({
+                "error": "To hasło pojawiło się w wycieku danych. Wybierz inne, bezpieczniejsze hasło.",
+                "code": "PASSWORD_BREACHED"
+            }));
+        }
+        PasswordBreachCheck::Unavailable => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Nie można teraz zweryfikować hasła. Spróbuj ponownie za chwilę."
+            }));
+        }
+        PasswordBreachCheck::Safe => {}
+    }
+
+    if let Err(e) = User::update_password(&db, uid, new_password).await {
+        log::error!("Admin password reset failed for {}: {e}", uid.to_hex());
+        return HttpResponse::InternalServerError()
+            .json(json!({ "error": "Nie udało się zmienić hasła." }));
+    }
+
+    terminate_user_sessions(&db, uid).await;
+
+    log_admin_action(
+        &req,
+        "user.password.reset",
+        Some("user"),
+        Some(&uid.to_hex()),
+        json!({ "username": user.username }),
+    )
+    .await;
+
+    HttpResponse::Ok().json(json!({
+        "message": "Hasło zostało zresetowane. Użytkownik musi zalogować się ponownie.",
+        "user": {
+            "id": uid.to_hex(),
+            "username": user.username,
+        },
+    }))
 }
 
 #[derive(Deserialize)]

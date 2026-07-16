@@ -28,11 +28,16 @@ use crate::ws::handlers::{dispatch_message, on_user_connected, on_user_disconnec
 use crate::ws::registry::ConnectionRegistry;
 use crate::ws::state::{is_valid_object_id, SocketState};
 use crate::middlewares::auth_middleware::TokenPayload;
+use crate::model::user_model::User;
+use crate::utils::auth::admin_session::is_admin_user_id;
 use crate::utils::auth::jwt_auth::{
     jwt_decoding_key, parse_jwt_from_cookie_header, parse_refresh_from_cookie_header,
     resolve_session_family_id, user_from_jwt_with_refresh,
 };
 use crate::utils::auth::jwt_validation::hs256_validation;
+use crate::utils::db::get_db;
+use crate::utils::whitelist::is_whitelist_enabled;
+use mongodb::bson::oid::ObjectId;
 
 #[derive(Clone)]
 pub struct WsAppState {
@@ -53,7 +58,8 @@ struct IncomingFrame {
     payload: serde_json::Value,
 }
 
-const PING_INTERVAL: Duration = Duration::from_secs(25);
+const PING_INTERVAL: Duration = Duration::from_secs(45);
+const PONG_TIMEOUT: Duration = Duration::from_secs(90);
 const AUTH_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_PAYLOAD: usize = 1_000_000;
 
@@ -110,6 +116,22 @@ pub async fn ws_handler(
     if user_id.is_empty() || jwt_token.is_empty() || !is_valid_object_id(&user_id) {
         log::warn!("WebSocket rejected — missing or invalid JWT cookie");
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    // Whitelist gate: pending users must not get realtime messaging/calls.
+    // Approval is detected via HTTP polling on /pending.
+    if is_whitelist_enabled() && !is_admin_user_id(&user_id) {
+        let allowed = match ObjectId::parse_str(&user_id) {
+            Ok(oid) => match User::find_by_id(&get_db(), oid).await {
+                Ok(Some(u)) => u.is_whitelisted,
+                _ => false,
+            },
+            Err(_) => false,
+        };
+        if !allowed {
+            log::warn!("WebSocket rejected — user {} not whitelisted", user_id);
+            return (StatusCode::FORBIDDEN, "User not whitelisted").into_response();
+        }
     }
 
     let session_family_id = if let Ok(key) = jwt_decoding_key() {
@@ -177,21 +199,15 @@ async fn handle_socket(
     on_user_connected(&user_id).await;
     log::info!("User connected: {}", user_id);
 
-    let ping_tx = tx.clone();
-    let ping_task = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(PING_INTERVAL).await;
-            match ping_tx.try_send(json!({"type":"ping","payload":{}}).to_string()) {
-                Err(mpsc::error::TrySendError::Closed(_)) => break,
-                _ => {}
-            }
-        }
-    });
-
     let state = app_state.socket_state.clone();
     let connected = user_id.clone();
     let mut auth_interval = tokio::time::interval(AUTH_RECHECK_INTERVAL);
     auth_interval.tick().await;
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // First tick completes immediately; skip so the first ping is after PING_INTERVAL.
+    ping_interval.tick().await;
+    let mut last_pong_at = std::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -199,6 +215,20 @@ async fn handle_socket(
                 if *revoke_rx.borrow_and_update() {
                     log::info!("WebSocket session revoked for user {}", user_id);
                     let _ = ws_sender.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+            _ = ping_interval.tick() => {
+                if last_pong_at.elapsed() > PONG_TIMEOUT {
+                    log::info!("WebSocket pong timeout for user {}", user_id);
+                    let _ = ws_sender.send(Message::Close(None)).await;
+                    break;
+                }
+                if ws_sender
+                    .send(Message::Ping(Default::default()))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -213,6 +243,20 @@ async fn handle_socket(
                     log::info!("WebSocket session expired for user {}", user_id);
                     let _ = ws_sender.send(Message::Close(None)).await;
                     break;
+                }
+                if is_whitelist_enabled() && !is_admin_user_id(&user_id) {
+                    let still_allowed = match ObjectId::parse_str(&user_id) {
+                        Ok(oid) => match User::find_by_id(&get_db(), oid).await {
+                            Ok(Some(u)) => u.is_whitelisted,
+                            _ => false,
+                        },
+                        Err(_) => false,
+                    };
+                    if !still_allowed {
+                        log::info!("WebSocket closed — whitelist revoked for {}", user_id);
+                        let _ = ws_sender.send(Message::Close(None)).await;
+                        break;
+                    }
                 }
             }
             msg = rx.recv() => {
@@ -243,10 +287,13 @@ async fn handle_socket(
                             break;
                         }
                         if let Ok(parsed) = serde_json::from_str::<IncomingFrame>(&text) {
+                            // Legacy JSON keepalive — browsers auto-answer protocol pings now.
                             if parsed.msg_type == "pong" {
+                                last_pong_at = std::time::Instant::now();
                                 continue;
                             }
                             if parsed.msg_type == "ping" {
+                                last_pong_at = std::time::Instant::now();
                                 let _ = tx.try_send(json!({"type":"pong","payload":{}}).to_string());
                                 continue;
                             }
@@ -258,7 +305,9 @@ async fn handle_socket(
                             break;
                         }
                     }
-                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Pong(_))) => {
+                        last_pong_at = std::time::Instant::now();
+                    }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(_)) => break,
                     Some(Ok(_)) => {}
@@ -266,8 +315,6 @@ async fn handle_socket(
             }
         }
     }
-
-    ping_task.abort();
     app_state.registry.unregister(&user_id, conn_id).await;
     app_state.socket_state.unregister_connection(&user_id).await;
     app_state

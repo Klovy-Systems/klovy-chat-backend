@@ -70,3 +70,4 @@ zip = "2"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
 aws-sdk-s3 = "1"
+webp = "0.3"

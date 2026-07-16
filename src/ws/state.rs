@@ -12,7 +12,8 @@ pub struct RateLimitEntry {
 
 #[derive(Clone, Default)]
 pub struct SocketState {
-    pub typing_users: Arc<Mutex<HashMap<String, HashMap<String, bool>>>>,
+    /// chat_id → (user_id → last_typing_heartbeat_ms)
+    pub typing_users: Arc<Mutex<HashMap<String, HashMap<String, i64>>>>,
     pub rate_limits: Arc<Mutex<HashMap<String, HashMap<String, RateLimitEntry>>>>,
     pub connections: Arc<Mutex<HashMap<String, u32>>>,
     pub ip_connections: Arc<Mutex<HashMap<String, u32>>>,

@@ -5,12 +5,14 @@ use crate::controllers::admin_controller::{
     admin_logout, admin_session_status, assign_badge, block_user, create_badge,
     delete_badge, delete_channel_admin, delete_user, delete_user_warning, get_user_badges,
     list_badges, list_channel_reports, list_channels, list_user_warnings, list_users, remove_badge,
-    restore_user, set_user_whitelist, unblock_user, update_badge, update_channel_report_status, warn_user,
+    restore_user, set_user_password, set_user_whitelist, unblock_user, update_badge,
+    update_channel_report_status, warn_user,
 };
 use crate::controllers::announcement_controller::{
     create_announcement, delete_announcement, list_admin_announcements, update_announcement,
 };
 use crate::middlewares::admin_auth_middleware::{check_admin_configured, verify_admin_session};
+use crate::middlewares::validation_middleware::validate_password;
 use crate::utils::ratelimit::admin_action_limiter;
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -54,6 +56,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .service(
                 web::resource("/users/{userId}/whitelist")
                     .route(web::patch().to(set_user_whitelist)),
+            )
+            .service(
+                web::resource("/users/{userId}/password")
+                    .wrap(from_fn(validate_password))
+                    .route(web::patch().to(set_user_password)),
             )
             .service(web::resource("/users/{userId}").route(web::delete().to(delete_user)))
             .service(

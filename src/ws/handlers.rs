@@ -82,19 +82,44 @@ async fn set_user_offline(user_id: &str) {
     }
 }
 
-async fn set_availability(user_id: &str, status: &str) {
-    if !is_valid_object_id(user_id) {
-        return;
+fn normalize_availability_status(status: &str) -> &'static str {
+    match status.to_lowercase().as_str() {
+        "away" => "away",
+        "brb" => "brb",
+        "dnd" => "dnd",
+        _ => "online",
     }
-    let status = match status.to_lowercase().as_str() {
-        "away" => AvailabilityStatus::Away,
-        "brb" => AvailabilityStatus::Brb,
-        "dnd" => AvailabilityStatus::Dnd,
-        _ => AvailabilityStatus::Online,
-    };
-    let status_bson = mongodb::bson::to_bson(&status).unwrap_or(Bson::String("online".into()));
+}
+
+async fn set_availability(user_id: &str, status: &str) -> &'static str {
+    let normalized = normalize_availability_status(status);
+    if !is_valid_object_id(user_id) {
+        return normalized;
+    }
     if let Ok(oid) = ObjectId::parse_str(user_id) {
-        let _ = User::set_fields(&get_db(), oid, doc! { "availabilityStatus": status_bson }).await;
+        // Store as plain string (same as HTTP /availability-status).
+        let _ = User::set_fields(
+            &get_db(),
+            oid,
+            doc! { "availabilityStatus": normalized },
+        )
+        .await;
+    }
+    normalized
+}
+
+async fn availability_status_for_user(user_id: &str) -> &'static str {
+    let Ok(oid) = ObjectId::parse_str(user_id) else {
+        return "online";
+    };
+    match User::find_by_id(&get_db(), oid).await {
+        Ok(Some(user)) => match user.availability_status {
+            AvailabilityStatus::Away => "away",
+            AvailabilityStatus::Brb => "brb",
+            AvailabilityStatus::Dnd => "dnd",
+            AvailabilityStatus::Online => "online",
+        },
+        _ => "online",
     }
 }
 
@@ -572,9 +597,15 @@ async fn handle_typing(state: SocketState, connected: &str, payload: TypingPaylo
 
     {
         let mut typing = state.typing_users.lock().await;
+        // Drop stale typing entries (no heartbeat for ~8s).
+        let now = crate::ws::state::now_ms();
+        typing.retain(|_, users| {
+            users.retain(|_, last_ms| now.saturating_sub(*last_ms) < 8_000);
+            !users.is_empty()
+        });
         let chat = typing.entry(chat_id.clone()).or_default();
         if is_typing {
-            chat.insert(user_id.to_string(), true);
+            chat.insert(user_id.to_string(), now);
         } else {
             chat.remove(user_id);
         }
@@ -586,10 +617,11 @@ async fn handle_typing(state: SocketState, connected: &str, payload: TypingPaylo
         let channel_id = chat_id.trim_start_matches("channel_");
         if let Ok(oid) = ObjectId::parse_str(channel_id) {
             if let Ok(Some(channel)) = Channel::find_by_id(&get_db(), oid).await {
-                for m in &channel.members {
-                    registry::emit_to_user(&m.to_hex(), "typing", event.clone());
+                for recipient in registry::channel_recipient_ids(&channel) {
+                    if recipient != user_id {
+                        registry::emit_to_user(&recipient, "typing", event.clone());
+                    }
                 }
-                registry::emit_to_user(&channel.admin.to_hex(), "typing", event);
             }
         }
     } else {
@@ -1216,9 +1248,15 @@ fn emit_rate_limit_error(user_id: &str) {
 
 pub async fn on_user_connected(user_id: &str) {
     set_user_online(user_id).await;
+    // Preserve the user's chosen availability (dnd/away/brb) — only presence flips online.
+    let availability = availability_status_for_user(user_id).await;
     broadcast_user_status(
         user_id,
-        json!({ "isOnline": true, "availabilityStatus": "online", "lastSeen": Value::Null }),
+        json!({
+            "isOnline": true,
+            "availabilityStatus": availability,
+            "lastSeen": Value::Null,
+        }),
     )
     .await;
 }
@@ -1260,11 +1298,17 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
             if let Ok(p) = serde_json::from_value::<TypingPayload>(payload) {
                 // Never rate-limit a "stopped typing" signal: dropping it would
                 // leave the peer's "typing…" indicator stuck on screen. Only
-                // throttle the "started/keeps typing" heartbeats.
-                if p.is_typing.unwrap_or(false)
-                    && !state.check_rate_limit(connected, "typing", 40, 60_000).await
-                {
-                    return;
+                // throttle the "started/keeps typing" heartbeats, per chat.
+                if p.is_typing.unwrap_or(false) {
+                    let chat_key = p
+                        .chat_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("unknown");
+                    let action = format!("typing:{chat_key}");
+                    if !state.check_rate_limit(connected, &action, 20, 60_000).await {
+                        return;
+                    }
                 }
                 handle_typing(state.clone(), connected, p).await;
             }
@@ -1354,10 +1398,14 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
         "set-status" => {
             let status = payload.get("availabilityStatus").and_then(|v| v.as_str());
             if let Some(st) = status {
-                set_availability(connected, st).await;
+                let normalized = set_availability(connected, st).await;
                 broadcast_user_status(
                     connected,
-                    json!({ "isOnline": true, "availabilityStatus": st, "lastSeen": Value::Null }),
+                    json!({
+                        "isOnline": true,
+                        "availabilityStatus": normalized,
+                        "lastSeen": Value::Null,
+                    }),
                 )
                 .await;
             }

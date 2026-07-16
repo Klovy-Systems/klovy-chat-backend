@@ -130,6 +130,10 @@ fn is_object_id_hex(value: &str) -> bool {
 }
 
 fn attachment_filename_is_valid(filename: &str) -> bool {
+    // Thumbnails: `{uuid}.thumb.webp`
+    if let Some(stem) = filename.strip_suffix(".thumb.webp") {
+        return uuid::Uuid::parse_str(stem).is_ok();
+    }
     let Some((name, ext)) = filename.rsplit_once('.') else {
         return false;
     };
@@ -140,6 +144,20 @@ fn attachment_filename_is_valid(filename: &str) -> bool {
         return false;
     }
     uuid::Uuid::parse_str(name).is_ok()
+}
+
+/// Derive thumbnail storage key from a full attachment WebP key.
+/// `…/{uuid}.webp` → `…/{uuid}.thumb.webp`
+pub fn attachment_thumb_key(full_key: &str) -> Option<String> {
+    let normalized = normalize_storage_key(full_key);
+    if normalized.ends_with(".thumb.webp") {
+        return None;
+    }
+    if !normalized.ends_with(".webp") {
+        return None;
+    }
+    let stem = normalized.trim_end_matches(".webp");
+    Some(format!("{stem}.thumb.webp"))
 }
 
 pub fn attachment_key_parts(path: &str) -> Option<(String, String)> {

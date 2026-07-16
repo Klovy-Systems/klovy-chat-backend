@@ -497,8 +497,14 @@ pub async fn run_server() -> std::io::Result<()> {
         res
     }
 
+    // Force HTTP/1.1 for the internal hop. Edge proxies may speak HTTP/2 to Axum,
+    // but re-proxying a fully buffered body over HTTP/2/h2c to Actix is unnecessary
+    // and has caused intermittent multipart/upload failures. Prefer HTTP/1.1 to origin
+    // at Cloudflare/nginx as well when uploads flake.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .http1_only()
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .expect("Failed to build HTTP proxy client");
     let internal_base = format!("http://127.0.0.1:{actual_internal_port}");
@@ -590,8 +596,8 @@ pub async fn run_server() -> std::io::Result<()> {
         let path = req
             .uri()
             .path_and_query()
-            .map(|x| x.as_str())
-            .unwrap_or("/");
+            .map(|x| x.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
         let url = format!("{internal_base}{path}");
 
         let (parts, body) = req.into_parts();
@@ -611,16 +617,35 @@ pub async fn run_server() -> std::io::Result<()> {
                     .unwrap_or_else(|_| Response::new(Body::empty())));
             }
         };
+        let body_len = body_bytes.len();
+
+        // After buffering the body, do not forward hop-by-hop / body framing headers
+        // from the client (esp. after HTTP/2 termination). Let reqwest set Content-Length
+        // from the actual buffered bytes.
+        fn should_strip_request_header(name: &str) -> bool {
+            matches!(
+                name,
+                "host"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "content-encoding"
+                    | "connection"
+                    | "keep-alive"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+                    | "x-real-ip"
+                    | "x-forwarded-for"
+            )
+        }
 
         let mut rb = client.request(method, &url).body(body_bytes);
         for (name, value) in parts.headers.iter() {
             let name_str = name.as_str();
-            if name != http::header::HOST
-                && name_str != "x-real-ip"
-                && name_str != "x-forwarded-for"
-            {
-                rb = rb.header(name, value);
+            if should_strip_request_header(name_str) {
+                continue;
             }
+            rb = rb.header(name, value);
         }
         rb = rb.header("X-Real-IP", client_ip);
         if let Some(secret) = internal_proxy_secret() {
@@ -649,10 +674,13 @@ pub async fn run_server() -> std::io::Result<()> {
                     .unwrap_or_else(|_| Response::new(Body::empty())))
             }
             Err(e) => {
-                log::error!("HTTP proxy to actix failed: {e}");
+                log::error!(
+                    "HTTP proxy to actix failed path={path} body_bytes={body_len}: {e}"
+                );
                 Ok(Response::builder()
                     .status(http::StatusCode::BAD_GATEWAY)
-                    .body(Body::from("Bad Gateway"))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"error":"Bad Gateway","detail":"internal proxy"}"#))
                     .unwrap_or_else(|_| Response::new(Body::empty())))
             }
         }

@@ -1396,7 +1396,18 @@ pub async fn update_availability_status(
     }
 
     let db = get_db();
-    match User::set_fields(&db, oid, doc! { "availabilityStatus": status }).await {
+    // Changing status means the user is active in the client — keep them online
+    // and persist the chosen availability (dnd/away/brb/online).
+    match User::set_fields(
+        &db,
+        oid,
+        doc! {
+            "availabilityStatus": status,
+            "isOnline": true,
+        },
+    )
+    .await
+    {
         Ok(Some(user)) => {
             emit_to_friends(
                 &db,
@@ -1405,7 +1416,7 @@ pub async fn update_availability_status(
                 json!({
                     "userId": user_id,
                     "status": {
-                        "isOnline": user.is_online,
+                        "isOnline": true,
                         "availabilityStatus": status,
                         "lastSeen": serde_json::Value::Null,
                     },

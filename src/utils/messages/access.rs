@@ -174,11 +174,27 @@ pub async fn cleanup_attachment_if_unreferenced(db: &Database, file_url: Option<
             .ok()
             .flatten()
             .unwrap_or(0);
+        let thumb_bytes = if let Some(thumb) = crate::utils::storage::attachment_thumb_key(&path)
+        {
+            storage()
+                .head_public_content_length(&thumb)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         let _ = storage().delete_attachment_key(&path).await;
 
         if let Some((user_id, bytes)) = owner {
-            let decrement = if bytes > 0 { bytes as i64 } else { size as i64 };
+            let measured = size.saturating_add(thumb_bytes);
+            let decrement = if bytes > 0 {
+                bytes as i64
+            } else {
+                measured as i64
+            };
             if decrement > 0 {
                 let _ = crate::model::user_storage_usage_model::UserStorageUsage::adjust(
                     db, user_id, -decrement,
@@ -219,13 +235,30 @@ async fn attachment_stored_size_is_valid(
         _ => return false,
     };
 
-    if actual > crate::utils::upload_limits::MAX_ATTACHMENT_BYTES {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    let is_image = matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "webp"
+    );
+    let max_bytes = if is_image {
+        crate::utils::upload_limits::MAX_IMAGE_ATTACHMENT_BYTES
+    } else {
+        crate::utils::upload_limits::MAX_ATTACHMENT_BYTES
+    };
+    if actual > max_bytes {
         return false;
     }
 
     if let Some(expected) = pending_size {
-        if expected > 0 && actual != expected {
-            return false;
+        if expected > 0 {
+            // Pending size for images includes the thumbnail object bytes.
+            if is_image {
+                if expected < actual {
+                    return false;
+                }
+            } else if actual != expected {
+                return false;
+            }
         }
     }
 
@@ -236,8 +269,6 @@ async fn attachment_stored_size_is_valid(
     // Obrazy są re-enkodowane po stronie serwera do webp, więc zapisany rozmiar
     // różni się od pierwotnego rozmiaru z klienta — nie porównujemy z „claimed"
     // (dokładny rozmiar jest już zweryfikowany powyżej przez pending_size).
-    let ext = path.rsplit('.').next().unwrap_or("");
-    let is_image = matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp");
     if is_image {
         return true;
     }
@@ -283,7 +314,16 @@ pub async fn validate_message_attachment(
                 .map(|size| size > crate::utils::upload_limits::MAX_ATTACHMENT_BYTES)
                 .unwrap_or(false)
             {
-                return false;
+                // Client-reported size is pre-encode; images are capped separately on upload.
+                let path = url.trim().replace('\\', "/");
+                let ext = path.rsplit('.').next().unwrap_or("");
+                let is_image = matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "jpg" | "jpeg" | "png" | "webp"
+                );
+                if !is_image {
+                    return false;
+                }
             }
 
             if url.starts_with("http://") || url.starts_with("https://") {

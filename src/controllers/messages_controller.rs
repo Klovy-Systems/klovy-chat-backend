@@ -16,7 +16,9 @@ use crate::model::user_model::User;
 use crate::utils::attachment_audit::{log_attachment_access, log_attachment_upload};
 use crate::utils::db::get_db;
 use crate::utils::friends::are_friends;
-use crate::utils::image_reencode::{reencode_error_message, reencode_upload_to_webp};
+use crate::utils::image_reencode::{
+    reencode_error_message, reencode_upload_to_webp_variants,
+};
 use crate::utils::access::membership_gate::require_message_participant;
 use crate::utils::messages::{
     access::{cleanup_attachment_if_unreferenced, user_can_access_attachment_path},
@@ -25,10 +27,13 @@ use crate::utils::messages::{
 };
 use crate::utils::validators::sanitize_input::sanitize_message_content;
 use crate::utils::storage::{
-    attachment_dm_key, attachment_group_key, content_type_for_ext,
+    attachment_dm_key, attachment_group_key, attachment_thumb_key, content_type_for_ext,
     is_logical_message_path, storage,
 };
-use crate::utils::upload_limits::{file_bytes_within_limit, local_file_size, MAX_ATTACHMENT_BYTES};
+use crate::utils::upload_limits::{
+    file_bytes_within_limit, is_image_extension, local_file_size, MAX_ATTACHMENT_BYTES,
+    MAX_IMAGE_ATTACHMENT_BYTES,
+};
 use crate::utils::validators::archive_validation::validate_upload_document;
 use crate::utils::validators::file_magic::validate_file_magic;
 
@@ -36,8 +41,9 @@ const SEARCH_LIMIT: i64 = 50;
 const MIN_QUERY_LENGTH: usize = 2;
 
 /// Domyślna i maksymalna liczba wiadomości zwracanych na jedną stronę historii DM.
-const DEFAULT_MESSAGE_LIMIT: i64 = 50;
-const MAX_MESSAGE_LIMIT: i64 = 100;
+const DEFAULT_MESSAGE_LIMIT: i64 = 30;
+const MAX_MESSAGE_LIMIT: i64 = 50;
+const MAX_PINNED_MESSAGES: i64 = 50;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "pdf", "jpg", "jpeg", "png", "webp", "docx", "xlsx", "txt", "webm", "ogg", "wav", "mp4", "m4a",
@@ -163,11 +169,19 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
         return HttpResponse::BadRequest().body("Invalid file content.");
     }
 
+    let is_image = is_image_extension(&ext);
+    let max_upload_bytes = if is_image {
+        MAX_IMAGE_ATTACHMENT_BYTES
+    } else {
+        MAX_ATTACHMENT_BYTES
+    };
     if local_file_size(form.file.file.path())
-        .map(|size| !file_bytes_within_limit(size, MAX_ATTACHMENT_BYTES))
+        .map(|size| !file_bytes_within_limit(size, max_upload_bytes))
         .unwrap_or(true)
     {
-        return HttpResponse::PayloadTooLarge().body("File too large. Maximum size is 10 MB.");
+        let limit_mb = max_upload_bytes / (1024 * 1024);
+        return HttpResponse::PayloadTooLarge()
+            .body(format!("File too large. Maximum size is {limit_mb} MB."));
     }
 
     if original_name.contains("..") || original_name.contains('/') || original_name.contains('\\') {
@@ -190,7 +204,6 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     }
 
     let db = get_db();
-    let is_image = matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp");
     let stored_ext = if is_image { "webp" } else { ext.as_str() };
 
     let logical_path = match context_type.as_str() {
@@ -220,23 +233,29 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
         _ => return HttpResponse::BadRequest().body("Invalid upload context."),
     };
 
-    let body = if is_image {
-        match reencode_upload_to_webp(form.file.file.path()) {
-            Ok(bytes) => bytes,
+    let (body, thumb_body) = if is_image {
+        match reencode_upload_to_webp_variants(form.file.file.path()) {
+            Ok(variants) => (variants.full, Some(variants.thumb)),
             Err(err) => return HttpResponse::BadRequest().body(reencode_error_message(&err)),
         }
     } else {
         match std::fs::read(form.file.file.path()) {
-            Ok(bytes) => bytes,
+            Ok(bytes) => (bytes, None),
             Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error."),
         }
     };
 
-    if !file_bytes_within_limit(body.len() as u64, MAX_ATTACHMENT_BYTES) {
-        return HttpResponse::PayloadTooLarge().body("File too large. Maximum size is 10 MB.");
+    let thumb_size = thumb_body.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+    let file_size = body.len() as u64;
+    let total_stored = file_size.saturating_add(thumb_size);
+
+    if !file_bytes_within_limit(file_size, max_upload_bytes) {
+        let limit_mb = max_upload_bytes / (1024 * 1024);
+        return HttpResponse::PayloadTooLarge()
+            .body(format!("File too large. Maximum size is {limit_mb} MB."));
     }
 
-    if UserStorageUsage::would_exceed(&db, user_oid, body.len() as u64)
+    if UserStorageUsage::would_exceed(&db, user_oid, total_stored)
         .await
         .unwrap_or(true)
     {
@@ -246,7 +265,6 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     }
 
     let file_hash = sha256_hex(&body);
-    let file_size = body.len() as u64;
     let content_type = content_type_for_ext(stored_ext);
     if storage()
         .put_public(&logical_path, body, content_type)
@@ -256,19 +274,31 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
         return HttpResponse::InternalServerError().body("Internal Server Error.");
     }
 
+    let thumb_path = attachment_thumb_key(&logical_path);
+    if let (Some(thumb_bytes), Some(thumb_key)) = (thumb_body, thumb_path.as_ref()) {
+        if storage()
+            .put_public(thumb_key, thumb_bytes, "image/webp")
+            .await
+            .is_err()
+        {
+            let _ = storage().delete_public(&logical_path).await;
+            return HttpResponse::InternalServerError().body("Internal Server Error.");
+        }
+    }
+
     if PendingUpload::register(
         &db,
         user_oid,
         &logical_path,
         &context_type,
         &context_id,
-        file_size,
+        total_stored,
         &file_hash,
     )
     .await
     .is_err()
     {
-        let _ = storage().delete_public(&logical_path).await;
+        let _ = storage().delete_attachment_key(&logical_path).await;
         if PendingUpload::count_for_user(&db, user_oid)
             .await
             .map(|count| count >= crate::utils::upload_limits::MAX_PENDING_UPLOADS_PER_USER)
@@ -280,11 +310,11 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
         return HttpResponse::InternalServerError().body("Internal Server Error.");
     }
 
-    if UserStorageUsage::adjust(&db, user_oid, file_size as i64)
+    if UserStorageUsage::adjust(&db, user_oid, total_stored as i64)
         .await
         .is_err()
     {
-        let _ = storage().delete_public(&logical_path).await;
+        let _ = storage().delete_attachment_key(&logical_path).await;
         let _ = PendingUpload::claim_by_path(&db, user_oid, &logical_path).await;
         return HttpResponse::InternalServerError().body("Internal Server Error.");
     }
@@ -652,6 +682,7 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
         let messages: Vec<Message> = match Message::collection(&db)
             .find(doc! { "channel": channel_oid, "pinned": true, "deleted": { "$ne": true } })
             .sort(doc! { "pinnedAt": -1 })
+            .limit(MAX_PINNED_MESSAGES)
             .await
         {
             Ok(c) => c.try_collect().await.unwrap_or_default(),
@@ -684,6 +715,7 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
         let messages: Vec<Message> = match Message::collection(&db)
             .find(filter)
             .sort(doc! { "pinnedAt": -1 })
+            .limit(MAX_PINNED_MESSAGES)
             .await
         {
             Ok(c) => c.try_collect().await.unwrap_or_default(),

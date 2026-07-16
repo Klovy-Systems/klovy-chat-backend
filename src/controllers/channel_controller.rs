@@ -36,8 +36,8 @@ const REPORT_REASONS: &[&str] = &[
 ];
 
 /// Domyślna i maksymalna liczba wiadomości zwracanych na jedną stronę historii kanału.
-const DEFAULT_CHANNEL_MESSAGE_LIMIT: i64 = 50;
-const MAX_CHANNEL_MESSAGE_LIMIT: i64 = 100;
+const DEFAULT_CHANNEL_MESSAGE_LIMIT: i64 = 30;
+const MAX_CHANNEL_MESSAGE_LIMIT: i64 = 50;
 
 fn param<'a>(req: &'a HttpRequest, name: &str) -> &'a str {
     req.match_info().get(name).unwrap_or("")
