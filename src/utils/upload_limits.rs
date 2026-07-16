@@ -16,8 +16,11 @@ pub const MAX_CHAT_IMAGE_EDGE: u32 = 2048;
 /// Max edge length for chat image thumbnails.
 pub const MAX_CHAT_THUMB_EDGE: u32 = 480;
 
-/// Max edge length for avatars/banners after re-encode.
+/// Max edge length for avatars after re-encode.
 pub const MAX_AVATAR_EDGE: u32 = 512;
+
+/// Max edge length for profile banners after re-encode (matches crop 1024×384).
+pub const MAX_BANNER_EDGE: u32 = 1024;
 
 /// Lossy WebP quality for chat full images (0–100).
 pub const CHAT_IMAGE_WEBP_QUALITY: f32 = 80.0;

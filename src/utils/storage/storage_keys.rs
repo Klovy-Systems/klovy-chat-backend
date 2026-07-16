@@ -20,16 +20,37 @@ pub fn dm_conversation_id(user_a: &str, user_b: &str) -> String {
     format!("conv_{first}_{second}")
 }
 
+fn new_media_version() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn is_media_version(value: &str) -> bool {
+    value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Parse `avatars|banners/.../{oid}.webp` (legacy) or `.../{oid}/{version}.webp`.
+fn parse_owned_media_id<'a>(rest: &'a str) -> Option<&'a str> {
+    let rest = rest.strip_suffix(".webp")?;
+    if let Some((id, version)) = rest.split_once('/') {
+        if !is_media_version(version) {
+            return None;
+        }
+        return Some(id);
+    }
+    Some(rest)
+}
+
+/// Unique key per upload so CDN `immutable` cache cannot serve a stale replace.
 pub fn avatar_user_key(user_id: &str) -> String {
-    format!("avatars/users/{user_id}.webp")
+    format!("avatars/users/{user_id}/{}.webp", new_media_version())
 }
 
 pub fn avatar_channel_key(channel_id: &str) -> String {
-    format!("avatars/channels/{channel_id}.webp")
+    format!("avatars/channels/{channel_id}/{}.webp", new_media_version())
 }
 
 pub fn banner_user_key(user_id: &str) -> String {
-    format!("banners/users/{user_id}.webp")
+    format!("banners/users/{user_id}/{}.webp", new_media_version())
 }
 
 pub fn attachment_dm_key(user_id: &str, recipient_id: &str, filename: &str) -> String {
@@ -54,9 +75,8 @@ pub enum PublicMediaKind {
 
 pub fn avatar_key_parts(path: &str) -> Option<AvatarKind> {
     let normalized = normalize_storage_key(path);
-    if normalized.starts_with("avatars/users/") {
-        let rest = normalized.strip_prefix("avatars/users/")?;
-        let id = rest.strip_suffix(".webp")?;
+    if let Some(rest) = normalized.strip_prefix("avatars/users/") {
+        let id = parse_owned_media_id(rest)?;
         if !is_object_id_hex(id) {
             return None;
         }
@@ -64,9 +84,8 @@ pub fn avatar_key_parts(path: &str) -> Option<AvatarKind> {
             user_id: id.to_string(),
         });
     }
-    if normalized.starts_with("avatars/channels/") {
-        let rest = normalized.strip_prefix("avatars/channels/")?;
-        let id = rest.strip_suffix(".webp")?;
+    if let Some(rest) = normalized.strip_prefix("avatars/channels/") {
+        let id = parse_owned_media_id(rest)?;
         if !is_object_id_hex(id) {
             return None;
         }
@@ -97,9 +116,8 @@ pub fn avatar_key_owned_by_channel(path: &str, channel_id: &str) -> bool {
 
 pub fn public_media_key_parts(path: &str) -> Option<PublicMediaKind> {
     let normalized = normalize_storage_key(path);
-    if normalized.starts_with("banners/users/") {
-        let rest = normalized.strip_prefix("banners/users/")?;
-        let id = rest.strip_suffix(".webp")?;
+    if let Some(rest) = normalized.strip_prefix("banners/users/") {
+        let id = parse_owned_media_id(rest)?;
         if !is_object_id_hex(id) {
             return None;
         }
@@ -234,5 +252,39 @@ pub fn content_type_for_ext(ext: &str) -> &'static str {
         "wav" => "audio/wav",
         "mp4" | "m4a" => "audio/mp4",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_legacy_and_versioned_avatar_keys() {
+        let oid = "507f1f77bcf86cd799439011";
+        let legacy = format!("avatars/users/{oid}.webp");
+        let versioned = format!("avatars/users/{oid}/0123456789abcdef0123456789abcdef.webp");
+        assert!(avatar_key_owned_by_user(&legacy, oid));
+        assert!(avatar_key_owned_by_user(&versioned, oid));
+        assert!(!avatar_key_owned_by_user(&versioned, "507f1f77bcf86cd799439012"));
+    }
+
+    #[test]
+    fn accepts_legacy_and_versioned_banner_keys() {
+        let oid = "507f1f77bcf86cd799439011";
+        let legacy = format!("banners/users/{oid}.webp");
+        let versioned = format!("banners/users/{oid}/fedcba9876543210fedcba9876543210.webp");
+        assert!(public_media_key_owned_by_user(&legacy, oid));
+        assert!(public_media_key_owned_by_user(&versioned, oid));
+    }
+
+    #[test]
+    fn avatar_user_key_is_versioned() {
+        let oid = "507f1f77bcf86cd799439011";
+        let key = avatar_user_key(oid);
+        assert!(key.starts_with(&format!("avatars/users/{oid}/")));
+        assert!(key.ends_with(".webp"));
+        assert!(avatar_key_owned_by_user(&key, oid));
+        assert_ne!(key, avatar_user_key(oid));
     }
 }

@@ -556,14 +556,9 @@ pub async fn upload_channel_avatar(
             .json(json!({ "message": "File too large. Maximum size is 5 MB." }));
     }
 
-    if !channel.image.is_empty() {
-        let channel_id = cid.to_hex();
-        if avatar_key_owned_by_channel(&channel.image, &channel_id) {
-            let _ = storage().delete_avatar_key(&channel.image).await;
-        }
-    }
-
-    let key = avatar_channel_key(&cid.to_hex());
+    let previous_image = channel.image.clone();
+    let channel_id = cid.to_hex();
+    let key = avatar_channel_key(&channel_id);
     let webp = match reencode_upload_to_webp(form.file.file.path()) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -587,7 +582,13 @@ pub async fn upload_channel_avatar(
         )
         .await;
 
-    let channel_id = cid.to_hex();
+    if !previous_image.is_empty()
+        && previous_image != key
+        && avatar_key_owned_by_channel(&previous_image, &channel_id)
+    {
+        let _ = storage().delete_avatar_key(&previous_image).await;
+    }
+
     emit_to_users(
         &channel_recipient_ids(&channel),
         "channel-avatar-updated",

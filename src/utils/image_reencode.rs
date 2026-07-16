@@ -109,13 +109,21 @@ pub fn reencode_upload_to_webp_variants(source: &Path) -> Result<EncodedImageVar
     Ok(EncodedImageVariants { full, thumb })
 }
 
-/// Avatar/banner: lossy WebP, capped at avatar edge.
+/// Avatar: lossy WebP, capped at avatar edge.
 pub fn reencode_upload_to_webp(source: &Path) -> Result<Vec<u8>, ImageReencodeError> {
+    reencode_upload_to_webp_max_edge(source, crate::utils::upload_limits::MAX_AVATAR_EDGE)
+}
+
+/// Banner (or other profile media): lossy WebP with a custom max edge.
+pub fn reencode_upload_to_webp_max_edge(
+    source: &Path,
+    max_edge: u32,
+) -> Result<Vec<u8>, ImageReencodeError> {
     let bytes = std::fs::read(source).map_err(|_| ImageReencodeError::IoFailed)?;
     let (width, height) = read_image_dimensions(&bytes)?;
     ensure_source_dimensions_ok(width, height)?;
     let img = image::load_from_memory(&bytes).map_err(|_| ImageReencodeError::DecodeFailed)?;
-    let resized = resize_to_max_edge(img, crate::utils::upload_limits::MAX_AVATAR_EDGE);
+    let resized = resize_to_max_edge(img, max_edge);
     encode_lossy_webp(
         &resized,
         crate::utils::upload_limits::AVATAR_WEBP_QUALITY,

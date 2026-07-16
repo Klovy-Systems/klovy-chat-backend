@@ -36,7 +36,9 @@ use crate::utils::user::badges::{
     featured_badge_ids_for_response, populate_user_badges, BadgeVisibility,
 };
 use crate::utils::user::serialize_user::{resolve_display_name, serialize_user, BIO_MAX_LENGTH, DISPLAY_NAME_MAX_LENGTH};
-use crate::utils::upload_limits::{file_bytes_within_limit, local_file_size, MAX_AVATAR_BYTES};
+use crate::utils::upload_limits::{
+    file_bytes_within_limit, local_file_size, MAX_AVATAR_BYTES, MAX_BANNER_EDGE,
+};
 use crate::utils::validators::file_magic::validate_file_magic;
 use crate::utils::validators::normalize_username::{is_valid_username, looks_like_email, normalize_username};
 use crate::utils::validators::pwned_password::{check_password_breach, PasswordBreachCheck};
@@ -46,7 +48,9 @@ use crate::utils::whitelist::is_whitelist_enabled;
 
 use crate::utils::app_env::is_production;
 use crate::utils::admin::DELETION_GRACE_DAYS;
-use crate::utils::image_reencode::{reencode_error_message, reencode_upload_to_webp};
+use crate::utils::image_reencode::{
+    reencode_error_message, reencode_upload_to_webp, reencode_upload_to_webp_max_edge,
+};
 use crate::utils::storage::{
     avatar_user_key, avatar_key_owned_by_user, banner_user_key, public_media_key_owned_by_user,
     storage,
@@ -1458,13 +1462,7 @@ pub async fn add_profile_image(
 
     let db = get_db();
     let existing = User::find_by_id(&db, oid).await.ok().flatten();
-    if let Some(user) = &existing {
-        if let Some(image) = &user.image {
-            if avatar_key_owned_by_user(image, &user_id) {
-                let _ = storage().delete_avatar_key(image).await;
-            }
-        }
-    }
+    let previous_image = existing.as_ref().and_then(|user| user.image.clone());
 
     let key = avatar_user_key(&user_id);
     let webp = match reencode_upload_to_webp(form.file.file.path()) {
@@ -1481,6 +1479,11 @@ pub async fn add_profile_image(
 
     match User::set_fields(&db, oid, doc! { "image": &key }).await {
         Ok(Some(user)) => {
+            if let Some(image) = previous_image {
+                if image != key && avatar_key_owned_by_user(&image, &user_id) {
+                    let _ = storage().delete_avatar_key(&image).await;
+                }
+            }
             emit_profile_event(
                 &db,
                 &user_id,
@@ -1568,15 +1571,10 @@ pub async fn add_profile_banner(
         Ok(None) => return HttpResponse::NotFound().body("User not found."),
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error."),
     };
-
-    if let Some(banner) = &user.banner {
-        if public_media_key_owned_by_user(banner, &user_id) {
-            let _ = storage().delete_public_media_key(banner).await;
-        }
-    }
+    let previous_banner = user.banner.clone();
 
     let key = banner_user_key(&user_id);
-    let webp = match reencode_upload_to_webp(form.file.file.path()) {
+    let webp = match reencode_upload_to_webp_max_edge(form.file.file.path(), MAX_BANNER_EDGE) {
         Ok(bytes) => bytes,
         Err(err) => return HttpResponse::BadRequest().body(reencode_error_message(&err)),
     };
@@ -1590,7 +1588,12 @@ pub async fn add_profile_banner(
 
     match User::set_fields(&db, oid, doc! { "banner": &key }).await {
         Ok(Some(user)) => {
-            emit_to_friends(
+            if let Some(banner) = previous_banner {
+                if banner != key && public_media_key_owned_by_user(&banner, &user_id) {
+                    let _ = storage().delete_public_media_key(&banner).await;
+                }
+            }
+            emit_profile_event(
                 &db,
                 &user_id,
                 "profile-banner-updated",
@@ -1630,7 +1633,7 @@ pub async fn remove_profile_banner(req: HttpRequest) -> HttpResponse {
             let _ = storage().delete_public_media_key(banner).await;
         }
         let _ = User::set_fields(&db, oid, doc! { "banner": Bson::Null }).await;
-        emit_to_friends(
+        emit_profile_event(
             &db,
             &user_id,
             "profile-banner-updated",
