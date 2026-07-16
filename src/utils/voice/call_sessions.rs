@@ -152,7 +152,7 @@ pub fn cancel_session(caller_id: &str, callee_id: &str) -> Result<(), CallSessio
     Ok(())
 }
 
-pub fn end_session(user_id: &str, peer_id: &str) -> Result<(), CallSessionError> {
+pub fn end_session(user_id: &str, peer_id: &str) -> Result<CallSession, CallSessionError> {
     maybe_purge_expired();
     let key = pair_key(user_id, peer_id);
     let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
@@ -165,8 +165,8 @@ pub fn end_session(user_id: &str, peer_id: &str) -> Result<(), CallSessionError>
     if !is_participant {
         return Err(CallSessionError::WrongRole);
     }
-    sessions.remove(&key);
-    Ok(())
+    let session = sessions.remove(&key);
+    session.ok_or(CallSessionError::NotFound)
 }
 
 pub fn token_allowed(user_id: &str, peer_id: &str) -> Result<CallSession, CallSessionError> {

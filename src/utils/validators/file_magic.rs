@@ -35,6 +35,10 @@ fn detect_audio_type(data: &[u8]) -> Option<&'static str> {
     if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WAVE" {
         return Some("wav");
     }
+    // MP4 / M4A (Safari & iOS voice notes): an ISO-BMFF `ftyp` box.
+    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        return Some("mp4");
+    }
     None
 }
 
@@ -52,6 +56,7 @@ pub fn validate_file_magic(path: &Path, ext: &str) -> bool {
         "txt" => !data.contains(&0),
         "docx" | "xlsx" => data.starts_with(b"PK\x03\x04"),
         "webm" | "ogg" | "wav" => detect_audio_type(&data) == Some(ext),
+        "mp4" | "m4a" => detect_audio_type(&data) == Some("mp4"),
         _ => false,
     }
 }

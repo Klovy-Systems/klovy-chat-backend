@@ -1,7 +1,18 @@
+use once_cell::sync::Lazy;
 use sha1::{Digest, Sha1};
 use std::time::Duration;
 
 use crate::utils::app_env::is_development;
+
+/// Shared HTTP client so we don't pay TLS/connection-pool setup cost on every
+/// signup or password change. Building a `reqwest::Client` per request was a
+/// measurable source of latency during registration.
+static HIBP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("failed to build HIBP HTTP client")
+});
 
 #[derive(Debug)]
 pub enum PwnedPasswordError {
@@ -37,13 +48,8 @@ pub async fn is_password_pwned(password: &str) -> Result<bool, PwnedPasswordErro
     let hash = sha1_hex_upper(password);
     let (prefix, suffix) = hash.split_at(5);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|_| PwnedPasswordError::RequestFailed)?;
-
     let url = format!("https://api.pwnedpasswords.com/range/{prefix}");
-    let response = client
+    let response = HIBP_CLIENT
         .get(&url)
         .header("User-Agent", "Klovy-Chat-PasswordCheck")
         .header("Add-Padding", "true")

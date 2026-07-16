@@ -8,7 +8,7 @@ use crate::controllers::channel_controller::{
     remove_bot_from_channel, report_channel, toggle_channel_mute, unban_channel_member,
     unmute_channel_member, update_channel_chat_lock, update_channel_slowmode, upload_channel_avatar,
 };
-use crate::controllers::invite_controller::create_invite;
+use crate::controllers::invite_controller::{create_invite, delete_invite, list_invites};
 use crate::middlewares::auth_middleware::{require_active_account, verify_token};
 use crate::utils::ratelimit::{channel_report_limiter, upload_limiter};
 
@@ -24,6 +24,19 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .wrap(from_fn(require_active_account))
             .wrap(from_fn(verify_token))
             .route(web::post().to(create_invite)),
+    );
+    cfg.service(
+        web::resource("/{channelId}/invites")
+            .wrap(from_fn(require_active_account))
+            .wrap(from_fn(verify_token))
+            .route(web::get().to(list_invites))
+            .route(web::post().to(create_invite)),
+    );
+    cfg.service(
+        web::resource("/{channelId}/invites/{inviteId}")
+            .wrap(from_fn(require_active_account))
+            .wrap(from_fn(verify_token))
+            .route(web::delete().to(delete_invite)),
     );
     cfg.service(
         web::resource("/{channelId}/details")

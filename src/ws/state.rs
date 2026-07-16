@@ -18,8 +18,8 @@ pub struct SocketState {
     pub ip_connections: Arc<Mutex<HashMap<String, u32>>>,
 }
 
-const MAX_CONNECTIONS_PER_USER: u32 = 3;
-const MAX_CONNECTIONS_PER_IP: u32 = 15;
+const MAX_CONNECTIONS_PER_USER: u32 = 6;
+const MAX_CONNECTIONS_PER_IP: u32 = 24;
 
 impl SocketState {
     pub fn new() -> Self {

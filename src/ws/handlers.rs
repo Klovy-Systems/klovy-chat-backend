@@ -17,7 +17,7 @@ use crate::utils::db::get_db;
 use crate::utils::friends::{are_friends, is_dm_blocked};
 use crate::utils::voice::call_sessions::{
     accept_session, cancel_session, create_ringing_session, end_session, reject_session,
-    CallSessionError,
+    CallPhase, CallSessionError,
 };
 use crate::utils::validators::sanitize_input::sanitize_message_content;
 use crate::utils::messages::access::{
@@ -994,10 +994,6 @@ async fn handle_call_invite(connected: &str, payload: CallPayload, state: &Socke
         registry::emit_to_user(&from, "call:unavailable", json!({ "to": to, "reason": "NOT_FRIENDS" }));
         return;
     }
-    if !state.is_user_connected(&to).await {
-        registry::emit_to_user(&from, "call:unavailable", json!({ "to": to, "reason": "OFFLINE" }));
-        return;
-    }
 
     let mode = if payload.mode.as_deref() == Some("video") {
         "video"
@@ -1005,6 +1001,8 @@ async fn handle_call_invite(connected: &str, payload: CallPayload, state: &Socke
         "audio"
     };
 
+    // Allow ringing even when the peer is offline / away — they may reconnect,
+    // and a missed-call log is written if nobody answers.
     let session_id = match create_ringing_session(&from, &to, mode) {
         Ok(id) => id,
         Err(CallSessionError::InProgress) => {
@@ -1032,16 +1030,18 @@ async fn handle_call_invite(connected: &str, payload: CallPayload, state: &Socke
         })
     }).unwrap_or(json!({ "_id": from }));
 
-    registry::emit_to_user(
-        &to,
-        "call:incoming",
-        json!({
-            "from": from,
-            "mode": mode,
-            "caller": caller_json,
-            "callSessionId": session_id,
-        }),
-    );
+    if state.is_user_connected(&to).await {
+        registry::emit_to_user(
+            &to,
+            "call:incoming",
+            json!({
+                "from": from,
+                "mode": mode,
+                "caller": caller_json,
+                "callSessionId": session_id,
+            }),
+        );
+    }
 }
 
 async fn handle_call_simple(connected: &str, incoming_event: &str, payload: CallPayload) {
@@ -1071,9 +1071,41 @@ async fn handle_call_simple(connected: &str, incoming_event: &str, payload: Call
             }
             return;
         }
-        "call:reject" => reject_session(&from, &to).is_ok(),
-        "call:cancel" => cancel_session(&from, &to).is_ok(),
-        "call:end" => end_session(&from, &to).is_ok(),
+        "call:reject" => {
+            if reject_session(&from, &to).is_ok() {
+                // Callee declined → missed call for the caller.
+                create_missed_call_log_message(&db, &to, &from).await;
+                true
+            } else {
+                false
+            }
+        }
+        "call:cancel" => {
+            // Caller hung up before answer — no chat log.
+            cancel_session(&from, &to).is_ok()
+        }
+        "call:end" => {
+            match end_session(&from, &to) {
+                Ok(session) => {
+                    registry::emit_to_user(&to, outgoing, json!({ "from": from }));
+                    // Answered call log only when both parties were connected.
+                    if session.phase == CallPhase::Accepted {
+                        if let Some(accepted_at) = session.accepted_at {
+                            let secs = accepted_at.elapsed().as_secs();
+                            create_call_log_message(
+                                &db,
+                                &session.caller_id,
+                                &session.callee_id,
+                                secs,
+                            )
+                            .await;
+                        }
+                    }
+                    return;
+                }
+                Err(_) => return,
+            }
+        }
         _ => false,
     };
     if !session_ok {
@@ -1081,6 +1113,97 @@ async fn handle_call_simple(connected: &str, incoming_event: &str, payload: Call
     }
 
     registry::emit_to_user(&to, outgoing, json!({ "from": from }));
+}
+
+/// Client signals that ringing timed out without an answer.
+async fn handle_call_timeout(connected: &str, payload: CallPayload) {
+    let Some(from) = payload.from else { return };
+    let Some(to) = payload.to else { return };
+    if !is_connected_user(connected, &from) || from == to {
+        return;
+    }
+    let db = get_db();
+    if !are_friends(&db, &from, &to).await {
+        return;
+    }
+    // Only the caller may timeout a ringing session.
+    if cancel_session(&from, &to).is_ok() {
+        registry::emit_to_user(&to, "call:cancelled", json!({ "from": from }));
+        create_missed_call_log_message(&db, &from, &to).await;
+    }
+}
+
+/// Formats a call duration as `H:MM:SS` or `M:SS`.
+fn format_call_duration(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{}:{:02}:{:02}", hours, minutes, seconds)
+    } else {
+        format!("{}:{:02}", minutes, seconds)
+    }
+}
+
+/// Creates a system "voice call" log entry in the DM conversation and broadcasts
+/// it to both participants. Duration is authoritative (server-side).
+async fn create_call_log_message(db: &Database, caller_id: &str, callee_id: &str, duration_secs: u64) {
+    persist_call_log(
+        db,
+        caller_id,
+        callee_id,
+        format!("Voice call · {}", format_call_duration(duration_secs)),
+        duration_secs.saturating_mul(1000).min(u32::MAX as u64) as u32,
+    )
+    .await;
+}
+
+/// Missed / unanswered call — `duration_ms = 0` so the client can render a distinct label.
+async fn create_missed_call_log_message(db: &Database, caller_id: &str, callee_id: &str) {
+    persist_call_log(db, caller_id, callee_id, "Missed call".to_string(), 0).await;
+}
+
+async fn persist_call_log(
+    db: &Database,
+    caller_id: &str,
+    callee_id: &str,
+    content: String,
+    duration_ms: u32,
+) {
+    let (Ok(caller), Ok(callee)) = (
+        ObjectId::parse_str(caller_id),
+        ObjectId::parse_str(callee_id),
+    ) else {
+        return;
+    };
+
+    let input = CreateMessageInput {
+        sender: caller,
+        recipient: Some(callee),
+        channel: None,
+        content,
+        message_type: Some(MessageType::Call),
+        file_url: None,
+        file_type: None,
+        file_size: None,
+        file_name: None,
+        duration_ms: Some(duration_ms),
+        quoted_message: None,
+        mentions: None,
+        mentions_everyone: Some(false),
+    };
+
+    let created = match Message::create(db, input).await {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!("call log create error: {}", e);
+            return;
+        }
+    };
+
+    let populated = serialize_message(db, &created).await;
+    registry::emit_to_user(caller_id, "receiveMessage", populated.clone());
+    registry::emit_to_user(callee_id, "receiveMessage", populated);
 }
 
 fn emit_rate_limit_error(user_id: &str) {
@@ -1113,7 +1236,7 @@ pub async fn on_user_disconnected(user_id: &str) {
 pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, state: &SocketState) {
     match msg_type {
         "sendMessage" => {
-            if !state.check_rate_limit(connected, "sendMessage", 30, 60_000).await {
+            if !state.check_rate_limit(connected, "sendMessage", 60, 60_000).await {
                 emit_rate_limit_error(connected);
                 return;
             }
@@ -1123,7 +1246,7 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
         }
         "send-channel-message" => {
             if !state
-                .check_rate_limit(connected, "send-channel-message", 30, 60_000)
+                .check_rate_limit(connected, "send-channel-message", 60, 60_000)
                 .await
             {
                 emit_rate_limit_error(connected);
@@ -1134,17 +1257,21 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
             }
         }
         "typing" => {
-            if !state.check_rate_limit(connected, "typing", 20, 60_000).await {
-                emit_rate_limit_error(connected);
-                return;
-            }
             if let Ok(p) = serde_json::from_value::<TypingPayload>(payload) {
+                // Never rate-limit a "stopped typing" signal: dropping it would
+                // leave the peer's "typing…" indicator stuck on screen. Only
+                // throttle the "started/keeps typing" heartbeats.
+                if p.is_typing.unwrap_or(false)
+                    && !state.check_rate_limit(connected, "typing", 40, 60_000).await
+                {
+                    return;
+                }
                 handle_typing(state.clone(), connected, p).await;
             }
         }
         "message-reaction" => {
             if !state
-                .check_rate_limit(connected, "message-reaction", 60, 60_000)
+                .check_rate_limit(connected, "message-reaction", 120, 60_000)
                 .await
             {
                 emit_rate_limit_error(connected);
@@ -1156,7 +1283,7 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
         }
         "mark-message-read" => {
             if !state
-                .check_rate_limit(connected, "mark-message-read", 120, 60_000)
+                .check_rate_limit(connected, "mark-message-read", 300, 60_000)
                 .await
             {
                 emit_rate_limit_error(connected);
@@ -1168,7 +1295,7 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
         }
         "mark-conversation-read" => {
             if !state
-                .check_rate_limit(connected, "mark-conversation-read", 30, 60_000)
+                .check_rate_limit(connected, "mark-conversation-read", 60, 60_000)
                 .await
             {
                 emit_rate_limit_error(connected);
@@ -1180,7 +1307,7 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
         }
         "mark-channel-read" => {
             if !state
-                .check_rate_limit(connected, "mark-channel-read", 30, 60_000)
+                .check_rate_limit(connected, "mark-channel-read", 60, 60_000)
                 .await
             {
                 emit_rate_limit_error(connected);
@@ -1191,7 +1318,7 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
             }
         }
         "editMessage" => {
-            if !state.check_rate_limit(connected, "editMessage", 30, 60_000).await {
+            if !state.check_rate_limit(connected, "editMessage", 60, 60_000).await {
                 emit_rate_limit_error(connected);
                 return;
             }
@@ -1200,7 +1327,7 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
             }
         }
         "deleteMessage" => {
-            if !state.check_rate_limit(connected, "deleteMessage", 30, 60_000).await {
+            if !state.check_rate_limit(connected, "deleteMessage", 60, 60_000).await {
                 emit_rate_limit_error(connected);
                 return;
             }
@@ -1251,6 +1378,15 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
             }
             if let Ok(p) = serde_json::from_value::<CallPayload>(payload) {
                 handle_call_simple(connected, msg_type, p).await;
+            }
+        }
+        "call:timeout" => {
+            if !state.check_rate_limit(connected, "call:timeout", 20, 60_000).await {
+                emit_rate_limit_error(connected);
+                return;
+            }
+            if let Ok(p) = serde_json::from_value::<CallPayload>(payload) {
+                handle_call_timeout(connected, p).await;
             }
         }
         _ => {}

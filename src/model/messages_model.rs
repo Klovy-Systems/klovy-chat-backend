@@ -15,6 +15,8 @@ pub enum MessageType {
     Video,
     Audio,
     Sticker,
+    /// System-generated voice/video call log entry (rendered centered in DM).
+    Call,
 }
 
 impl Default for MessageType {
@@ -165,6 +167,14 @@ pub fn is_message_content_within_limit(content: &str) -> bool {
 
 pub fn validate_message(input: &CreateMessageInput) -> Result<(), MessageValidationError> {
     let msg_type = input.message_type.as_ref().unwrap_or(&MessageType::Text);
+
+    // Call log entries are system-generated: no file, content acts as a label.
+    if *msg_type == MessageType::Call {
+        if !is_message_content_within_limit(&input.content) {
+            return Err(MessageValidationError::ContentTooLong);
+        }
+        return Ok(());
+    }
 
     if *msg_type != MessageType::Text && input.file_url.is_none() {
         return Err(MessageValidationError::FileUrlRequired);

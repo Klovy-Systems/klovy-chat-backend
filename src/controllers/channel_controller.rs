@@ -23,7 +23,7 @@ use crate::utils::channel::{
 use crate::ws::registry::{channel_recipient_ids, emit_to_user, emit_to_users};
 use crate::utils::db::get_db;
 use crate::utils::friends::are_friends;
-use crate::utils::messages::serialize_message;
+use crate::utils::messages::serialize_messages_batch;
 use crate::utils::user::serialize_user::resolve_display_name;
 
 const REPORT_REASONS: &[&str] = &[
@@ -272,10 +272,7 @@ pub async fn get_channel_messages(req: HttpRequest) -> HttpResponse {
     }
     messages.reverse();
 
-    let mut out = Vec::with_capacity(messages.len());
-    for m in &messages {
-        out.push(serialize_message(&db, m).await);
-    }
+    let out = serialize_messages_batch(&db, &messages).await;
     HttpResponse::Ok().json(json!({ "messages": out, "hasMore": has_more }))
 }
 

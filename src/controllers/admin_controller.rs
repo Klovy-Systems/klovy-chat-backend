@@ -20,7 +20,7 @@ use crate::utils::auth::admin_session::{
     admin_user_ids_configured, clear_admin_cookie, resolve_admin_user,
 };
 use crate::utils::security::csrf::{csrf_token_for_response};
-use crate::utils::channel::{channel_member_count, populate_channel_user};
+use crate::utils::channel::channel_member_count;
 use crate::ws::registry::{channel_recipient_ids, disconnect_user, emit_to_user, emit_to_users};
 use crate::utils::db::get_db;
 use crate::utils::friends::emit_to_friends;
@@ -573,14 +573,34 @@ pub async fn list_channels(req: HttpRequest) -> HttpResponse {
         }
     };
 
+    // Batch-load channel admins in a single query instead of per-channel lookups.
+    let admin_ids: Vec<ObjectId> = channels.iter().map(|c| c.admin).collect();
+    let mut admin_map: std::collections::HashMap<ObjectId, User> =
+        std::collections::HashMap::new();
+    if !admin_ids.is_empty() {
+        if let Ok(cursor) = User::collection(&db)
+            .find(doc! { "_id": { "$in": &admin_ids } })
+            .await
+        {
+            let users: Vec<User> = cursor.try_collect().await.unwrap_or_default();
+            for u in users {
+                if let Some(id) = u.id {
+                    admin_map.insert(id, u);
+                }
+            }
+        }
+    }
+
     let mut items = Vec::with_capacity(channels.len());
     for ch in &channels {
-        let admin_user = populate_channel_user(&db, ch.admin).await;
-        let admin = json!({
-            "id": admin_user.get("_id").cloned().unwrap_or(Value::Null),
-            "username": admin_user.get("username").cloned().unwrap_or(Value::Null),
-            "displayName": admin_user.get("displayName").cloned().unwrap_or(Value::Null),
-        });
+        let admin = match admin_map.get(&ch.admin) {
+            Some(u) => json!({
+                "id": u.id.map(|o| o.to_hex()),
+                "username": u.username,
+                "displayName": resolve_display_name(u),
+            }),
+            None => json!({ "id": Value::Null, "username": Value::Null, "displayName": Value::Null }),
+        };
 
         items.push(json!({
             "id": ch.id.map(|o| o.to_hex()),

@@ -195,10 +195,31 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
         .map(|u| u.blocked_contacts.iter().map(|o| o.to_hex()).collect())
         .unwrap_or_default();
 
+    // Batch-load all friend users in a single query instead of one lookup each.
+    let other_ids: Vec<ObjectId> = friendships
+        .iter()
+        .map(|f| if f.from == uid { f.to } else { f.from })
+        .collect();
+    let mut friend_map: std::collections::HashMap<ObjectId, User> =
+        std::collections::HashMap::new();
+    if !other_ids.is_empty() {
+        if let Ok(cursor) = User::collection(&db)
+            .find(doc! { "_id": { "$in": &other_ids } })
+            .await
+        {
+            let users: Vec<User> = cursor.try_collect().await.unwrap_or_default();
+            for u in users {
+                if let Some(id) = u.id {
+                    friend_map.insert(id, u);
+                }
+            }
+        }
+    }
+
     let mut contacts = Vec::new();
     for f in &friendships {
         let other_id = if f.from == uid { f.to } else { f.from };
-        let Ok(Some(friend)) = User::find_by_id(&db, other_id).await else {
+        let Some(friend) = friend_map.get(&other_id) else {
             continue;
         };
         let fid = other_id;
@@ -208,15 +229,15 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
         let unread = dm_unread_count(&db, uid, fid).await;
 
         let last_time_ms = last.as_ref().map(|(t, _)| t.timestamp_millis()).unwrap_or(0);
-        let listening_activity = effective_listening(&friend).map(listening_activity_json);
-        let badges = populate_user_badges(&db, &friend, BadgeVisibility::All).await;
+        let listening_activity = effective_listening(friend).map(listening_activity_json);
+        let badges = populate_user_badges(&db, friend, BadgeVisibility::All).await;
 
         contacts.push((
             last_time_ms,
             json!({
                 "_id": fid_hex,
                 "username": friend.username,
-                "displayName": resolve_display_name(&friend),
+                "displayName": resolve_display_name(friend),
                 "bio": friend.bio,
                 "image": friend.image,
                 "banner": friend.banner,
@@ -301,16 +322,32 @@ pub async fn get_blocked_contacts(req: HttpRequest) -> HttpResponse {
         _ => return HttpResponse::NotFound().json(json!({ "message": "Użytkownik nie znaleziony" })),
     };
 
+    let mut blocked_map: std::collections::HashMap<ObjectId, User> =
+        std::collections::HashMap::new();
+    if !user.blocked_contacts.is_empty() {
+        if let Ok(cursor) = User::collection(&db)
+            .find(doc! { "_id": { "$in": &user.blocked_contacts } })
+            .await
+        {
+            let users: Vec<User> = cursor.try_collect().await.unwrap_or_default();
+            for u in users {
+                if let Some(id) = u.id {
+                    blocked_map.insert(id, u);
+                }
+            }
+        }
+    }
+
     let mut blocked = Vec::new();
     for contact_oid in &user.blocked_contacts {
-        let Ok(Some(friend)) = User::find_by_id(&db, *contact_oid).await else {
+        let Some(friend) = blocked_map.get(contact_oid) else {
             continue;
         };
-        let badges = populate_user_badges(&db, &friend, BadgeVisibility::All).await;
+        let badges = populate_user_badges(&db, friend, BadgeVisibility::All).await;
         blocked.push(json!({
             "_id": contact_oid.to_hex(),
             "username": friend.username,
-            "displayName": resolve_display_name(&friend),
+            "displayName": resolve_display_name(friend),
             "image": friend.image,
             "color": friend.color,
             "badges": badges,

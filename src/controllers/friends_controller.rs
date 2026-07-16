@@ -33,6 +33,30 @@ fn iso(dt: &DateTime) -> Option<String> {
     dt.try_to_rfc3339_string().ok()
 }
 
+/// Fetch multiple users in a single query, keyed by id, to avoid N+1 lookups
+/// when rendering friend / request lists.
+async fn fetch_users_map(
+    db: &mongodb::Database,
+    ids: &[ObjectId],
+) -> std::collections::HashMap<ObjectId, User> {
+    let mut map = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return map;
+    }
+    if let Ok(cursor) = User::collection(db)
+        .find(doc! { "_id": { "$in": ids } })
+        .await
+    {
+        let users: Vec<User> = cursor.try_collect().await.unwrap_or_default();
+        for u in users {
+            if let Some(id) = u.id {
+                map.insert(id, u);
+            }
+        }
+    }
+    map
+}
+
 #[derive(Deserialize)]
 pub struct SendFriendRequestBody {
     pub username: Option<String>,
@@ -184,17 +208,22 @@ pub async fn get_received_requests(req: HttpRequest) -> HttpResponse {
         Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
     };
 
-    let mut out = Vec::new();
-    for r in &requests {
-        if let Ok(Some(from_user)) = User::find_by_id(&db, r.from).await {
-            out.push(json!({
-                "_id": r.id.map(|o| o.to_hex()),
-                "from": map_friend_user(&from_user),
-                "status": status_str(&r.status),
-                "createdAt": iso(&r.created_at),
-            }));
-        }
-    }
+    let sender_ids: Vec<ObjectId> = requests.iter().map(|r| r.from).collect();
+    let user_map = fetch_users_map(&db, &sender_ids).await;
+
+    let out: Vec<_> = requests
+        .iter()
+        .filter_map(|r| {
+            user_map.get(&r.from).map(|from_user| {
+                json!({
+                    "_id": r.id.map(|o| o.to_hex()),
+                    "from": map_friend_user(from_user),
+                    "status": status_str(&r.status),
+                    "createdAt": iso(&r.created_at),
+                })
+            })
+        })
+        .collect();
 
     HttpResponse::Ok().json(json!({ "requests": out }))
 }
@@ -217,17 +246,22 @@ pub async fn get_sent_requests(req: HttpRequest) -> HttpResponse {
         Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
     };
 
-    let mut out = Vec::new();
-    for r in &requests {
-        if let Ok(Some(to_user)) = User::find_by_id(&db, r.to).await {
-            out.push(json!({
-                "_id": r.id.map(|o| o.to_hex()),
-                "to": map_friend_user(&to_user),
-                "status": status_str(&r.status),
-                "createdAt": iso(&r.created_at),
-            }));
-        }
-    }
+    let recipient_ids: Vec<ObjectId> = requests.iter().map(|r| r.to).collect();
+    let user_map = fetch_users_map(&db, &recipient_ids).await;
+
+    let out: Vec<_> = requests
+        .iter()
+        .filter_map(|r| {
+            user_map.get(&r.to).map(|to_user| {
+                json!({
+                    "_id": r.id.map(|o| o.to_hex()),
+                    "to": map_friend_user(to_user),
+                    "status": status_str(&r.status),
+                    "createdAt": iso(&r.created_at),
+                })
+            })
+        })
+        .collect();
 
     HttpResponse::Ok().json(json!({ "requests": out }))
 }
@@ -360,13 +394,18 @@ pub async fn get_friends(req: HttpRequest) -> HttpResponse {
         Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
     };
 
-    let mut friends = Vec::new();
-    for f in &friendships {
-        let other_id = if f.from == uid { f.to } else { f.from };
-        if let Ok(Some(other)) = User::find_by_id(&db, other_id).await {
-            friends.push(map_friend_user(&other));
-        }
-    }
+    let ordered_ids: Vec<ObjectId> = friendships
+        .iter()
+        .map(|f| if f.from == uid { f.to } else { f.from })
+        .collect();
+
+    // Fetch all friend users in a single query instead of one lookup per row.
+    let user_map = fetch_users_map(&db, &ordered_ids).await;
+
+    let friends: Vec<_> = ordered_ids
+        .iter()
+        .filter_map(|id| user_map.get(id).map(map_friend_user))
+        .collect();
 
     HttpResponse::Ok().json(json!({ "friends": friends }))
 }

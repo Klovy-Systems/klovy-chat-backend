@@ -26,6 +26,8 @@ pub fn content_security_policy(include_upgrade_insecure: bool) -> String {
         frame-src https://challenges.cloudflare.com; \
         connect-src 'self' https: wss:; \
         img-src 'self' data: blob: https://{cdn_host} https://*.giphy.com; \
+        media-src 'self' data: blob: https://{cdn_host}; \
+        worker-src 'self' blob:; \
         style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
         font-src 'self' https://fonts.gstatic.com; \
         object-src 'none'; \

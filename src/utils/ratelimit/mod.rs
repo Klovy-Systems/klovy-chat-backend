@@ -152,29 +152,33 @@ fn trusted_ips() -> Vec<String> {
         .unwrap_or_default()
 }
 
-static GLOBAL: Lazy<Store> = Lazy::new(|| Store::new(600, Duration::from_secs(15 * 60)));
-static SEND: Lazy<Store> = Lazy::new(|| Store::new(500, Duration::from_secs(60)));
+// NOTE on tuning: limits that gate normal real-time usage (browsing, loading
+// media, uploading, discovery, admin panels) are set generously so production
+// feels responsive. Security-sensitive limits (login/2FA/signup/password/
+// username brute-force) stay strict.
+static GLOBAL: Lazy<Store> = Lazy::new(|| Store::new(1500, Duration::from_secs(15 * 60)));
+static SEND: Lazy<Store> = Lazy::new(|| Store::new(900, Duration::from_secs(60)));
 static AUTH: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
-static LOGIN: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
-static TWO_FACTOR_LOGIN: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
-static SIGNUP: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(60 * 60)));
-static ADMIN_READ: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(5 * 60)));
-static ADMIN_WRITE: Lazy<Store> = Lazy::new(|| Store::new(25, Duration::from_secs(5 * 60)));
-static DISCOVERY: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(60)));
-static REFRESH: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(15 * 60)));
-static UPLOAD: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(60)));
-static ATTACHMENT_ACCESS: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(60)));
-static INVITE_ACCEPT: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
-static FRIEND_REQUEST: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(60 * 60)));
+static LOGIN: Lazy<Store> = Lazy::new(|| Store::new(8, Duration::from_secs(15 * 60)));
+static TWO_FACTOR_LOGIN: Lazy<Store> = Lazy::new(|| Store::new(8, Duration::from_secs(15 * 60)));
+static SIGNUP: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(60 * 60)));
+static ADMIN_READ: Lazy<Store> = Lazy::new(|| Store::new(200, Duration::from_secs(5 * 60)));
+static ADMIN_WRITE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(5 * 60)));
+static DISCOVERY: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
+static REFRESH: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(15 * 60)));
+static UPLOAD: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
+static ATTACHMENT_ACCESS: Lazy<Store> = Lazy::new(|| Store::new(600, Duration::from_secs(60)));
+static INVITE_ACCEPT: Lazy<Store> = Lazy::new(|| Store::new(15, Duration::from_secs(15 * 60)));
+static FRIEND_REQUEST: Lazy<Store> = Lazy::new(|| Store::new(40, Duration::from_secs(60 * 60)));
 static CHANNEL_REPORT: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
 static TWO_FACTOR_MUTATION: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
-static INVITE_PREVIEW: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(15 * 60)));
-static WS_HANDSHAKE: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(60)));
+static INVITE_PREVIEW: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(15 * 60)));
+static WS_HANDSHAKE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
 static CHANGE_PASSWORD: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static CHANGE_USERNAME: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
-static FRIEND_ACTION: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(5 * 60)));
+static FRIEND_ACTION: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(5 * 60)));
 static BOT_MGMT: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(5 * 60)));
-static BOT_SEND: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(60)));
+static BOT_SEND: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
 
 pub async fn global_limiter(
     req: ServiceRequest,

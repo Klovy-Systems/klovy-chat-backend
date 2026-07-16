@@ -21,7 +21,7 @@ use crate::utils::access::membership_gate::require_message_participant;
 use crate::utils::messages::{
     access::{cleanup_attachment_if_unreferenced, user_can_access_attachment_path},
     can_access_channel_messages, can_access_dm_messages, can_pin_message, dm_only_or_clause,
-    escape_regex, serialize_message,
+    escape_regex, serialize_message, serialize_messages_batch,
 };
 use crate::utils::validators::sanitize_input::sanitize_message_content;
 use crate::utils::storage::{
@@ -40,15 +40,11 @@ const DEFAULT_MESSAGE_LIMIT: i64 = 50;
 const MAX_MESSAGE_LIMIT: i64 = 100;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "pdf", "jpg", "jpeg", "png", "webp", "docx", "xlsx", "txt", "webm", "ogg", "wav",
+    "pdf", "jpg", "jpeg", "png", "webp", "docx", "xlsx", "txt", "webm", "ogg", "wav", "mp4", "m4a",
 ];
 
 async fn serialize_all(db: &mongodb::Database, msgs: &[Message]) -> Vec<serde_json::Value> {
-    let mut out = Vec::with_capacity(msgs.len());
-    for m in msgs {
-        out.push(serialize_message(db, m).await);
-    }
-    out
+    serialize_messages_batch(db, msgs).await
 }
 
 #[derive(Deserialize)]

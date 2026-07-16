@@ -5,7 +5,16 @@ static DB: OnceCell<Database> = OnceCell::new();
 
 pub async fn init_db(uri: &str) -> mongodb::error::Result<()> {
     let mut options = mongodb::options::ClientOptions::parse(uri).await?;
-    options.max_pool_size = Some(10);
+    // A pool of 10 throttles the app under concurrent production load. Keep a
+    // warm minimum so requests don't pay connection setup, and allow the pool
+    // to grow for bursts. Overridable via MONGO_MAX_POOL_SIZE.
+    let max_pool = std::env::var("MONGO_MAX_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(50);
+    options.max_pool_size = Some(max_pool);
+    options.min_pool_size = Some(5);
+    options.max_idle_time = Some(std::time::Duration::from_secs(300));
     options.server_selection_timeout = Some(std::time::Duration::from_secs(10));
     options.connect_timeout = Some(std::time::Duration::from_secs(45));
 

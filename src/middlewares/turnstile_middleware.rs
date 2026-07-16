@@ -29,6 +29,8 @@ pub enum TurnstileOutcome {
 #[derive(Deserialize)]
 struct TurnstileResponse {
     success: Option<bool>,
+    #[serde(rename = "error-codes", default)]
+    error_codes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -64,14 +66,17 @@ pub async fn verify_turnstile_token(
     };
 
     let secret = std::env::var("TURNSTILE_SECRET_KEY").unwrap_or_default();
-    let client_ip = crate::utils::client_ip::client_ip_from_http_request(&http_req);
-    let mut verify_body = serde_json::json!({
+
+    // IMPORTANT: We intentionally do NOT send `remoteip`. Behind Cloudflare and
+    // other reverse proxies / mobile carriers the IP the backend derives can
+    // differ from the IP Cloudflare observed when the widget was solved, which
+    // makes siteverify fail for *some* users intermittently ("invalid turnstile
+    // token"). `remoteip` is optional, so omitting it removes that whole class
+    // of false negatives while the token itself still fully validates the user.
+    let verify_body = serde_json::json!({
         "secret": secret,
         "response": token,
     });
-    if client_ip != "unknown" {
-        verify_body["remoteip"] = serde_json::Value::String(client_ip);
-    }
 
     let outcome = match TURNSTILE_CLIENT
         .post(SITEVERIFY_URL)
@@ -81,14 +86,26 @@ pub async fn verify_turnstile_token(
     {
         Ok(resp) => match resp.json::<TurnstileResponse>().await {
             Ok(data) if data.success == Some(true) => TurnstileOutcome::Verified,
-            Ok(_) => {
+            Ok(data) => {
+                log::warn!(
+                    "Turnstile verification failed: error-codes={:?}",
+                    data.error_codes
+                );
                 let res = HttpResponse::BadRequest()
                     .json(serde_json::json!({ "error": "Invalid Turnstile token" }));
                 return Ok(ServiceResponse::new(http_req, res));
             }
-            Err(_) => TurnstileOutcome::Bypassed,
+            Err(e) => {
+                // Could not parse Cloudflare's response — fall back to the guard
+                // instead of hard-failing legitimate users.
+                log::warn!("Turnstile response parse error: {e}");
+                TurnstileOutcome::Bypassed
+            }
         },
-        Err(_) => TurnstileOutcome::Bypassed,
+        Err(e) => {
+            log::warn!("Turnstile siteverify request error: {e}");
+            TurnstileOutcome::Bypassed
+        }
     };
 
     http_req.extensions_mut().insert(outcome);

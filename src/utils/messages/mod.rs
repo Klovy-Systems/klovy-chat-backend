@@ -1,9 +1,11 @@
 pub mod access;
 pub mod mentions;
 
+use futures::stream::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime};
 use mongodb::Database;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 
 use crate::model::channel_model::Channel;
 use crate::model::messages_model::Message;
@@ -128,6 +130,152 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
 
 pub async fn serialize_message(db: &Database, msg: &Message) -> Value {
     serialize_message_inner(db, msg, true).await
+}
+
+fn user_to_json(u: &User) -> Value {
+    json!({
+        "_id": u.id.map(|o| o.to_hex()),
+        "username": u.username,
+        "displayName": resolve_display_name(u),
+        "bio": u.bio,
+        "image": u.image,
+        "color": u.color,
+        "isBot": u.is_bot,
+    })
+}
+
+fn collect_message_user_ids(msg: &Message, set: &mut HashSet<ObjectId>) {
+    set.insert(msg.sender);
+    if let Some(r) = msg.recipient {
+        set.insert(r);
+    }
+    if let Some(p) = msg.pinned_by {
+        set.insert(p);
+    }
+    for m in &msg.mentions {
+        set.insert(*m);
+    }
+}
+
+fn cached_user(users: &HashMap<ObjectId, Value>, id: ObjectId) -> Value {
+    users.get(&id).cloned().unwrap_or(Value::Null)
+}
+
+fn serialize_message_cached(
+    msg: &Message,
+    users: &HashMap<ObjectId, Value>,
+    quoted: Option<&Message>,
+) -> Value {
+    let sender = cached_user(users, msg.sender);
+    let recipient = msg
+        .recipient
+        .map(|r| cached_user(users, r))
+        .unwrap_or(Value::Null);
+    let pinned_by = msg
+        .pinned_by
+        .map(|p| cached_user(users, p))
+        .unwrap_or(Value::Null);
+    let mentions: Vec<Value> = msg.mentions.iter().map(|m| cached_user(users, *m)).collect();
+
+    let quoted = match quoted {
+        Some(qm) => serialize_message_cached(qm, users, None),
+        None => Value::Null,
+    };
+
+    let read_by: Vec<Value> = msg
+        .read_by
+        .iter()
+        .map(|rb| json!({ "user": rb.user.to_hex(), "readAt": iso(&rb.read_at) }))
+        .collect();
+
+    json!({
+        "_id": msg.id.map(|o| o.to_hex()),
+        "sender": sender,
+        "recipient": recipient,
+        "channel": msg.channel.map(|o| o.to_hex()),
+        "content": msg.content,
+        "messageType": serde_json::to_value(&msg.message_type).unwrap_or(Value::Null),
+        "fileUrl": msg.file_url,
+        "fileType": msg.file_type,
+        "fileSize": msg.file_size,
+        "fileName": msg.file_name,
+        "durationMs": msg.duration_ms,
+        "timestamp": iso(&msg.timestamp),
+        "read": msg.read,
+        "readBy": read_by,
+        "reactions": reactions_to_json(msg),
+        "quotedMessage": quoted,
+        "mentions": mentions,
+        "mentionsEveryone": msg.mentions_everyone,
+        "edited": msg.edited,
+        "editedAt": msg.edited_at.as_ref().and_then(iso),
+        "deleted": msg.deleted,
+        "deletedAt": msg.deleted_at.as_ref().and_then(iso),
+        "pinned": msg.pinned,
+        "pinnedAt": msg.pinned_at.as_ref().and_then(iso),
+        "pinnedBy": pinned_by,
+        "createdAt": iso(&msg.created_at),
+        "updatedAt": iso(&msg.updated_at),
+    })
+}
+
+/// Serialize a batch of messages with only three DB round-trips (quoted
+/// messages, then all referenced users), instead of the previous N+1 pattern
+/// that issued several `find_one` calls per message.
+pub async fn serialize_messages_batch(db: &Database, msgs: &[Message]) -> Vec<Value> {
+    if msgs.is_empty() {
+        return Vec::new();
+    }
+
+    // 1. Fetch all quoted messages in one query.
+    let quoted_ids: Vec<ObjectId> = msgs.iter().filter_map(|m| m.quoted_message).collect();
+    let mut quoted_map: HashMap<ObjectId, Message> = HashMap::new();
+    if !quoted_ids.is_empty() {
+        if let Ok(cursor) = Message::collection(db)
+            .find(doc! { "_id": { "$in": &quoted_ids } })
+            .await
+        {
+            let list: Vec<Message> = cursor.try_collect().await.unwrap_or_default();
+            for m in list {
+                if let Some(id) = m.id {
+                    quoted_map.insert(id, m);
+                }
+            }
+        }
+    }
+
+    // 2. Gather every referenced user id (from messages and their quotes).
+    let mut user_ids: HashSet<ObjectId> = HashSet::new();
+    for m in msgs {
+        collect_message_user_ids(m, &mut user_ids);
+    }
+    for m in quoted_map.values() {
+        collect_message_user_ids(m, &mut user_ids);
+    }
+
+    // 3. Fetch all users in one query and build a lookup cache.
+    let mut user_map: HashMap<ObjectId, Value> = HashMap::new();
+    if !user_ids.is_empty() {
+        let ids: Vec<ObjectId> = user_ids.into_iter().collect();
+        if let Ok(cursor) = User::collection(db)
+            .find(doc! { "_id": { "$in": &ids } })
+            .await
+        {
+            let users: Vec<User> = cursor.try_collect().await.unwrap_or_default();
+            for u in users {
+                if let Some(id) = u.id {
+                    user_map.insert(id, user_to_json(&u));
+                }
+            }
+        }
+    }
+
+    msgs.iter()
+        .map(|m| {
+            let quoted = m.quoted_message.and_then(|q| quoted_map.get(&q));
+            serialize_message_cached(m, &user_map, quoted)
+        })
+        .collect()
 }
 
 pub async fn can_pin_message(db: &Database, user_id: &str, msg: &Message) -> bool {
