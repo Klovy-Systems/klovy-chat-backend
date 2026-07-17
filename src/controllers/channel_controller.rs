@@ -233,6 +233,10 @@ pub async fn get_channel_messages(req: HttpRequest) -> HttpResponse {
         }
     };
 
+    let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
+        return HttpResponse::BadRequest().json(json!({ "message": "Invalid channel id" }));
+    };
+
     let query = web::Query::<std::collections::HashMap<String, String>>::from_query(req.query_string())
         .map(|q| q.into_inner())
         .unwrap_or_default();
@@ -270,6 +274,7 @@ pub async fn get_channel_messages(req: HttpRequest) -> HttpResponse {
     if has_more {
         messages.truncate(limit as usize);
     }
+    messages.retain(|m| m.channel == Some(channel_oid));
     messages.reverse();
 
     let out = serialize_messages_batch(&db, &messages).await;

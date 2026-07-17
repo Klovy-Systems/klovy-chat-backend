@@ -14,12 +14,11 @@ use crate::model::user_storage_usage_model::UserStorageUsage;
 use crate::utils::file_hash::sha256_hex;
 use crate::model::user_model::User;
 use crate::utils::attachment_audit::{log_attachment_access, log_attachment_upload};
+use crate::utils::access::membership_gate::{require_dm_access, require_message_participant};
 use crate::utils::db::get_db;
-use crate::utils::friends::are_friends;
 use crate::utils::image_reencode::{
     reencode_error_message, reencode_upload_to_webp_variants,
 };
-use crate::utils::access::membership_gate::require_message_participant;
 use crate::utils::messages::{
     access::{cleanup_attachment_if_unreferenced, user_can_access_attachment_path},
     can_access_channel_messages, can_access_dm_messages, can_pin_message, dm_only_or_clause,
@@ -65,11 +64,20 @@ pub struct GetMessagesBody {
 }
 
 pub async fn get_messages(req: HttpRequest, body: web::Json<GetMessagesBody>) -> HttpResponse {
-    let user1 = request_user_id(&req).unwrap_or_default();
+    let Some(user1) = request_user_id(&req) else {
+        return HttpResponse::Unauthorized().json(json!({
+            "error": "UNAUTHORIZED",
+            "message": "Authentication required.",
+        }));
+    };
     let user2 = body.id.clone().unwrap_or_default();
 
     if user1.is_empty() || user2.is_empty() {
         return HttpResponse::BadRequest().body("Both user IDs are required.");
+    }
+
+    if user1 == user2 {
+        return HttpResponse::BadRequest().body("Invalid contact.");
     }
 
     let (Ok(u1), Ok(u2)) = (ObjectId::parse_str(&user1), ObjectId::parse_str(&user2)) else {
@@ -77,10 +85,10 @@ pub async fn get_messages(req: HttpRequest, body: web::Json<GetMessagesBody>) ->
     };
 
     let db = get_db();
-    if !are_friends(&db, &user1, &user2).await {
+    if let Err(reason) = require_dm_access(&db, &user1, &user2).await {
         return HttpResponse::Forbidden().json(json!({
-            "error": "NOT_FRIENDS",
-            "message": "Możesz przeglądać wiadomości tylko ze znajomymi.",
+            "error": "ACCESS_DENIED",
+            "message": reason.as_str(),
         }));
     }
 
@@ -123,6 +131,12 @@ pub async fn get_messages(req: HttpRequest, body: web::Json<GetMessagesBody>) ->
     if has_more {
         messages.truncate(limit as usize);
     }
+    // Defense-in-depth: never return messages outside this DM pair.
+    messages.retain(|m| {
+        m.recipient.is_some()
+            && ((m.sender == u1 && m.recipient == Some(u2))
+                || (m.sender == u2 && m.recipient == Some(u1)))
+    });
     messages.reverse();
 
     let out = serialize_all(&db, &messages).await;
@@ -721,6 +735,12 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
             Ok(c) => c.try_collect().await.unwrap_or_default(),
             Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
         };
+        let mut messages = messages;
+        messages.retain(|m| {
+            m.recipient.is_some()
+                && ((m.sender == uid && m.recipient == Some(cid))
+                    || (m.sender == cid && m.recipient == Some(uid)))
+        });
         let out = serialize_all(&db, &messages).await;
         return HttpResponse::Ok().json(json!({ "messages": out }));
     }
@@ -809,6 +829,12 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
             Ok(c) => c.try_collect().await.unwrap_or_default(),
             Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
         };
+        let mut messages = messages;
+        messages.retain(|m| {
+            m.recipient.is_some()
+                && ((m.sender == uid && m.recipient == Some(cid))
+                    || (m.sender == cid && m.recipient == Some(uid)))
+        });
         let out = serialize_all(&db, &messages).await;
         return HttpResponse::Ok().json(json!({ "messages": out }));
     }

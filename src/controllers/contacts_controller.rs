@@ -225,8 +225,16 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
         let fid = other_id;
         let fid_hex = fid.to_hex();
 
-        let last = dm_last_message(&db, uid, fid).await;
-        let unread = dm_unread_count(&db, uid, fid).await;
+        let last = if blocked.contains(&fid_hex) {
+            None
+        } else {
+            dm_last_message(&db, uid, fid).await
+        };
+        let unread = if blocked.contains(&fid_hex) {
+            0
+        } else {
+            dm_unread_count(&db, uid, fid).await
+        };
 
         let last_time_ms = last.as_ref().map(|(t, _)| t.timestamp_millis()).unwrap_or(0);
         let listening_activity = effective_listening(friend).map(listening_activity_json);

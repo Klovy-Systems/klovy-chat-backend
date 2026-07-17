@@ -5,7 +5,7 @@ use crate::model::channel_model::Channel;
 use crate::utils::channel::{
     can_access_channel, is_channel_admin, is_channel_muted_member,
 };
-use crate::utils::friends::are_friends;
+use crate::utils::friends::{are_friends, is_dm_blocked};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessDeniedReason {
@@ -15,6 +15,7 @@ pub enum AccessDeniedReason {
     Banned,
     Muted,
     NotFriends,
+    Blocked,
 }
 
 impl AccessDeniedReason {
@@ -26,6 +27,7 @@ impl AccessDeniedReason {
             Self::Banned => "You are banned from this channel",
             Self::Muted => "You are muted in this channel",
             Self::NotFriends => "Not friends with this user",
+            Self::Blocked => "This conversation is not available",
         }
     }
 }
@@ -79,6 +81,9 @@ pub async fn require_dm_access(
     if !are_friends(db, user_id, contact_id).await {
         return Err(AccessDeniedReason::NotFriends);
     }
+    if is_dm_blocked(db, user_id, contact_id).await {
+        return Err(AccessDeniedReason::Blocked);
+    }
     Ok(())
 }
 
@@ -108,6 +113,9 @@ pub async fn require_message_participant(
         };
         if !are_friends(db, user_id, &other).await {
             return Err(AccessDeniedReason::NotFriends);
+        }
+        if is_dm_blocked(db, user_id, &other).await {
+            return Err(AccessDeniedReason::Blocked);
         }
         return Ok(());
     }

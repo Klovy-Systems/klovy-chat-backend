@@ -752,7 +752,7 @@ async fn handle_mark_conversation_read(connected: &str, payload: MarkConversatio
         return;
     }
     let db = get_db();
-    if !are_friends(&db, &user_id, &contact_id).await {
+    if require_dm_access(&db, &user_id, &contact_id).await.is_err() {
         return;
     }
     let (Ok(uid), Ok(cid)) = (ObjectId::parse_str(&user_id), ObjectId::parse_str(&contact_id)) else {

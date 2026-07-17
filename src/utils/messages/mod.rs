@@ -12,7 +12,7 @@ use crate::model::messages_model::Message;
 use crate::model::user_model::User;
 use crate::utils::access::membership_gate::require_channel_access;
 use crate::utils::channel::{can_access_channel, is_channel_admin};
-use crate::utils::friends::are_friends;
+use crate::utils::access::membership_gate::require_dm_access;
 use crate::utils::user::serialize_user::resolve_display_name;
 
 pub fn dm_only_or_clause() -> Bson {
@@ -301,14 +301,17 @@ pub async fn can_pin_message(db: &Database, user_id: &str, msg: &Message) -> boo
             return false;
         }
         let other_id = if user_id == sender_id { recipient_id } else { sender_id };
-        return are_friends(db, user_id, &other_id).await;
+        if require_dm_access(db, user_id, &other_id).await.is_err() {
+            return false;
+        }
+        return true;
     }
 
     false
 }
 
 pub async fn can_access_dm_messages(db: &Database, user_id: &str, contact_id: &str) -> bool {
-    are_friends(db, user_id, contact_id).await
+    require_dm_access(db, user_id, contact_id).await.is_ok()
 }
 
 pub async fn can_access_channel_messages(
