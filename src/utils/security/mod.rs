@@ -3,6 +3,7 @@ pub mod client_id;
 pub mod client_environment;
 pub mod client_user_agent;
 pub mod constant_time;
+pub mod cors;
 pub mod csp;
 pub mod csrf;
 pub mod origin;

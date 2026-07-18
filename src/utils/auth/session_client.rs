@@ -136,20 +136,84 @@ pub fn normalize_browser_name(browser: &str) -> String {
     }
 }
 
+fn detect_browser_family(value: &str) -> Option<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("edg") {
+        Some("edge")
+    } else if lower.contains("opr") || lower.contains("opera") {
+        Some("opera")
+    } else if lower.contains("vivaldi") {
+        Some("vivaldi")
+    } else if lower.contains("firefox") || lower.contains("fxios") {
+        Some("firefox")
+    } else if lower.contains("brave") {
+        Some("brave")
+    } else if lower.contains("crios") || lower.contains("chrome") || lower.contains("chromium") {
+        Some("chrome")
+    } else if lower.contains("safari") {
+        Some("safari")
+    } else {
+        None
+    }
+}
+
+fn detect_os_family(value: &str) -> Option<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("android") {
+        Some("android")
+    } else if lower.contains("iphone") || lower.contains("ipad") || lower.contains("ios") {
+        Some("ios")
+    } else if lower.contains("windows") || lower.contains("win32") || lower.contains("win64") {
+        Some("windows")
+    } else if lower.contains("mac") || lower.contains("darwin") {
+        Some("macos")
+    } else if lower.contains("linux") || lower.contains("ubuntu") || lower.contains("x11") {
+        Some("linux")
+    } else {
+        None
+    }
+}
+
+fn client_environment_matches_user_agent(
+    reported_browser: &str,
+    reported_os: &str,
+    ua: &str,
+) -> bool {
+    let ua_info = fallback_from_user_agent(ua);
+    let ua_browser_family = detect_browser_family(&ua_info.browser);
+    let reported_browser_family = detect_browser_family(reported_browser);
+    let ua_os_family = detect_os_family(&ua_info.os);
+    let reported_os_family = detect_os_family(reported_os);
+
+    let browser_ok = match (ua_browser_family, reported_browser_family) {
+        (Some(expected), Some(reported)) => expected == reported,
+        (None, _) => true,
+        (Some(_), None) => false,
+    };
+    let os_ok = match (ua_os_family, reported_os_family) {
+        (Some(expected), Some(reported)) => expected == reported,
+        (None, _) => true,
+        (Some(_), None) => false,
+    };
+
+    browser_ok && os_ok
+}
+
 pub fn resolve_client_info(ua: &str, env: &ClientEnvironmentHints) -> ClientInfo {
     if let (Some(browser), Some(os)) = (
         sanitize_client_label(env.browser.as_ref()),
         sanitize_client_label(env.os.as_ref()),
     ) {
         let browser = normalize_browser_name(&browser);
-        let label = sanitize_client_label(env.label.as_ref())
-            .unwrap_or_else(|| format!("{browser} on {os}"));
-        return ClientInfo {
-            browser,
-            os,
-            label,
-            is_known: true,
-        };
+        if client_environment_matches_user_agent(&browser, &os, ua) {
+            let label = format!("{browser} on {os}");
+            return ClientInfo {
+                browser,
+                os,
+                label,
+                is_known: true,
+            };
+        }
     }
 
     fallback_from_user_agent(ua)
@@ -169,8 +233,8 @@ mod tests {
     }
 
     #[test]
-    fn prefers_client_reported_environment() {
-        let ua = "Mozilla/5.0";
+    fn prefers_client_reported_environment_when_consistent_with_user_agent() {
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
         let info = resolve_client_info(
             ua,
             &env(
@@ -181,6 +245,36 @@ mod tests {
         assert_eq!(info.browser, "Google Chrome 120.0");
         assert_eq!(info.os, "Windows 15.0 · x86 · 64-bit");
         assert_eq!(info.label, "Google Chrome 120.0 on Windows 15.0 · x86 · 64-bit");
+    }
+
+    #[test]
+    fn rejects_spoofed_client_environment() {
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
+        let info = resolve_client_info(
+            ua,
+            &ClientEnvironmentHints {
+                browser: Some("Firefox 121.0".to_string()),
+                os: Some("Ubuntu · Linux x86_64".to_string()),
+                label: Some("Firefox 121.0 on Ubuntu · Linux x86_64".to_string()),
+            },
+        );
+        assert_eq!(info.browser, "Chrome 120.0");
+        assert_eq!(info.os, "Windows NT 10.0 · x64");
+        assert_eq!(info.label, "Chrome 120.0 on Windows NT 10.0 · x64");
+    }
+
+    #[test]
+    fn ignores_spoofed_client_label() {
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
+        let info = resolve_client_info(
+            ua,
+            &ClientEnvironmentHints {
+                browser: Some("Chrome 120.0".to_string()),
+                os: Some("Windows NT 10.0 · x64".to_string()),
+                label: Some("Totally fake session label".to_string()),
+            },
+        );
+        assert_eq!(info.label, "Chrome 120.0 on Windows NT 10.0 · x64");
     }
 
     #[test]

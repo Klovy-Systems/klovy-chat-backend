@@ -540,6 +540,8 @@ pub async fn run_server() -> std::io::Result<()> {
     use http::Method;
     use tower_http::cors::AllowOrigin;
 
+    use crate::utils::security::cors::CORS_ALLOWED_REQUEST_HEADERS;
+
     let origin_headers: Vec<HeaderValue> = allowed_origins
         .iter()
         .filter_map(|origin| origin.parse().ok())
@@ -563,21 +565,14 @@ pub async fn run_server() -> std::io::Result<()> {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([
-            header::CONTENT_TYPE,
-            header::AUTHORIZATION,
-            header::ACCEPT,
-            header::ACCEPT_LANGUAGE,
-            header::ACCEPT_ENCODING,
-            HeaderName::from_static("x-requested-with"),
-            HeaderName::from_static("x-csrf-token"),
-            HeaderName::from_static("x-client-version"),
-            HeaderName::from_static("x-klovy-client"),
-            HeaderName::from_static("x-klovy-user-agent"),
-            HeaderName::from_static("x-klovy-client-browser"),
-            HeaderName::from_static("x-klovy-client-os"),
-            HeaderName::from_static("x-klovy-client-label"),
-        ])
+        // Jawna lista zsynchronizowana z `utils/security/cors.rs` (bez mirror_request).
+        .allow_headers(
+            CORS_ALLOWED_REQUEST_HEADERS
+                .iter()
+                .copied()
+                .map(HeaderName::from_static)
+                .collect::<Vec<_>>(),
+        )
         .expose_headers([
             header::CONTENT_DISPOSITION,
             HeaderName::from_static("x-total-count"),

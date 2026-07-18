@@ -1,5 +1,6 @@
 use std::env;
 
+use actix_web::http::Method;
 use http::HeaderMap;
 
 fn push_origin(origins: &mut Vec<String>, origin: &str) {
@@ -54,33 +55,128 @@ pub fn origin_allowed(value: &str, allowed: &[String]) -> bool {
         .any(|origin| value == origin || value.starts_with(&format!("{origin}/")))
 }
 
-pub fn is_origin_header_allowed(headers: &HeaderMap) -> bool {
-    let allowed = allowed_origins();
+/// Ścieżki zwolnione z kontroli Origin (media w tagach HTML, OAuth redirect, boty S2S).
+pub fn is_origin_guard_exempt(path: &str) -> bool {
+    path == "/api"
+        || path == "/api/"
+        || path.starts_with("/api/security")
+        || path.starts_with("/api/bot/")
+        || path.starts_with("/api/messages/attachment")
+        || path.starts_with("/api/messages/download-file")
+        || path.starts_with("/api/integrations/spotify/callback")
+}
+
+pub fn requires_origin_guard(method: &Method, path: &str) -> bool {
+    if *method == Method::OPTIONS || is_origin_guard_exempt(path) {
+        return false;
+    }
+    path.starts_with("/api") || path.starts_with("/whitelist")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginGuardMode {
+    /// Mutacje w produkcji: wymagany poprawny Origin lub Referer.
+    Strict,
+    /// GET/HEAD: odrzucaj tylko gdy Origin/Referer są obecne i niedozwolone.
+    RejectKnownBad,
+}
+
+pub fn validate_browser_origin(
+    headers: &HeaderMap,
+    allowed: &[String],
+    mode: OriginGuardMode,
+) -> bool {
     let origin = headers
         .get("origin")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .and_then(|v| v.to_str().ok());
     let referer = headers
         .get("referer")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .and_then(|v| v.to_str().ok());
+    validate_browser_origin_values(origin, referer, allowed, mode)
+}
 
-    let origin_ok = origin
-        .as_deref()
-        .map(|value| origin_allowed(value, &allowed));
-    // Referer to pełny URL — używamy tej samej logiki co dla Origin (dopasowanie
-    // dokładne lub z separatorem `/`), aby zapobiec obejściu prefiksowemu typu
-    // `https://klovy.chat.evil.com`.
-    let referer_ok = referer
-        .as_deref()
-        .map(|value| origin_allowed(value, &allowed));
+pub fn validate_browser_origin_values(
+    origin: Option<&str>,
+    referer: Option<&str>,
+    allowed: &[String],
+    mode: OriginGuardMode,
+) -> bool {
+    let origin_ok = origin.map(|value| origin_allowed(value, allowed));
+    let referer_ok = referer.map(|value| origin_allowed(value, allowed));
 
-    if crate::utils::app_env::is_production() {
-        origin_ok == Some(true) || referer_ok == Some(true)
-    } else {
-        match (origin_ok, referer_ok) {
-            (Some(false), _) | (None, Some(false)) => false,
-            _ => true,
+    match mode {
+        OriginGuardMode::Strict => {
+            if crate::utils::app_env::is_production() {
+                origin_ok == Some(true) || referer_ok == Some(true)
+            } else {
+                !matches!(
+                    (origin_ok, referer_ok),
+                    (Some(false), _) | (None, Some(false))
+                )
+            }
         }
+        OriginGuardMode::RejectKnownBad => {
+            if origin_ok == Some(false) || referer_ok == Some(false) {
+                return false;
+            }
+            if crate::utils::app_env::is_production() {
+                return true;
+            }
+            !matches!(
+                (origin_ok, referer_ok),
+                (Some(false), _) | (None, Some(false))
+            )
+        }
+    }
+}
+
+pub fn is_origin_header_allowed(headers: &HeaderMap) -> bool {
+    let allowed = allowed_origins();
+    validate_browser_origin(headers, &allowed, OriginGuardMode::Strict)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_requires_allowed_origin_in_production() {
+        let allowed = vec!["https://app.klovy.chat".to_string()];
+        assert!(validate_browser_origin_values(
+            Some("https://app.klovy.chat"),
+            None,
+            &allowed,
+            OriginGuardMode::Strict,
+        ));
+        assert!(!validate_browser_origin_values(
+            Some("https://evil.com"),
+            None,
+            &allowed,
+            OriginGuardMode::Strict,
+        ));
+    }
+
+    #[test]
+    fn reject_known_bad_blocks_invalid_get_origin() {
+        let allowed = vec!["https://app.klovy.chat".to_string()];
+        assert!(!validate_browser_origin_values(
+            Some("https://evil.com"),
+            None,
+            &allowed,
+            OriginGuardMode::RejectKnownBad,
+        ));
+        assert!(validate_browser_origin_values(
+            None,
+            None,
+            &allowed,
+            OriginGuardMode::RejectKnownBad,
+        ));
+    }
+
+    #[test]
+    fn origin_allowed_rejects_prefix_bypass() {
+        let allowed = vec!["https://app.klovy.chat".to_string()];
+        assert!(!origin_allowed("https://app.klovy.chat.evil.com", &allowed));
+        assert!(origin_allowed("https://app.klovy.chat/settings", &allowed));
     }
 }
