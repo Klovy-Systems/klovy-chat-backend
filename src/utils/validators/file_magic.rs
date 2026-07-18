@@ -42,6 +42,70 @@ fn detect_audio_type(data: &[u8]) -> Option<&'static str> {
     None
 }
 
+pub fn webm_has_video_track(data: &[u8]) -> bool {
+    const VIDEO_CODEC_MARKERS: &[&[u8]] = &[b"V_VP8", b"V_VP9", b"V_AV1", b"V_MPEG", b"V_THEORA"];
+    VIDEO_CODEC_MARKERS
+        .iter()
+        .any(|marker| data.windows(marker.len()).any(|window| window == *marker))
+}
+
+pub fn mime_allowed_for_extension(ext: &str, mime: &str) -> bool {
+    let ext = ext.to_ascii_lowercase();
+    let mime = mime.trim().to_ascii_lowercase();
+    if mime.is_empty() {
+        return false;
+    }
+
+    match ext.as_str() {
+        "pdf" => mime == "application/pdf",
+        "jpg" | "jpeg" => mime == "image/jpeg",
+        "png" => mime == "image/png",
+        "webp" => mime == "image/webp",
+        "docx" => {
+            mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        }
+        "xlsx" => mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "txt" => mime == "text/plain",
+        "webm" => mime == "audio/webm" || mime == "video/webm",
+        "ogg" => mime == "audio/ogg" || mime == "video/ogg" || mime == "application/ogg",
+        "wav" => {
+            matches!(
+                mime.as_str(),
+                "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave"
+            )
+        }
+        "mp4" => {
+            matches!(
+                mime.as_str(),
+                "audio/mp4" | "audio/aac" | "audio/x-m4a" | "video/mp4"
+            )
+        }
+        "m4a" => {
+            matches!(
+                mime.as_str(),
+                "audio/mp4" | "audio/aac" | "audio/x-m4a" | "video/mp4"
+            )
+        }
+        _ => false,
+    }
+}
+
+pub fn resolve_upload_content_type(ext: &str, client_mime: Option<&str>, data: &[u8]) -> String {
+    if let Some(mime) = client_mime {
+        let mime = mime.trim();
+        if mime_allowed_for_extension(ext, mime) {
+            return mime.to_string();
+        }
+    }
+
+    match ext.to_ascii_lowercase().as_str() {
+        "webm" if webm_has_video_track(data) => "video/webm".to_string(),
+        "mp4" => "video/mp4".to_string(),
+        "m4a" => "audio/mp4".to_string(),
+        other => crate::utils::storage::content_type_for_ext(other).to_string(),
+    }
+}
+
 pub fn validate_file_magic(path: &Path, ext: &str) -> bool {
     let Some(data) = read_header(path) else {
         return false;
@@ -58,5 +122,28 @@ pub fn validate_file_magic(path: &Path, ext: &str) -> bool {
         "webm" | "ogg" | "wav" => detect_audio_type(&data) == Some(ext),
         "mp4" | "m4a" => detect_audio_type(&data) == Some("mp4"),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_webm_video_from_client_mime() {
+        let header = b"\x1a\x45\xdf\xa3";
+        assert_eq!(
+            resolve_upload_content_type("webm", Some("video/webm"), header),
+            "video/webm"
+        );
+    }
+
+    #[test]
+    fn resolves_webm_audio_by_default() {
+        let header = b"\x1a\x45\xdf\xa3";
+        assert_eq!(
+            resolve_upload_content_type("webm", Some("audio/webm"), header),
+            "audio/webm"
+        );
     }
 }

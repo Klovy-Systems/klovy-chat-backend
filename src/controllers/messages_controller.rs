@@ -34,7 +34,7 @@ use crate::utils::upload_limits::{
     MAX_IMAGE_ATTACHMENT_BYTES,
 };
 use crate::utils::validators::archive_validation::validate_upload_document;
-use crate::utils::validators::file_magic::validate_file_magic;
+use crate::utils::validators::file_magic::{resolve_upload_content_type, validate_file_magic};
 
 const SEARCH_LIMIT: i64 = 50;
 const MIN_QUERY_LENGTH: usize = 2;
@@ -151,6 +151,8 @@ pub struct UploadFileForm {
     pub context_type: Text<String>,
     #[multipart(rename = "contextId")]
     pub context_id: Text<String>,
+    #[multipart(rename = "contentType")]
+    pub content_type: Option<Text<String>>,
 }
 
 pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) -> HttpResponse {
@@ -279,9 +281,10 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     }
 
     let file_hash = sha256_hex(&body);
-    let content_type = content_type_for_ext(stored_ext);
+    let client_mime = form.content_type.as_ref().map(|value| value.0.as_str());
+    let content_type = resolve_upload_content_type(stored_ext, client_mime, &body);
     if storage()
-        .put_public(&logical_path, body, content_type)
+        .put_public(&logical_path, body, &content_type)
         .await
         .is_err()
     {
