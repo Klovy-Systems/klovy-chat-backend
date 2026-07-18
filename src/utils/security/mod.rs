@@ -1,5 +1,6 @@
 pub mod bot_detection;
 pub mod client_id;
+pub mod client_environment;
 pub mod client_user_agent;
 pub mod constant_time;
 pub mod csp;

@@ -1262,7 +1262,7 @@ pub async fn on_user_connected(user_id: &str) {
 }
 
 pub async fn on_user_disconnected(user_id: &str) {
-    crate::utils::voice::call_sessions::clear_sessions_for_user(user_id);
+    crate::utils::voice::call_sessions::clear_ringing_sessions_for_user(user_id);
     set_user_offline(user_id).await;
     broadcast_user_status(
         user_id,

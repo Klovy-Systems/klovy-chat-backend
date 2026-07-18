@@ -42,6 +42,13 @@ fn detect_audio_type(data: &[u8]) -> Option<&'static str> {
     None
 }
 
+pub fn mp4_has_video_track(data: &[u8]) -> bool {
+    const VIDEO_CODEC_MARKERS: &[&[u8]] = &[b"avc1", b"hvc1", b"hev1", b"vp09", b"mp4v", b"av01"];
+    VIDEO_CODEC_MARKERS
+        .iter()
+        .any(|marker| data.windows(marker.len()).any(|window| window == *marker))
+}
+
 pub fn webm_has_video_track(data: &[u8]) -> bool {
     const VIDEO_CODEC_MARKERS: &[&[u8]] = &[b"V_VP8", b"V_VP9", b"V_AV1", b"V_MPEG", b"V_THEORA"];
     VIDEO_CODEC_MARKERS
@@ -77,7 +84,8 @@ pub fn mime_allowed_for_extension(ext: &str, mime: &str) -> bool {
         "mp4" => {
             matches!(
                 mime.as_str(),
-                "audio/mp4" | "audio/aac" | "audio/x-m4a" | "video/mp4"
+                "audio/mp4" | "audio/aac" | "audio/x-m4a" | "video/mp4" | "video/quicktime"
+                    | "application/mp4" | "application/octet-stream"
             )
         }
         "m4a" => {
@@ -100,7 +108,8 @@ pub fn resolve_upload_content_type(ext: &str, client_mime: Option<&str>, data: &
 
     match ext.to_ascii_lowercase().as_str() {
         "webm" if webm_has_video_track(data) => "video/webm".to_string(),
-        "mp4" => "video/mp4".to_string(),
+        "mp4" if mp4_has_video_track(data) => "video/mp4".to_string(),
+        "mp4" => "audio/mp4".to_string(),
         "m4a" => "audio/mp4".to_string(),
         other => crate::utils::storage::content_type_for_ext(other).to_string(),
     }
@@ -144,6 +153,24 @@ mod tests {
         assert_eq!(
             resolve_upload_content_type("webm", Some("audio/webm"), header),
             "audio/webm"
+        );
+    }
+
+    #[test]
+    fn resolves_mp4_video_from_client_mime() {
+        let header = b"\x00\x00\x00\x18ftypmp42";
+        assert_eq!(
+            resolve_upload_content_type("mp4", Some("video/mp4"), header),
+            "video/mp4"
+        );
+    }
+
+    #[test]
+    fn resolves_mp4_video_from_track_markers() {
+        let header = b"\x00\x00\x00\x18ftypisomavc1";
+        assert_eq!(
+            resolve_upload_content_type("mp4", None, header),
+            "video/mp4"
         );
     }
 }

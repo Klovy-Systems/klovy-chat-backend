@@ -574,6 +574,9 @@ pub async fn run_server() -> std::io::Result<()> {
             HeaderName::from_static("x-client-version"),
             HeaderName::from_static("x-klovy-client"),
             HeaderName::from_static("x-klovy-user-agent"),
+            HeaderName::from_static("x-klovy-client-browser"),
+            HeaderName::from_static("x-klovy-client-os"),
+            HeaderName::from_static("x-klovy-client-label"),
         ])
         .expose_headers([
             header::CONTENT_DISPOSITION,

@@ -3,7 +3,7 @@ use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::messages_controller::{
     delete_message, download_attachment, edit_message, get_messages, get_pinned_messages,
-    pin_message, search_messages, serve_attachment, unpin_message, upload_file,
+    link_preview, pin_message, search_messages, serve_attachment, unpin_message, upload_file,
 };
 use crate::middlewares::auth_middleware::{
     log_suspicious_activity, require_active_account, verify_token,
@@ -92,6 +92,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .wrap(from_fn(verify_token))
             .wrap(from_fn(attachment_access_limiter))
             .route(web::get().to(serve_attachment)),
+    );
+    cfg.service(
+        web::resource("/link-preview")
+            .wrap(from_fn(log_suspicious_activity("link-preview")))
+            .wrap(from_fn(require_active_account))
+            .wrap(from_fn(verify_token))
+            .route(web::post().to(link_preview)),
     );
     cfg.service(
         web::resource("/{messageId}/pin")

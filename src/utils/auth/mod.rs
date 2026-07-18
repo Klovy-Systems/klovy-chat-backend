@@ -2,6 +2,7 @@ pub mod admin_session;
 pub mod jwt_auth;
 pub mod jwt_validation;
 pub mod refresh_token;
+pub mod request_client_environment;
 pub mod request_user_agent;
 pub mod session_client;
 pub mod session_fingerprint;

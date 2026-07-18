@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const RINGING_TTL: Duration = Duration::from_secs(60);
-const ACCEPTED_TOKEN_WINDOW: Duration = Duration::from_secs(5 * 60);
 const PURGE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,10 +55,7 @@ fn maybe_purge_expired() {
     sessions.retain(|_, session| {
         match session.phase {
             CallPhase::Ringing => session.created_at.elapsed() < RINGING_TTL,
-            CallPhase::Accepted => session
-                .accepted_at
-                .map(|t| t.elapsed() < ACCEPTED_TOKEN_WINDOW)
-                .unwrap_or(false),
+            CallPhase::Accepted => true,
         }
     });
 }
@@ -72,10 +68,7 @@ pub fn create_ringing_session(caller_id: &str, callee_id: &str, mode: &str) -> R
     if let Some(existing) = sessions.get(&key) {
         let active = match existing.phase {
             CallPhase::Ringing => existing.created_at.elapsed() < RINGING_TTL,
-            CallPhase::Accepted => existing
-                .accepted_at
-                .map(|t| t.elapsed() < ACCEPTED_TOKEN_WINDOW)
-                .unwrap_or(false),
+            CallPhase::Accepted => true,
         };
         if active {
             return Err(CallSessionError::InProgress);
@@ -185,11 +178,29 @@ pub fn token_allowed(user_id: &str, peer_id: &str) -> Result<CallSession, CallSe
     if session.phase != CallPhase::Accepted {
         return Err(CallSessionError::InvalidPhase);
     }
-    let accepted_at = session.accepted_at.ok_or(CallSessionError::InvalidPhase)?;
-    if accepted_at.elapsed() >= ACCEPTED_TOKEN_WINDOW {
-        return Err(CallSessionError::InvalidPhase);
-    }
     Ok(session.clone())
+}
+
+pub fn active_session_for_user(user_id: &str) -> Option<CallSession> {
+    maybe_purge_expired();
+    let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    sessions
+        .values()
+        .find(|session| {
+            session.phase == CallPhase::Accepted
+                && (session.caller_id == user_id || session.callee_id == user_id)
+        })
+        .cloned()
+}
+
+pub fn clear_ringing_sessions_for_user(user_id: &str) {
+    let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    sessions.retain(|_, session| {
+        if session.caller_id != user_id && session.callee_id != user_id {
+            return true;
+        }
+        session.phase != CallPhase::Ringing
+    });
 }
 
 pub fn clear_sessions_for_user(user_id: &str) {

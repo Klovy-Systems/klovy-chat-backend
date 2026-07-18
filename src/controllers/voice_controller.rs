@@ -10,7 +10,7 @@ use crate::middlewares::auth_middleware::request_user_id;
 use crate::utils::db::get_db;
 use crate::utils::friends::are_friends;
 use crate::utils::ratelimit::Store;
-use crate::utils::voice::call_sessions::{token_allowed, CallSessionError};
+use crate::utils::voice::call_sessions::{active_session_for_user, token_allowed, CallSessionError};
 
 const TOKEN_TTL_SECS: i64 = 3 * 60;
 
@@ -148,4 +148,26 @@ pub async fn get_voice_token(req: HttpRequest, body: web::Json<VoiceTokenBody>) 
     };
 
     HttpResponse::Ok().json(json!({ "token": token, "url": url, "room": room }))
+}
+
+pub async fn get_active_call(req: HttpRequest) -> HttpResponse {
+    let Some(user_id) = request_user_id(&req) else {
+        return HttpResponse::Unauthorized().json(json!({ "message": "Not authenticated." }));
+    };
+
+    let Some(session) = active_session_for_user(&user_id) else {
+        return HttpResponse::Ok().json(json!({ "active": false }));
+    };
+
+    let peer_id = if session.caller_id == user_id {
+        session.callee_id.clone()
+    } else {
+        session.caller_id.clone()
+    };
+
+    HttpResponse::Ok().json(json!({
+        "active": true,
+        "peerId": peer_id,
+        "mode": session.mode,
+    }))
 }

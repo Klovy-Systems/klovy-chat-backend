@@ -35,6 +35,12 @@ use crate::utils::upload_limits::{
 };
 use crate::utils::validators::archive_validation::validate_upload_document;
 use crate::utils::validators::file_magic::{resolve_upload_content_type, validate_file_magic};
+use crate::utils::link_preview::{fetch_link_preview, is_safe_preview_target};
+use crate::utils::ratelimit::Store;
+use once_cell::sync::Lazy;
+use std::time::Duration;
+
+static LINK_PREVIEW_LIMIT: Lazy<Store> = Lazy::new(|| Store::new(40, Duration::from_secs(60)));
 
 const SEARCH_LIMIT: i64 = 50;
 const MIN_QUERY_LENGTH: usize = 2;
@@ -843,4 +849,43 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
     }
 
     HttpResponse::BadRequest().json(json!({ "error": "contactId or channelId required" }))
+}
+
+#[derive(Deserialize)]
+pub struct LinkPreviewBody {
+    pub url: Option<String>,
+}
+
+pub async fn link_preview(req: HttpRequest, body: web::Json<LinkPreviewBody>) -> HttpResponse {
+    let user_id = request_user_id(&req).unwrap_or_default();
+    if user_id.is_empty() {
+        return HttpResponse::Unauthorized().json(json!({
+            "error": "UNAUTHORIZED",
+            "message": "Authentication required.",
+        }));
+    }
+
+    let rate_key = format!("link-preview:{user_id}");
+    if !LINK_PREVIEW_LIMIT.check_and_increment_with_window(&rate_key, 40, Duration::from_secs(60)) {
+        return HttpResponse::TooManyRequests().json(json!({
+            "error": "TOO_MANY_REQUESTS",
+            "message": "Too many preview requests.",
+        }));
+    }
+
+    let url = body.url.clone().unwrap_or_default().trim().to_string();
+    if url.is_empty() || !is_safe_preview_target(&url) {
+        return HttpResponse::BadRequest().json(json!({
+            "error": "INVALID_URL",
+            "message": "Invalid preview URL.",
+        }));
+    }
+
+    match fetch_link_preview(&url).await {
+        Ok(preview) => HttpResponse::Ok().json(preview),
+        Err(message) => HttpResponse::BadGateway().json(json!({
+            "error": "PREVIEW_UNAVAILABLE",
+            "message": message,
+        })),
+    }
 }

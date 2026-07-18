@@ -1,3 +1,5 @@
+use crate::utils::security::client_environment::ClientEnvironmentHints;
+
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
     pub browser: String,
@@ -6,38 +8,124 @@ pub struct ClientInfo {
     pub is_known: bool,
 }
 
-fn windows_version(ua: &str) -> &'static str {
-    if ua.contains("Windows NT 10.0") {
-        "Windows 10"
-    } else if ua.contains("Windows NT 11.0") {
-        "Windows 11"
-    } else if ua.contains("Windows NT 6.3") {
-        "Windows 8.1"
-    } else if ua.contains("Windows NT 6.2") {
-        "Windows 8"
-    } else if ua.contains("Windows NT 6.1") {
-        "Windows 7"
-    } else if ua.contains("Windows") {
-        "Windows"
-    } else {
-        "Windows"
-    }
-}
+const MAX_LABEL_LEN: usize = 160;
 
-fn android_device(ua: &str) -> Option<String> {
-    let marker = "Android";
-    let idx = ua.find(marker)?;
-    let rest = &ua[idx..];
-    let semi = rest.find(';')?;
-    let after = rest[semi + 1..].trim();
-    let model = after.split(';').next()?.trim();
-    if model.is_empty()
-        || model.eq_ignore_ascii_case("wv")
-        || model.eq_ignore_ascii_case("mobile")
-    {
+fn sanitize_client_label(value: Option<&String>) -> Option<String> {
+    let raw = value?.trim();
+    if raw.is_empty() || raw.len() > MAX_LABEL_LEN {
         return None;
     }
-    Some(model.to_string())
+    if raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+fn short_version(version: &str, parts: usize) -> String {
+    let chunks: Vec<&str> = version.split('.').filter(|part| !part.is_empty()).collect();
+    if chunks.len() <= parts {
+        return version.to_string();
+    }
+    chunks[..parts].join(".")
+}
+
+fn extract_platform_from_user_agent(ua: &str) -> Option<String> {
+    let start = ua.find('(')?;
+    let rest = &ua[start + 1..];
+    let end = rest.find(')')?;
+    let inner = rest[..end].trim();
+    if inner.is_empty() {
+        return None;
+    }
+
+    let noise = [
+        "X11", "WOW64", "Win64", "U", "Mobile", "Tablet", "compatible",
+    ];
+
+    let segments: Vec<String> = inner
+        .split(';')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .filter(|part| {
+            !noise.iter().any(|n| part.eq_ignore_ascii_case(n))
+                && !part.starts_with("rv:")
+        })
+        .map(str::to_string)
+        .collect();
+
+    if segments.is_empty() {
+        return None;
+    }
+    Some(segments.join(" · "))
+}
+
+fn extract_browser_from_user_agent(ua: &str) -> Option<String> {
+    let rules: &[(&str, &str)] = &[
+        ("Edg/", "Edge"),
+        ("EdgA/", "Edge"),
+        ("EdgiOS/", "Edge"),
+        ("OPR/", "Opera"),
+        ("Vivaldi/", "Vivaldi"),
+        ("Firefox/", "Firefox"),
+        ("CriOS/", "Chrome"),
+        ("Chrome/", "Chrome"),
+    ];
+
+    for (needle, name) in rules {
+        if let Some(idx) = ua.find(needle) {
+            let version_start = idx + needle.len();
+            let version: String = ua[version_start..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if !version.is_empty() {
+                return Some(format!("{name} {}", short_version(&version, 2)));
+            }
+            return Some(name.to_string());
+        }
+    }
+
+    if let Some(idx) = ua.find("Version/") {
+        let version_start = idx + "Version/".len();
+        let version: String = ua[version_start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if ua.contains("Safari") {
+            if version.is_empty() {
+                return Some("Safari".to_string());
+            }
+            return Some(format!("Safari {}", short_version(&version, 2)));
+        }
+    }
+
+    None
+}
+
+fn fallback_from_user_agent(ua: &str) -> ClientInfo {
+    let trimmed = ua.trim();
+    if trimmed.is_empty() {
+        return ClientInfo {
+            browser: "Unknown browser".to_string(),
+            os: "Unknown OS".to_string(),
+            label: "Unknown session".to_string(),
+            is_known: false,
+        };
+    }
+
+    let browser = extract_browser_from_user_agent(trimmed)
+        .unwrap_or_else(|| "Unknown browser".to_string());
+    let os = extract_platform_from_user_agent(trimmed)
+        .unwrap_or_else(|| "Unknown OS".to_string());
+    let is_known = browser != "Unknown browser";
+    let label = format!("{browser} on {os}");
+
+    ClientInfo {
+        browser,
+        os,
+        label,
+        is_known,
+    }
 }
 
 pub fn normalize_browser_name(browser: &str) -> String {
@@ -48,72 +136,66 @@ pub fn normalize_browser_name(browser: &str) -> String {
     }
 }
 
-pub fn parse_user_agent(ua: &str) -> ClientInfo {
-    let trimmed = ua.trim();
-    if trimmed.is_empty() {
+pub fn resolve_client_info(ua: &str, env: &ClientEnvironmentHints) -> ClientInfo {
+    if let (Some(browser), Some(os)) = (
+        sanitize_client_label(env.browser.as_ref()),
+        sanitize_client_label(env.os.as_ref()),
+    ) {
+        let browser = normalize_browser_name(&browser);
+        let label = sanitize_client_label(env.label.as_ref())
+            .unwrap_or_else(|| format!("{browser} on {os}"));
         return ClientInfo {
-            browser: "Nieznana przeglądarka".to_string(),
-            os: "Nieznany system".to_string(),
-            label: "Nieznana sesja".to_string(),
-            is_known: false,
+            browser,
+            os,
+            label,
+            is_known: true,
         };
     }
 
-    let ua_lower = trimmed.to_lowercase();
+    fallback_from_user_agent(ua)
+}
 
-    let browser = if trimmed.contains("Stoat") {
-        if ua_lower.contains("android") {
-            "Stoat For Android"
-        } else if ua_lower.contains("iphone") || ua_lower.contains("ipad") {
-            "Stoat IOS"
-        } else {
-            "Stoat For Web"
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::security::client_environment::ClientEnvironmentHints;
+
+    fn env(browser: Option<&str>, os: Option<&str>) -> ClientEnvironmentHints {
+        ClientEnvironmentHints {
+            browser: browser.map(str::to_string),
+            os: os.map(str::to_string),
+            label: None,
         }
-    } else if trimmed.contains("Edg/") || trimmed.contains("EdgA/") || trimmed.contains("EdgiOS/") {
-        "Edge"
-    } else if trimmed.contains("OPR/") || ua_lower.contains("opera") {
-        "Opera"
-    } else if trimmed.contains("Firefox/") || ua_lower.contains("fxios") {
-        "Firefox"
-    } else if trimmed.contains("Brave/") || ua_lower.contains("brave") {
-        "Brave"
-    } else if trimmed.contains("CriOS/") {
-        "Chrome"
-    } else if trimmed.contains("Chrome/") {
-        "Chrome"
-    } else if trimmed.contains("Safari/") {
-        "Safari"
-    } else if ua_lower.contains("msie") || ua_lower.contains("trident/") {
-        "Internet Explorer"
-    } else {
-        "Nieznana przeglądarka"
-    };
+    }
 
-    let browser = normalize_browser_name(browser);
+    #[test]
+    fn prefers_client_reported_environment() {
+        let ua = "Mozilla/5.0";
+        let info = resolve_client_info(
+            ua,
+            &env(
+                Some("Google Chrome 120.0"),
+                Some("Windows 15.0 · x86 · 64-bit"),
+            ),
+        );
+        assert_eq!(info.browser, "Google Chrome 120.0");
+        assert_eq!(info.os, "Windows 15.0 · x86 · 64-bit");
+        assert_eq!(info.label, "Google Chrome 120.0 on Windows 15.0 · x86 · 64-bit");
+    }
 
-    let os = if ua_lower.contains("iphone") || ua_lower.contains("ipad") {
-        "IOS".to_string()
-    } else if ua_lower.contains("android") {
-        android_device(trimmed)
-            .map(|model| format!("Android On {model}"))
-            .unwrap_or_else(|| "Android".to_string())
-    } else if ua_lower.contains("mac os x") || trimmed.contains("Macintosh") {
-        "macOS".to_string()
-    } else if ua_lower.contains("windows") {
-        windows_version(trimmed).to_string()
-    } else if ua_lower.contains("linux") {
-        "Linux".to_string()
-    } else {
-        "Nieznany system".to_string()
-    };
+    #[test]
+    fn fallback_extracts_user_agent_parenthetical() {
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
+        let info = resolve_client_info(ua, &ClientEnvironmentHints::default());
+        assert_eq!(info.os, "Windows NT 10.0 · x64");
+        assert_eq!(info.browser, "Chrome 120.0");
+    }
 
-    let is_known = browser != "Nieznana przeglądarka";
-    let label = format!("{browser} On {os}");
-
-    ClientInfo {
-        browser: browser.to_string(),
-        os,
-        label,
-        is_known,
+    #[test]
+    fn fallback_extracts_linux_segments() {
+        let ua = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 Firefox/121.0";
+        let info = resolve_client_info(ua, &ClientEnvironmentHints::default());
+        assert_eq!(info.os, "Ubuntu · Linux x86_64");
+        assert_eq!(info.browser, "Firefox 121.0");
     }
 }

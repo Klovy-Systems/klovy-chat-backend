@@ -23,7 +23,8 @@ use crate::utils::spotify::{
 };
 
 static SPOTIFY_STATUS: Lazy<Store> = Lazy::new(|| Store::new(15, Duration::from_secs(60)));
-static SPOTIFY_SYNC: Lazy<Store> = Lazy::new(|| Store::new(1, Duration::from_secs(7)));
+/// Ręczne „sprawdź teraz” + tło co ~45s — kilka szybkich kliknięć OK, nadal chroni Spotify API.
+static SPOTIFY_SYNC: Lazy<Store> = Lazy::new(|| Store::new(8, Duration::from_secs(60)));
 
 const OAUTH_STATE_TTL_MS: i64 = 10 * 60 * 1000;
 
@@ -441,12 +442,11 @@ pub async fn spotify_sync(req: HttpRequest, body: web::Json<SpotifySyncBody>) ->
     let Some(user_id) = request_user_id(&req) else {
         return HttpResponse::Unauthorized().json(json!({ "error": "Authentication required" }));
     };
-    if !SPOTIFY_SYNC.check_and_increment_with_window(
-        &format!("spotify-sync:{user_id}"),
-        1,
-        Duration::from_secs(7),
-    ) {
-        return HttpResponse::TooManyRequests().json(json!({ "error": "Rate limit exceeded" }));
+    if !SPOTIFY_SYNC.check_and_increment(&format!("spotify-sync:{user_id}")) {
+        return HttpResponse::TooManyRequests().json(json!({
+            "error": "Rate limit exceeded",
+            "retryAfter": 15,
+        }));
     }
 
     let Ok(user) = load_active_user(&user_id).await else {

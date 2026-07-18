@@ -250,7 +250,8 @@ pub fn content_type_for_ext(ext: &str) -> &'static str {
         "webm" => "audio/webm",
         "ogg" => "audio/ogg",
         "wav" => "audio/wav",
-        "mp4" | "m4a" => "audio/mp4",
+        "mp4" => "video/mp4",
+        "m4a" => "audio/mp4",
         _ => "application/octet-stream",
     }
 }

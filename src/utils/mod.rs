@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod db;
 pub mod friends;
 pub mod image_reencode;
+pub mod link_preview;
 pub mod listening;
 pub mod messages;
 pub mod ratelimit;
