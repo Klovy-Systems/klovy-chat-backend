@@ -536,7 +536,7 @@ pub async fn run_server() -> std::io::Result<()> {
     };
 
     let allowed_origins = allowed_origins();
-    use http::header::{self, HeaderName, HeaderValue};
+    use http::header::{self, HeaderValue};
     use http::Method;
     use tower_http::cors::AllowOrigin;
 
@@ -565,22 +565,21 @@ pub async fn run_server() -> std::io::Result<()> {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        // Jawna lista zsynchronizowana z `utils/security/cors.rs` (bez mirror_request).
-        .allow_headers(
-            CORS_ALLOWED_REQUEST_HEADERS
-                .iter()
-                .copied()
-                .map(HeaderName::from_static)
-                .collect::<Vec<_>>(),
-        )
+        // Jawna lista w `utils/security/cors.rs` — bez mirror_request.
+        .allow_headers(CORS_ALLOWED_REQUEST_HEADERS)
         .expose_headers([
             header::CONTENT_DISPOSITION,
-            HeaderName::from_static("x-total-count"),
-            HeaderName::from_static("x-rate-limit-remaining"),
-            HeaderName::from_static("x-rate-limit-reset"),
+            header::HeaderName::from_static("x-total-count"),
+            header::HeaderName::from_static("x-rate-limit-remaining"),
+            header::HeaderName::from_static("x-rate-limit-reset"),
         ])
         .max_age(std::time::Duration::from_secs(86400))
         .allow_credentials(true);
+
+    log::info!(
+        "CORS allow-headers: {}",
+        crate::utils::security::cors::cors_allowed_request_header_names().join(", ")
+    );
 
     let client2 = client.clone();
     let base2 = internal_base.clone();
