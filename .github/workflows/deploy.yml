@@ -1,88 +1,3 @@
-name: Deploy KlovyChat Backend
-
-on:
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: read
-
-
-jobs:
-
-  deploy:
-
-    runs-on: ubuntu-latest
-
-
-    steps:
-
-    - name: Checkout
-      uses: actions/checkout@v4
-
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-
-
-    - name: Build Rust backend
-      run: |
-        cargo build --release
-
-
-    - name: Verify binary exists
-      run: |
-        ls -lh target/release/
-        
-        test -f target/release/klovy-chat-server
-        
-        echo "Binary OK"
-
-
-
-    - name: Setup SSH
-      run: |
-
-        mkdir -p ~/.ssh
-
-        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-
-        chmod 600 ~/.ssh/id_ed25519
-
-
-        ssh-keyscan \
-          -p ${{ secrets.SSH_PORT }} \
-          ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
-
-
-
-    - name: Test SSH
-      run: |
-
-        ssh \
-          -i ~/.ssh/id_ed25519 \
-          -p ${{ secrets.SSH_PORT }} \
-          ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-          "
-          whoami
-          echo SSH_OK
-          "
-
-
-
-    - name: Upload binary
-      run: |
-
-        rsync \
-          -avz \
-          --timeout=30 \
-          -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }}" \
-          target/release/klovy-chat-server \
-          ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/klovychat.new
-
-
-
     - name: Deploy backend
       run: |
 
@@ -91,127 +6,79 @@ jobs:
           -p ${{ secrets.SSH_PORT }} \
           ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
 
-
         set -euo pipefail
 
-
         APP_DIR="/opt/klovy/backend"
-
         APP="$APP_DIR/klovychat"
-
         NEW="/tmp/klovychat.new"
-
         BACKUP="$APP_DIR/klovychat.backup.$(date +%Y%m%d_%H%M%S)"
-
-
 
         echo "=== Checking uploaded file ==="
 
-
-        if [ ! -f "$NEW" ]; then
-            echo "ERROR: new binary missing"
-            exit 1
-        fi
-
-
+        test -f "$NEW"
 
         echo "=== Backup current binary ==="
 
-
         cp "$APP" "$BACKUP"
 
-
-        echo "Backup:"
+        echo "Backup created:"
         echo "$BACKUP"
 
+        echo "=== Stopping service ==="
 
+        sudo /usr/bin/systemctl stop klovychat
 
-        echo "=== Install new binary ==="
+        echo "=== Installing new binary ==="
 
+        install -m755 "$NEW" "$APP"
 
-        install \
-          -m755 \
-          "$NEW" \
-          "$APP"
+        echo "=== Starting service ==="
 
-
-
-        echo "=== Restart systemd ==="
-
-
-        sudo /usr/bin/systemctl restart klovychat
-
-
+        sudo /usr/bin/systemctl start klovychat
 
         echo "Waiting..."
 
         sleep 5
 
-
-
         echo "=== Checking service ==="
 
-
-
         if ! sudo /usr/bin/systemctl is-active --quiet klovychat
-
         then
 
             echo "SERVICE FAILED"
 
-            echo "Starting rollback"
+            echo "=== Rollback ==="
 
+            sudo /usr/bin/systemctl stop klovychat
 
-            cp "$BACKUP" "$APP"
+            install -m755 "$BACKUP" "$APP"
 
-
-            sudo /usr/bin/systemctl restart klovychat
-
+            sudo /usr/bin/systemctl start klovychat
 
             sleep 5
 
-
-
             if ! sudo /usr/bin/systemctl is-active --quiet klovychat
-
             then
-
                 echo "ROLLBACK FAILED"
-
                 exit 1
-
             fi
 
-
-
-            echo "Rollback completed"
-
-
+            echo "Rollback successful"
             exit 1
 
         fi
 
-
-
         echo "=== Service running ==="
-
 
         sudo /usr/bin/systemctl status klovychat --no-pager
 
-
-
         echo "=== Last logs ==="
-
 
         sudo journalctl \
           -u klovychat \
           -n 20 \
           --no-pager
 
-
-
         echo "DEPLOY SUCCESS"
-
-
 
         EOF
