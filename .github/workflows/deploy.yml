@@ -31,6 +31,16 @@ jobs:
         cargo build --release
 
 
+    - name: Verify binary exists
+      run: |
+        ls -lh target/release/
+        
+        test -f target/release/klovy-chat-server
+        
+        echo "Binary OK"
+
+
+
     - name: Setup SSH
       run: |
 
@@ -40,21 +50,24 @@ jobs:
 
         chmod 600 ~/.ssh/id_ed25519
 
+
         ssh-keyscan \
           -p ${{ secrets.SSH_PORT }} \
           ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
 
 
 
-    - name: Test SSH connection
+    - name: Test SSH
       run: |
 
         ssh \
           -i ~/.ssh/id_ed25519 \
           -p ${{ secrets.SSH_PORT }} \
-          -o StrictHostKeyChecking=yes \
           ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-          "whoami && echo SSH_OK"
+          "
+          whoami
+          echo SSH_OK
+          "
 
 
 
@@ -64,8 +77,8 @@ jobs:
         rsync \
           -avz \
           --timeout=30 \
-          -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }} -o StrictHostKeyChecking=yes" \
-          target/release/klovychat \
+          -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }}" \
+          target/release/klovy-chat-server \
           ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/klovychat.new
 
 
@@ -76,7 +89,6 @@ jobs:
         ssh \
           -i ~/.ssh/id_ed25519 \
           -p ${{ secrets.SSH_PORT }} \
-          -o StrictHostKeyChecking=yes \
           ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
 
 
@@ -93,25 +105,12 @@ jobs:
 
 
 
-        echo "=== Checking files ==="
+        echo "=== Checking uploaded file ==="
 
 
         if [ ! -f "$NEW" ]; then
-
-            echo "New binary missing!"
-
+            echo "ERROR: new binary missing"
             exit 1
-
-        fi
-
-
-
-        if [ ! -f "$APP" ]; then
-
-            echo "Current binary missing!"
-
-            exit 1
-
         fi
 
 
@@ -122,13 +121,12 @@ jobs:
         cp "$APP" "$BACKUP"
 
 
-
-        echo "Backup created:"
+        echo "Backup:"
         echo "$BACKUP"
 
 
 
-        echo "=== Installing new binary ==="
+        echo "=== Install new binary ==="
 
 
         install \
@@ -138,54 +136,55 @@ jobs:
 
 
 
-        echo "=== Restarting service ==="
+        echo "=== Restart systemd ==="
 
 
-        sudo systemctl restart klovychat
+        sudo /usr/bin/systemctl restart klovychat
 
 
 
-        echo "=== Waiting for startup ==="
-
+        echo "Waiting..."
 
         sleep 5
 
 
 
-        echo "=== Health check ==="
+        echo "=== Checking service ==="
 
 
-        if ! sudo systemctl is-active --quiet klovychat
+
+        if ! sudo /usr/bin/systemctl is-active --quiet klovychat
 
         then
 
-            echo "Service failed!"
+            echo "SERVICE FAILED"
 
-            echo "=== Rollback ==="
+            echo "Starting rollback"
 
 
             cp "$BACKUP" "$APP"
 
 
-            sudo systemctl restart klovychat
+            sudo /usr/bin/systemctl restart klovychat
 
 
             sleep 5
 
 
 
-            if ! sudo systemctl is-active --quiet klovychat
+            if ! sudo /usr/bin/systemctl is-active --quiet klovychat
 
             then
 
-                echo "Rollback failed!"
+                echo "ROLLBACK FAILED"
 
                 exit 1
 
             fi
 
 
-            echo "Rollback successful"
+
+            echo "Rollback completed"
 
 
             exit 1
@@ -194,10 +193,25 @@ jobs:
 
 
 
-        echo "=== Deploy successful ==="
+        echo "=== Service running ==="
 
 
-        sudo systemctl status klovychat --no-pager || true
+        sudo /usr/bin/systemctl status klovychat --no-pager
+
+
+
+        echo "=== Last logs ==="
+
+
+        sudo journalctl \
+          -u klovychat \
+          -n 20 \
+          --no-pager
+
+
+
+        echo "DEPLOY SUCCESS"
+
 
 
         EOF
