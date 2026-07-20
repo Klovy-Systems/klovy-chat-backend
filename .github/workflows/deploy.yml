@@ -1,10 +1,10 @@
     - name: Deploy backend
       run: |
-
         ssh \
           -i ~/.ssh/id_ed25519 \
           -p ${{ secrets.SSH_PORT }} \
-          ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+          -o StrictHostKeyChecking=yes \
+          ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "bash -s" << 'EOF'
 
         set -euo pipefail
 
@@ -13,72 +13,112 @@
         NEW="/tmp/klovychat.new"
         BACKUP="$APP_DIR/klovychat.backup.$(date +%Y%m%d_%H%M%S)"
 
-        echo "=== Checking uploaded file ==="
+        echo "=== Checking uploaded binary ==="
 
-        test -f "$NEW"
+        if [ ! -f "$NEW" ]; then
+            echo "ERROR: new binary does not exist"
+            exit 1
+        fi
 
-        echo "=== Backup current binary ==="
+
+        if [ ! -f "$APP" ]; then
+            echo "ERROR: current binary does not exist"
+            exit 1
+        fi
+
+
+        echo "=== Creating backup ==="
 
         cp "$APP" "$BACKUP"
 
         echo "Backup created:"
         echo "$BACKUP"
 
+
         echo "=== Stopping service ==="
 
         sudo /usr/bin/systemctl stop klovychat
 
+
         echo "=== Installing new binary ==="
 
-        install -m755 "$NEW" "$APP"
+        install \
+          -m755 \
+          "$NEW" \
+          "$APP"
+
 
         echo "=== Starting service ==="
 
         sudo /usr/bin/systemctl start klovychat
 
-        echo "Waiting..."
+
+        echo "=== Waiting for startup ==="
 
         sleep 5
 
-        echo "=== Checking service ==="
 
-        if ! sudo /usr/bin/systemctl is-active --quiet klovychat
+        echo "=== Health check ==="
+
+
+        if sudo /usr/bin/systemctl is-active --quiet klovychat
         then
+
+            echo "Service OK"
+
+        else
 
             echo "SERVICE FAILED"
 
-            echo "=== Rollback ==="
+            echo "=== Starting rollback ==="
+
 
             sudo /usr/bin/systemctl stop klovychat
 
-            install -m755 "$BACKUP" "$APP"
+
+            install \
+              -m755 \
+              "$BACKUP" \
+              "$APP"
+
 
             sudo /usr/bin/systemctl start klovychat
 
+
             sleep 5
 
-            if ! sudo /usr/bin/systemctl is-active --quiet klovychat
+
+            if sudo /usr/bin/systemctl is-active --quiet klovychat
             then
+
+                echo "Rollback successful"
+
+            else
+
                 echo "ROLLBACK FAILED"
-                exit 1
+
             fi
 
-            echo "Rollback successful"
+
             exit 1
 
         fi
 
-        echo "=== Service running ==="
+
+        echo "=== Service status ==="
 
         sudo /usr/bin/systemctl status klovychat --no-pager
 
-        echo "=== Last logs ==="
 
-        sudo journalctl \
+        echo "=== Recent logs ==="
+
+        sudo /usr/bin/journalctl \
           -u klovychat \
-          -n 20 \
+          -n 30 \
           --no-pager
 
+
         echo "DEPLOY SUCCESS"
+
 
         EOF
