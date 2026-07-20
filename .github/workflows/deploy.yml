@@ -1,0 +1,92 @@
+name: Deploy KlovyChat Backend
+
+on:
+  push:
+    branches:
+      - main
+
+
+jobs:
+
+  deploy:
+
+    runs-on: ubuntu-latest
+
+
+    steps:
+
+    # Pobiera kod z GitHuba
+    - name: Checkout
+      uses: actions/checkout@v4
+
+
+    # Instaluje Rust
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+
+    # Buduje backend
+    - name: Build Rust backend
+      run: cargo build --release
+
+
+    # Przygotowanie SSH
+    - name: Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+        chmod 600 ~/.ssh/id_ed25519
+
+
+    # Kopiuje binarkę na VPS
+    - name: Upload binary
+      run: |
+        rsync -avz \
+        -e "ssh -p ${{ secrets.SSH_PORT }} -o StrictHostKeyChecking=no" \
+        target/release/klovychat \
+        ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/klovychat.new
+
+
+    # Aktualizacja serwera
+    - name: Deploy
+      run: |
+
+        ssh \
+        -p ${{ secrets.SSH_PORT }} \
+        -o StrictHostKeyChecking=no \
+        ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+
+
+        set -e
+
+
+        echo "Backup starej wersji"
+
+        cp /opt/klovy/backend/klovychat \
+        /opt/klovy/backend/klovychat.backup
+
+
+        echo "Podmiana binarki"
+
+
+        install -m755 \
+        /tmp/klovychat.new \
+        /opt/klovy/backend/klovychat
+
+
+        echo "Restart systemd"
+
+
+        sudo systemctl restart klovychat
+
+
+        sleep 5
+
+
+        echo "Sprawdzenie"
+
+
+        sudo systemctl is-active klovychat
+
+
+        EOF
