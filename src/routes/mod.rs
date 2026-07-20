@@ -1,6 +1,5 @@
 pub mod admin_routes;
 pub mod auth_routes;
-pub mod bot_routes;
 pub mod channel_routes;
 pub mod contact_routes;
 pub mod emoji_routes;

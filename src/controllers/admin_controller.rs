@@ -359,12 +359,6 @@ pub async fn set_user_password(
         _ => return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." })),
     };
 
-    if user.is_bot {
-        return HttpResponse::BadRequest().json(json!({
-            "error": "Nie można zmienić hasła konta bota."
-        }));
-    }
-
     match check_password_breach(new_password).await {
         PasswordBreachCheck::Breached => {
             return HttpResponse::BadRequest().json(json!({

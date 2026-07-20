@@ -15,7 +15,7 @@ use crate::utils::whitelist::is_whitelist_enabled;
 const FRIEND_REQUEST_UNAVAILABLE: &str = "Nie można wysłać zaproszenia do tego użytkownika.";
 
 fn recipient_available(user: &User) -> bool {
-    if !user.is_login_allowed() || user.is_bot {
+    if !user.is_login_allowed() {
         return false;
     }
     !is_whitelist_enabled() || user.is_whitelisted

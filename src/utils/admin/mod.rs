@@ -2,7 +2,6 @@ use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
 
-use crate::model::bot_token_model::BotToken;
 use crate::model::channel_model::Channel;
 use crate::model::channel_read_state_model::ChannelReadState;
 use crate::model::channel_report_model::ChannelReport;
@@ -79,14 +78,6 @@ async fn delete_user_storage_files(user: &User, user_id: ObjectId, db: &Database
     }
     if let Some(banner) = user.banner.as_deref() {
         let _ = storage.delete_public_media_key(banner).await;
-    }
-
-    if let Ok(bots) = User::find_bots_by_owner(db, user_id).await {
-        for bot in bots {
-            if let Some(image) = bot.image.as_deref() {
-                let _ = storage.delete_avatar_key(image).await;
-            }
-        }
     }
 
     let owned_channels: Vec<Channel> = match Channel::collection(db)
@@ -169,19 +160,6 @@ async fn purge_user_related_records(db: &Database, user_id: ObjectId) {
     let _ = ChannelReport::collection(db)
         .delete_many(doc! { "reportedBy": user_id })
         .await;
-
-    if let Ok(bots) = User::find_bots_by_owner(db, user_id).await {
-        for bot in bots {
-            if let Some(bot_id) = bot.id {
-                let _ = BotToken::revoke_for_bot(db, bot_id).await;
-                let _ = RefreshToken::revoke_all_for_user(db, bot_id).await;
-                disconnect_user(&bot_id.to_hex());
-            }
-        }
-        let _ = User::collection(db)
-            .delete_many(doc! { "isBot": true, "ownerId": user_id })
-            .await;
-    }
 }
 
 pub async fn purge_user_data(

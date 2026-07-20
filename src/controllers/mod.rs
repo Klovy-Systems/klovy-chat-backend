@@ -2,7 +2,6 @@ pub mod admin_controller;
 pub mod announcement_controller;
 pub mod api_info_controller;
 pub mod auth_controller;
-pub mod bot_controller;
 pub mod channel_controller;
 pub mod contacts_controller;
 pub mod emoji_controller;

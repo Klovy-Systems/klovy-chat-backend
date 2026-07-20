@@ -24,7 +24,6 @@ use crate::ws::registry::{channel_recipient_ids, emit_to_user, emit_to_users};
 use crate::utils::db::get_db;
 use crate::utils::friends::are_friends;
 use crate::utils::messages::serialize_messages_batch;
-use crate::utils::user::serialize_user::resolve_display_name;
 
 const REPORT_REASONS: &[&str] = &[
     "Spam lub reklamy",
@@ -692,131 +691,6 @@ pub async fn add_user_to_channel(req: HttpRequest, body: web::Json<AddUserBody>)
         json!({ "channelId": cid.to_hex() }),
     );
     HttpResponse::Ok().json(json!({ "message": "User added to channel" }))
-}
-
-fn serialize_bot_ref(bot: &User) -> Value {
-    json!({
-        "_id": bot.id.map(|o| o.to_hex()),
-        "username": bot.username,
-        "displayName": resolve_display_name(bot),
-        "color": bot.color,
-        "image": bot.image,
-        "isBot": true,
-    })
-}
-
-/// Boty należące do admina kanału, których nie ma jeszcze w kanale.
-pub async fn get_installable_bots(req: HttpRequest) -> HttpResponse {
-    let user_id = request_user_id(&req).unwrap_or_default();
-    let Ok(cid) = ObjectId::parse_str(param(&req, "channelId")) else {
-        return HttpResponse::NotFound().json(json!({ "message": "Channel not found" }));
-    };
-    let Ok(uid) = ObjectId::parse_str(&user_id) else {
-        return HttpResponse::Unauthorized().json(json!({ "message": "Unauthorized" }));
-    };
-
-    let db = get_db();
-    let channel = match Channel::find_by_id(&db, cid).await {
-        Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Channel not found" })),
-    };
-
-    if channel.admin != uid {
-        return HttpResponse::Forbidden().json(json!({ "message": "Tylko administrator kanału może zarządzać botami." }));
-    }
-
-    let bots = match User::find_bots_by_owner(&db, uid).await {
-        Ok(b) => b,
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "message": "Internal Server Error" })),
-    };
-
-    let installable: Vec<Value> = bots
-        .iter()
-        .filter(|b| b.id.map(|id| !channel.members.contains(&id)).unwrap_or(false))
-        .map(serialize_bot_ref)
-        .collect();
-
-    HttpResponse::Ok().json(json!({ "bots": installable }))
-}
-
-#[derive(Deserialize)]
-pub struct AddBotBody {
-    #[serde(rename = "botId")]
-    pub bot_id: Option<String>,
-}
-
-pub async fn add_bot_to_channel(req: HttpRequest, body: web::Json<AddBotBody>) -> HttpResponse {
-    let user_id = request_user_id(&req).unwrap_or_default();
-    let Ok(cid) = ObjectId::parse_str(param(&req, "channelId")) else {
-        return HttpResponse::NotFound().json(json!({ "message": "Channel not found" }));
-    };
-    let Ok(uid) = ObjectId::parse_str(&user_id) else {
-        return HttpResponse::Unauthorized().json(json!({ "message": "Unauthorized" }));
-    };
-    let Ok(bot_oid) = ObjectId::parse_str(&body.bot_id.clone().unwrap_or_default()) else {
-        return HttpResponse::BadRequest().json(json!({ "message": "Nieprawidłowy identyfikator bota." }));
-    };
-
-    let db = get_db();
-    let channel = match Channel::find_by_id(&db, cid).await {
-        Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Channel not found" })),
-    };
-
-    if channel.admin != uid {
-        return HttpResponse::Forbidden().json(json!({ "message": "Tylko administrator kanału może dodawać boty." }));
-    }
-
-    let bot = match User::find_bot(&db, bot_oid).await {
-        Ok(Some(b)) if b.owner_id == Some(uid) => b,
-        Ok(_) => return HttpResponse::Forbidden().json(json!({ "message": "Możesz dodać tylko własnego bota." })),
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "message": "Internal Server Error" })),
-    };
-
-    if channel.members.contains(&bot_oid) {
-        return HttpResponse::BadRequest().json(json!({ "message": "Bot jest już w tym kanale." }));
-    }
-
-    let _ = Channel::collection(&db)
-        .update_one(
-            doc! { "_id": cid },
-            doc! { "$addToSet": { "members": bot_oid }, "$set": { "updatedAt": DateTime::now() } },
-        )
-        .await;
-
-    HttpResponse::Ok().json(json!({ "message": "Bot dodany do kanału.", "bot": serialize_bot_ref(&bot) }))
-}
-
-pub async fn remove_bot_from_channel(req: HttpRequest) -> HttpResponse {
-    let user_id = request_user_id(&req).unwrap_or_default();
-    let Ok(cid) = ObjectId::parse_str(param(&req, "channelId")) else {
-        return HttpResponse::NotFound().json(json!({ "message": "Channel not found" }));
-    };
-    let Ok(uid) = ObjectId::parse_str(&user_id) else {
-        return HttpResponse::Unauthorized().json(json!({ "message": "Unauthorized" }));
-    };
-    let Ok(bot_oid) = ObjectId::parse_str(param(&req, "botId")) else {
-        return HttpResponse::BadRequest().json(json!({ "message": "Nieprawidłowy identyfikator bota." }));
-    };
-
-    let db = get_db();
-    let channel = match Channel::find_by_id(&db, cid).await {
-        Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Channel not found" })),
-    };
-
-    if channel.admin != uid {
-        return HttpResponse::Forbidden().json(json!({ "message": "Tylko administrator kanału może usuwać boty." }));
-    }
-
-    let _ = Channel::collection(&db)
-        .update_one(
-            doc! { "_id": cid },
-            doc! { "$pull": { "members": bot_oid }, "$set": { "updatedAt": DateTime::now() } },
-        )
-        .await;
-
-    HttpResponse::Ok().json(json!({ "message": "Bot usunięty z kanału." }))
 }
 
 pub async fn delete_channel(req: HttpRequest) -> HttpResponse {

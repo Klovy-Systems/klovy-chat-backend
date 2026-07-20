@@ -25,7 +25,7 @@ fn is_exempt(path: &str) -> bool {
         return true;
     }
 
-    path.starts_with("/api/security") || path.starts_with("/api/bot/")
+    path.starts_with("/api/security")
 }
 
 pub async fn csrf_middleware(

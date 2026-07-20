@@ -30,7 +30,7 @@ use crate::utils::auth::two_factor_token::{
 };
 use crate::utils::crypto::credential_hash::verify_user_password;
 use crate::ws::registry::{disconnect_user, revoke_session_remotely};
-use crate::utils::friends::{emit_profile_event, emit_to_friends};
+use crate::utils::friends::{emit_profile_event, emit_status_event, emit_to_friends};
 use crate::utils::db::get_db;
 use crate::utils::user::badges::{
     featured_badge_ids_for_response, populate_user_badges, BadgeVisibility,
@@ -472,16 +472,6 @@ pub async fn login(
         }
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
-
-    // Konta botów nie logują się hasłem — uwierzytelniają się wyłącznie tokenem.
-    if user.is_bot {
-        monitor.log_event(
-            SecurityEventType::LoginFailures,
-            json!({ "username": normalized, "reason": "bot_account" }),
-        );
-        add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({ "message": "Invalid credentials" }));
-    }
 
     if !verify_user_password(&password, &user.password).await {
         monitor.log_event(
@@ -1413,10 +1403,9 @@ pub async fn update_availability_status(
     .await
     {
         Ok(Some(user)) => {
-            emit_to_friends(
+            emit_status_event(
                 &db,
                 &user_id,
-                "user-status-changed",
                 json!({
                     "userId": user_id,
                     "status": {
@@ -1766,12 +1755,6 @@ pub async fn disable_account(
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
 
-    if user.is_bot {
-        return HttpResponse::BadRequest().json(json!({
-            "message": "Konta botów nie można wyłączyć tą ścieżką."
-        }));
-    }
-
     if user.is_disabled {
         return HttpResponse::BadRequest().json(json!({
             "message": "Konto jest już wyłączone.",
@@ -1838,12 +1821,6 @@ pub async fn request_account_deletion(
         Ok(None) => return HttpResponse::NotFound().body("User not found."),
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
-
-    if user.is_bot {
-        return HttpResponse::BadRequest().json(json!({
-            "message": "Konta botów nie można usunąć tą ścieżką."
-        }));
-    }
 
     if user.is_pending_deletion() {
         return HttpResponse::BadRequest().json(json!({

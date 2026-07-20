@@ -124,10 +124,9 @@ async fn availability_status_for_user(user_id: &str) -> &'static str {
 }
 
 async fn broadcast_user_status(user_id: &str, status: Value) {
-    crate::utils::friends::emit_to_friends(
+    crate::utils::friends::emit_status_event(
         &get_db(),
         user_id,
-        "user-status-changed",
         json!({ "userId": user_id, "status": status }),
     )
     .await;
@@ -1263,10 +1262,16 @@ pub async fn on_user_connected(user_id: &str) {
 
 pub async fn on_user_disconnected(user_id: &str) {
     crate::utils::voice::call_sessions::clear_ringing_sessions_for_user(user_id);
+    // Read availability before flipping offline so friends keep the last chosen status.
+    let availability = availability_status_for_user(user_id).await;
     set_user_offline(user_id).await;
     broadcast_user_status(
         user_id,
-        json!({ "isOnline": false, "lastSeen": now_ms() }),
+        json!({
+            "isOnline": false,
+            "availabilityStatus": availability,
+            "lastSeen": now_ms(),
+        }),
     )
     .await;
 }
@@ -1381,17 +1386,27 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
         }
         "set-online" => {
             set_user_online(connected).await;
+            let availability = availability_status_for_user(connected).await;
             broadcast_user_status(
                 connected,
-                json!({ "isOnline": true, "lastSeen": Value::Null }),
+                json!({
+                    "isOnline": true,
+                    "availabilityStatus": availability,
+                    "lastSeen": Value::Null,
+                }),
             )
             .await;
         }
         "set-offline" => {
+            let availability = availability_status_for_user(connected).await;
             set_user_offline(connected).await;
             broadcast_user_status(
                 connected,
-                json!({ "isOnline": false, "lastSeen": now_ms() }),
+                json!({
+                    "isOnline": false,
+                    "availabilityStatus": availability,
+                    "lastSeen": now_ms(),
+                }),
             )
             .await;
         }

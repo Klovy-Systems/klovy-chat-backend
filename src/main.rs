@@ -1,7 +1,7 @@
 use klovy_chat_server::loaders::express;
 use klovy_chat_server::utils::app_env::is_production;
 use klovy_chat_server::model::{
-    announcement_model::Announcement, audit_log_model::AuditLog, bot_token_model::BotToken, channel_model::Channel,
+    announcement_model::Announcement, audit_log_model::AuditLog, channel_model::Channel,
     channel_read_state_model::ChannelReadState, channel_report_model::ChannelReport,
     friend_request_model::FriendRequest, invite_model::Invite, messages_model::Message,
     oauth_token_model::OauthToken, pending_upload_model::PendingUpload,
@@ -149,7 +149,7 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn ensure_indexes(db: &mongodb::Database) {
-    let tasks: [(&str, mongodb::error::Result<()>); 15] = [
+    let tasks: [(&str, mongodb::error::Result<()>); 14] = [
         ("users", User::create_indexes(db).await),
         ("channels", Channel::create_indexes(db).await),
         ("messages", Message::create_indexes(db).await),
@@ -159,7 +159,6 @@ async fn ensure_indexes(db: &mongodb::Database) {
         ("channel_reports", ChannelReport::create_indexes(db).await),
         ("refresh_tokens", RefreshToken::create_indexes(db).await),
         ("oauth_tokens", OauthToken::create_indexes(db).await),
-        ("bot_tokens", BotToken::create_indexes(db).await),
         ("pending_uploads", PendingUpload::create_indexes(db).await),
         ("user_storage_usage", UserStorageUsage::create_indexes(db).await),
         ("audit_logs", AuditLog::create_indexes(db).await),

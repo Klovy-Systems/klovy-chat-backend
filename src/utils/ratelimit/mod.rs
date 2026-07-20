@@ -177,8 +177,6 @@ static WS_HANDSHAKE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_se
 static CHANGE_PASSWORD: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static CHANGE_USERNAME: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static FRIEND_ACTION: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(5 * 60)));
-static BOT_MGMT: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(5 * 60)));
-static BOT_SEND: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
 
 pub async fn global_limiter(
     req: ServiceRequest,
@@ -539,27 +537,4 @@ pub async fn change_username_limiter(
 pub fn ws_handshake_allowed(ip: &str) -> bool {
     let key = rate_limit_key("ws-handshake", ip);
     WS_HANDSHAKE.check_and_increment(&key)
-}
-
-/// Limiter operacji zarządzania botami (tworzenie/regeneracja tokenu itp.).
-pub async fn bot_management_limiter(
-    req: ServiceRequest,
-    next: Next<impl MessageBody + 'static>,
-) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
-    limit_all(
-        &BOT_MGMT,
-        "bot-mgmt",
-        "Too many bot management requests. Slow down.",
-        5 * 60 * 1000,
-        None,
-        req,
-        next,
-    )
-    .await
-}
-
-/// Per-bot limit wysyłania wiadomości przez runtime API (obok slowmode kanału).
-pub fn bot_send_allowed(bot_id: &str) -> bool {
-    let key = rate_limit_key("bot-send", bot_id);
-    BOT_SEND.check_and_increment(&key)
 }

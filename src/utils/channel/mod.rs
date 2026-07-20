@@ -67,7 +67,6 @@ pub async fn populate_channel_user(db: &Database, id: ObjectId) -> Value {
                 "image": u.image,
                 "banner": u.banner,
                 "color": u.color,
-                "isBot": u.is_bot,
                 "badges": badges,
             })
         }

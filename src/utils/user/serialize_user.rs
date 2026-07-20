@@ -59,7 +59,6 @@ pub fn serialize_user_for_viewer(
         "isWhitelisted": user.is_whitelisted,
         "isWhitelistEnabled": is_whitelist_enabled,
         "twoFactorEnabled": user.two_factor_enabled,
-        "isBot": user.is_bot,
     });
 
     if is_self {

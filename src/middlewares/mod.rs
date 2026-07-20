@@ -1,7 +1,6 @@
 pub mod admin_auth_middleware;
 pub mod auth_fallback_guard;
 pub mod auth_middleware;
-pub mod bot_auth_middleware;
 pub mod client_guard;
 pub mod csrf;
 pub mod internal_proxy_guard;

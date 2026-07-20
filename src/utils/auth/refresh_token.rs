@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::model::refresh_token_model::RefreshToken;
 use crate::model::user_model::User;
-use crate::utils::auth::session_client::normalize_browser_name;
+use crate::utils::auth::session_client::{normalize_browser_name, resolved_os_label};
 use crate::utils::auth::session_metadata::SessionClientMetadata;
 use crate::utils::crypto::token_hash::{
     hash_refresh_token_for_storage, is_legacy_refresh_hash, legacy_refresh_token_hash,
@@ -28,6 +28,7 @@ pub struct UserSessionInfo {
     pub label: String,
     pub browser: String,
     pub os: String,
+    pub user_agent: Option<String>,
     pub is_known: bool,
     pub is_current: bool,
     pub created_at: Option<String>,
@@ -69,11 +70,12 @@ fn session_label(token: &RefreshToken) -> (String, String, String, bool) {
             .clone()
             .unwrap_or_else(|| "Nieznana przeglądarka".to_string()),
     );
-    let os = token
-        .client_os
-        .clone()
-        .unwrap_or_else(|| "Nieznany system".to_string());
-    let label = format!("{browser} On {os}");
+    let ua = token.client_user_agent.as_deref().unwrap_or("");
+    let os = resolved_os_label(
+        token.client_os.as_deref().unwrap_or(""),
+        ua,
+    );
+    let label = os.clone();
     let is_known = token.client_browser.is_some() && browser != "Nieznana przeglądarka";
     (label, browser, os, is_known)
 }
@@ -109,6 +111,10 @@ pub async fn list_user_sessions(
             label,
             browser,
             os,
+            user_agent: token
+                .client_user_agent
+                .clone()
+                .filter(|ua| !ua.trim().is_empty()),
             is_known,
             is_current,
             created_at,

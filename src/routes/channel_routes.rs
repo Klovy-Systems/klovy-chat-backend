@@ -2,10 +2,10 @@ use actix_web::web;
 use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::channel_controller::{
-    add_bot_to_channel, add_user_to_channel, ban_channel_member, create_channel, delete_channel,
-    delete_channel_avatar, get_channel_details, get_channel_messages, get_installable_bots,
+    add_user_to_channel, ban_channel_member, create_channel, delete_channel,
+    delete_channel_avatar, get_channel_details, get_channel_messages,
     get_user_channels, kick_channel_member, leave_channel, mute_channel_member, rename_channel,
-    remove_bot_from_channel, report_channel, toggle_channel_mute, unban_channel_member,
+    report_channel, toggle_channel_mute, unban_channel_member,
     unmute_channel_member, update_channel_chat_lock, update_channel_slowmode, upload_channel_avatar,
 };
 use crate::controllers::invite_controller::{create_invite, delete_invite, list_invites};
@@ -112,24 +112,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .wrap(from_fn(upload_limiter))
             .route(web::post().to(upload_channel_avatar))
             .route(web::delete().to(delete_channel_avatar)),
-    );
-    cfg.service(
-        web::resource("/{channelId}/installable-bots")
-            .wrap(from_fn(require_active_account))
-            .wrap(from_fn(verify_token))
-            .route(web::get().to(get_installable_bots)),
-    );
-    cfg.service(
-        web::resource("/{channelId}/bots/{botId}")
-            .wrap(from_fn(require_active_account))
-            .wrap(from_fn(verify_token))
-            .route(web::delete().to(remove_bot_from_channel)),
-    );
-    cfg.service(
-        web::resource("/{channelId}/bots")
-            .wrap(from_fn(require_active_account))
-            .wrap(from_fn(verify_token))
-            .route(web::post().to(add_bot_to_channel)),
     );
     cfg.service(
         web::resource("")

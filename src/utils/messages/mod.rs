@@ -46,7 +46,6 @@ pub async fn populate_user(db: &Database, id: ObjectId) -> Value {
             "bio": u.bio,
             "image": u.image,
             "color": u.color,
-            "isBot": u.is_bot,
         }),
         _ => Value::Null,
     }
@@ -140,7 +139,6 @@ fn user_to_json(u: &User) -> Value {
         "bio": u.bio,
         "image": u.image,
         "color": u.color,
-        "isBot": u.is_bot,
     })
 }
 

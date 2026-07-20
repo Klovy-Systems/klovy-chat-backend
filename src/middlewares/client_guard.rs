@@ -33,7 +33,6 @@ fn is_exempt(path: &str) -> bool {
         || path.starts_with("/api/security")
         || path.starts_with("/api/messages/attachment")
         || path.starts_with("/api/messages/download-file")
-        || path.starts_with("/api/bot/")
         || path.starts_with("/api/integrations/spotify/callback")
 }
 

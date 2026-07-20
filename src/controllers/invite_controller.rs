@@ -172,10 +172,14 @@ pub async fn get_invite(req: HttpRequest) -> HttpResponse {
         .ok()
         .flatten();
     let channel_json = channel.map(|c| {
+        let member_count = c.members.len() + 1;
         json!({
             "_id": c.id.map(|o| o.to_hex()),
             "name": c.name,
             "image": c.image,
+            "description": c.description,
+            "memberCount": member_count,
+            "createdAt": c.created_at.try_to_rfc3339_string().ok(),
         })
     });
 

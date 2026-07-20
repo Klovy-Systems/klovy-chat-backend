@@ -1,7 +1,6 @@
 pub mod announcement_model;
 pub mod audit_log_model;
 pub mod badge_model;
-pub mod bot_token_model;
 pub mod channel_moderation;
 pub mod channel_model;
 pub mod channel_read_state_model;

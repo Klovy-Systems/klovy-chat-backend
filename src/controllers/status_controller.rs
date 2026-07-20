@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::middlewares::auth_middleware::request_user_id;
 use crate::model::user_model::User;
-use crate::utils::friends::emit_to_friends;
+use crate::utils::friends::emit_status_event;
 use crate::utils::db::get_db;
 
 #[derive(Deserialize)]
@@ -28,17 +28,20 @@ pub async fn update_user_status(req: HttpRequest, body: web::Json<UpdateStatusBo
     };
 
     let db = get_db();
-    if User::set_fields(&db, oid, doc! { "availabilityStatus": &status })
-        .await
-        .is_err()
+    if User::set_fields(
+        &db,
+        oid,
+        doc! { "availabilityStatus": &status, "isOnline": true },
+    )
+    .await
+    .is_err()
     {
         return HttpResponse::InternalServerError().json(json!({ "error": "Server error" }));
     }
 
-    emit_to_friends(
+    emit_status_event(
         &db,
         &user_id,
-        "user-status-changed",
         json!({
             "userId": user_id,
             "status": {

@@ -29,7 +29,7 @@ fn short_version(version: &str, parts: usize) -> String {
     chunks[..parts].join(".")
 }
 
-fn extract_platform_from_user_agent(ua: &str) -> Option<String> {
+fn extract_platform_primary_segment(ua: &str) -> Option<String> {
     let start = ua.find('(')?;
     let rest = &ua[start + 1..];
     let end = rest.find(')')?;
@@ -42,21 +42,60 @@ fn extract_platform_from_user_agent(ua: &str) -> Option<String> {
         "X11", "WOW64", "Win64", "U", "Mobile", "Tablet", "compatible",
     ];
 
-    let segments: Vec<String> = inner
+    inner
         .split(';')
         .map(|part| part.trim())
-        .filter(|part| !part.is_empty())
-        .filter(|part| {
-            !noise.iter().any(|n| part.eq_ignore_ascii_case(n))
+        .find(|part| {
+            !part.is_empty()
+                && !noise.iter().any(|n| part.eq_ignore_ascii_case(n))
                 && !part.starts_with("rv:")
         })
         .map(str::to_string)
-        .collect();
+}
 
-    if segments.is_empty() {
-        return None;
+fn is_version_token(token: &str) -> bool {
+    if token.is_empty() {
+        return true;
     }
-    Some(segments.join(" · "))
+    token.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '_')
+}
+
+fn is_arch_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "x86" | "x86_64" | "x64" | "amd64" | "i686" | "arm64" | "aarch64" | "wow64" | "64-bit" | "32-bit"
+    )
+}
+
+pub fn simplify_os_label(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let primary = trimmed.split('·').next().unwrap_or(trimmed).trim();
+    let mut result = Vec::new();
+    let mut skip_next = false;
+
+    for word in primary.split_whitespace() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if word.eq_ignore_ascii_case("nt") {
+            skip_next = true;
+            continue;
+        }
+        if !is_version_token(word) && !is_arch_token(word) {
+            result.push(word);
+        }
+    }
+
+    result.join(" ").trim().to_string()
+}
+
+fn extract_platform_from_user_agent(ua: &str) -> Option<String> {
+    extract_platform_primary_segment(ua)
 }
 
 fn extract_browser_from_user_agent(ua: &str) -> Option<String> {
@@ -115,10 +154,16 @@ fn fallback_from_user_agent(ua: &str) -> ClientInfo {
 
     let browser = extract_browser_from_user_agent(trimmed)
         .unwrap_or_else(|| "Unknown browser".to_string());
-    let os = extract_platform_from_user_agent(trimmed)
-        .unwrap_or_else(|| "Unknown OS".to_string());
+    let os = simplify_os_label(
+        &extract_platform_from_user_agent(trimmed).unwrap_or_default(),
+    );
+    let os = if os.is_empty() {
+        "Unknown OS".to_string()
+    } else {
+        os
+    };
     let is_known = browser != "Unknown browser";
-    let label = format!("{browser} on {os}");
+    let label = os.clone();
 
     ClientInfo {
         browser,
@@ -161,8 +206,10 @@ fn detect_os_family(value: &str) -> Option<&'static str> {
     let lower = value.to_ascii_lowercase();
     if lower.contains("android") {
         Some("android")
-    } else if lower.contains("iphone") || lower.contains("ipad") || lower.contains("ios") {
+    } else if lower.contains("iphone") || lower.contains("ipad") || lower.contains("ipod") || lower.contains("ios") {
         Some("ios")
+    } else if lower.contains("cros") || lower.contains("chrome os") {
+        Some("chromeos")
     } else if lower.contains("windows") || lower.contains("win32") || lower.contains("win64") {
         Some("windows")
     } else if lower.contains("mac") || lower.contains("darwin") {
@@ -171,6 +218,22 @@ fn detect_os_family(value: &str) -> Option<&'static str> {
         Some("linux")
     } else {
         None
+    }
+}
+
+pub fn resolved_os_label(reported_os: &str, ua: &str) -> String {
+    let simplified = simplify_os_label(reported_os);
+    if !simplified.is_empty() {
+        return simplified;
+    }
+
+    let from_ua = simplify_os_label(
+        &extract_platform_from_user_agent(ua).unwrap_or_default(),
+    );
+    if from_ua.is_empty() {
+        "Unknown OS".to_string()
+    } else {
+        from_ua
     }
 }
 
@@ -206,7 +269,8 @@ pub fn resolve_client_info(ua: &str, env: &ClientEnvironmentHints) -> ClientInfo
     ) {
         let browser = normalize_browser_name(&browser);
         if client_environment_matches_user_agent(&browser, &os, ua) {
-            let label = format!("{browser} on {os}");
+            let os = resolved_os_label(&os, ua);
+            let label = os.clone();
             return ClientInfo {
                 browser,
                 os,
@@ -243,8 +307,8 @@ mod tests {
             ),
         );
         assert_eq!(info.browser, "Google Chrome 120.0");
-        assert_eq!(info.os, "Windows 15.0 · x86 · 64-bit");
-        assert_eq!(info.label, "Google Chrome 120.0 on Windows 15.0 · x86 · 64-bit");
+        assert_eq!(info.os, "Windows");
+        assert_eq!(info.label, "Windows");
     }
 
     #[test]
@@ -259,8 +323,8 @@ mod tests {
             },
         );
         assert_eq!(info.browser, "Chrome 120.0");
-        assert_eq!(info.os, "Windows NT 10.0 · x64");
-        assert_eq!(info.label, "Chrome 120.0 on Windows NT 10.0 · x64");
+        assert_eq!(info.os, "Windows");
+        assert_eq!(info.label, "Windows");
     }
 
     #[test]
@@ -274,14 +338,14 @@ mod tests {
                 label: Some("Totally fake session label".to_string()),
             },
         );
-        assert_eq!(info.label, "Chrome 120.0 on Windows NT 10.0 · x64");
+        assert_eq!(info.label, "Windows");
     }
 
     #[test]
     fn fallback_extracts_user_agent_parenthetical() {
         let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
         let info = resolve_client_info(ua, &ClientEnvironmentHints::default());
-        assert_eq!(info.os, "Windows NT 10.0 · x64");
+        assert_eq!(info.os, "Windows");
         assert_eq!(info.browser, "Chrome 120.0");
     }
 
@@ -289,7 +353,14 @@ mod tests {
     fn fallback_extracts_linux_segments() {
         let ua = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 Firefox/121.0";
         let info = resolve_client_info(ua, &ClientEnvironmentHints::default());
-        assert_eq!(info.os, "Ubuntu · Linux x86_64");
+        assert_eq!(info.os, "Ubuntu");
         assert_eq!(info.browser, "Firefox 121.0");
+    }
+
+    #[test]
+    fn simplify_os_label_strips_versions_without_mapping() {
+        assert_eq!(simplify_os_label("Windows NT 10.0 · x64"), "Windows");
+        assert_eq!(simplify_os_label("Windows"), "Windows");
+        assert_eq!(simplify_os_label("macOS 14.2"), "macOS");
     }
 }

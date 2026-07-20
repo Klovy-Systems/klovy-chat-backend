@@ -8,7 +8,7 @@ use actix_web_lab::middleware::from_fn;
 use std::env;
 
 use crate::routes::{
-    admin_routes, auth_routes, bot_routes, channel_routes, contact_routes, emoji_routes,
+    admin_routes, auth_routes, channel_routes, contact_routes, emoji_routes,
     friend_routes, gif_routes, integration_routes, invite_routes, message_routes, status_routes,
     sticker_routes, user_routes, voice_routes, whitelist_routes,
 };
@@ -23,7 +23,7 @@ use crate::middlewares::{
 };
 
 use crate::utils::ratelimit::{
-    auth_rate_limiter, bot_management_limiter, global_limiter, send_limiter,
+    auth_rate_limiter, global_limiter, send_limiter,
 };
 use crate::utils::upload_limits::{MAX_HTTP_BODY_BYTES, MAX_JSON_PAYLOAD_BYTES};
 
@@ -271,16 +271,6 @@ pub fn create_app(
                 .wrap(from_fn(send_limiter))
                 .wrap(from_fn(whitelist_check))
                 .configure(channel_routes::configure),
-        )
-        .service(
-            web::scope("/api/bots")
-                .wrap(from_fn(bot_management_limiter))
-                .wrap(from_fn(whitelist_check))
-                .configure(bot_routes::configure_management),
-        )
-        .service(
-            web::scope("/api/bot")
-                .configure(bot_routes::configure_runtime),
         )
         .service(
             web::scope("/api/contacts")

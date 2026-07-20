@@ -100,6 +100,12 @@ pub async fn emit_profile_event(db: &Database, user_id: &str, event: &str, data:
     emit_to_friends(db, user_id, event, data).await;
 }
 
+/// Rozgłasza zmianę obecności/statusu do samego użytkownika (wiele kart) i znajomych.
+pub async fn emit_status_event(db: &Database, user_id: &str, data: Value) {
+    crate::ws::registry::emit_to_user(user_id, "user-status-changed", data.clone());
+    emit_to_friends(db, user_id, "user-status-changed", data).await;
+}
+
 pub fn map_friend_user(user: &User) -> Value {
     json!({
         "_id": user.id.map(|o| o.to_hex()).unwrap_or_default(),
@@ -109,7 +115,6 @@ pub fn map_friend_user(user: &User) -> Value {
         "image": user.image,
         "banner": user.banner,
         "color": user.color,
-        "isBot": user.is_bot,
         "createdAt": user.created_at.try_to_rfc3339_string().ok(),
     })
 }

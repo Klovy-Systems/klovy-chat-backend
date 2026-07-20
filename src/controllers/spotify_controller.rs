@@ -164,7 +164,7 @@ async fn load_active_user(user_id: &str) -> Result<User, HttpResponse> {
     };
     let db = get_db();
     match User::find_by_id(&db, oid).await {
-        Ok(Some(user)) if user.is_login_allowed() && !user.is_bot => {
+        Ok(Some(user)) if user.is_login_allowed() => {
             Ok(user)
         }
         Ok(Some(_)) => Err(HttpResponse::Forbidden().json(json!({ "error": "Forbidden" }))),

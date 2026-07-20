@@ -167,12 +167,6 @@ pub struct User {
     #[serde(rename = "isAdmin", default)]
     pub is_admin: bool,
 
-    #[serde(rename = "isBot", default)]
-    pub is_bot: bool,
-
-    #[serde(rename = "ownerId", skip_serializing_if = "Option::is_none", default)]
-    pub owner_id: Option<ObjectId>,
-
     #[serde(default)]
     pub role: UserRole,
 
@@ -343,8 +337,6 @@ impl User {
             deletion_requested_at: None,
             deletion_scheduled_at: None,
             is_admin: false,
-            is_bot: false,
-            owner_id: None,
             role: UserRole::User,
             is_online: false,
             availability_status: AvailabilityStatus::Online,
@@ -399,7 +391,10 @@ impl User {
         username: &str,
     ) -> mongodb::error::Result<Option<User>> {
         Self::collection(db)
-            .find_one(doc! { "username": normalize_username(username) })
+            .find_one(doc! {
+                "username": normalize_username(username),
+                "isBot": { "$ne": true },
+            })
             .await
     }
 
@@ -480,100 +475,6 @@ impl User {
             })
             .await?;
         Ok(count > 0)
-    }
-
-    /// Tworzy konto bota — użytkownika z flagą `is_bot` i właścicielem.
-    /// Bot nie loguje się hasłem (uwierzytelnia się tokenem), więc zapisujemy
-    /// losowe, nieużywalne hasło.
-    pub async fn create_bot(
-        db: &Database,
-        username: &str,
-        display_name: &str,
-        owner: ObjectId,
-    ) -> Result<User, Box<dyn std::error::Error>> {
-        let username = normalize_username(username);
-        if !is_valid_username(&username) {
-            return Err("Invalid bot username".into());
-        }
-
-        let random = format!("{}{}", ObjectId::new().to_hex(), ObjectId::new().to_hex());
-        let password = hash_user_password(&random).await?;
-
-        let display = display_name.trim();
-        let display = if display.is_empty() { None } else { Some(display.to_string()) };
-
-        let now = DateTime::now();
-        let user = User {
-            id: None,
-            username,
-            password,
-            display_name: display,
-            bio: None,
-            image: None,
-            banner: None,
-            profile_setup: true,
-            color: None,
-            is_whitelisted: true,
-            is_active: true,
-            is_blocked: false,
-            is_banned: false,
-            block_reason: None,
-            blocked_at: None,
-            is_disabled: false,
-            disabled_at: None,
-            deletion_requested_at: None,
-            deletion_scheduled_at: None,
-            is_admin: false,
-            is_bot: true,
-            owner_id: Some(owner),
-            role: UserRole::User,
-            is_online: false,
-            availability_status: AvailabilityStatus::Online,
-            last_seen: None,
-            listening_activity: None,
-            share_listening: true,
-            language: default_language(),
-            muted_channels: vec![],
-            muted_contacts: vec![],
-            blocked_contacts: vec![],
-            badges: vec![],
-            featured_badge_ids: vec![],
-            token_version: 0,
-            two_factor_enabled: false,
-            totp_secret: None,
-            totp_pending_secret: None,
-            backup_codes: None,
-            created_at: now,
-            updated_at: now,
-        };
-
-        let result = Self::collection(db).insert_one(&user).await?;
-        let id = result.inserted_id.as_object_id();
-        Ok(User { id, ..user })
-    }
-
-    /// Zwraca boty należące do wskazanego właściciela.
-    pub async fn find_bots_by_owner(
-        db: &Database,
-        owner: ObjectId,
-    ) -> mongodb::error::Result<Vec<User>> {
-        use futures_util::TryStreamExt;
-        Self::collection(db)
-            .find(doc! { "isBot": true, "ownerId": owner })
-            .sort(doc! { "createdAt": -1 })
-            .await?
-            .try_collect()
-            .await
-    }
-
-    /// Zwraca użytkownika, o ile jest botem.
-    pub async fn find_bot(
-        db: &Database,
-        id: ObjectId,
-    ) -> mongodb::error::Result<Option<User>> {
-        Self::collection(db)
-            .find_one(doc! { "_id": id, "isBot": true })
-            .await
     }
 
     pub async fn invalidate_tokens(
