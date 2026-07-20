@@ -5,6 +5,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 
 jobs:
 
@@ -15,78 +18,186 @@ jobs:
 
     steps:
 
-    # Pobiera kod z GitHuba
     - name: Checkout
       uses: actions/checkout@v4
 
 
-    # Instaluje Rust
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
 
-    # Buduje backend
     - name: Build Rust backend
-      run: cargo build --release
+      run: |
+        cargo build --release
 
 
-    # Przygotowanie SSH
     - name: Setup SSH
       run: |
+
         mkdir -p ~/.ssh
+
         echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+
         chmod 600 ~/.ssh/id_ed25519
 
-
-    # Kopiuje binarkę na VPS
-    - name: Upload binary
-      run: |
-        rsync -avz \
-        -e "ssh -p ${{ secrets.SSH_PORT }} -o StrictHostKeyChecking=no" \
-        target/release/klovychat \
-        ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/klovychat.new
+        ssh-keyscan \
+          -p ${{ secrets.SSH_PORT }} \
+          ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
 
 
-    # Aktualizacja serwera
-    - name: Deploy
+
+    - name: Test SSH connection
       run: |
 
         ssh \
-        -p ${{ secrets.SSH_PORT }} \
-        -o StrictHostKeyChecking=no \
-        ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+          -i ~/.ssh/id_ed25519 \
+          -p ${{ secrets.SSH_PORT }} \
+          -o StrictHostKeyChecking=yes \
+          ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+          "whoami && echo SSH_OK"
 
 
-        set -e
+
+    - name: Upload binary
+      run: |
+
+        rsync \
+          -avz \
+          --timeout=30 \
+          -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }} -o StrictHostKeyChecking=yes" \
+          target/release/klovychat \
+          ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/klovychat.new
 
 
-        echo "Backup starej wersji"
 
-        cp /opt/klovy/backend/klovychat \
-        /opt/klovy/backend/klovychat.backup
+    - name: Deploy backend
+      run: |
 
-
-        echo "Podmiana binarki"
-
-
-        install -m755 \
-        /tmp/klovychat.new \
-        /opt/klovy/backend/klovychat
+        ssh \
+          -i ~/.ssh/id_ed25519 \
+          -p ${{ secrets.SSH_PORT }} \
+          -o StrictHostKeyChecking=yes \
+          ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
 
 
-        echo "Restart systemd"
+        set -euo pipefail
+
+
+        APP_DIR="/opt/klovy/backend"
+
+        APP="$APP_DIR/klovychat"
+
+        NEW="/tmp/klovychat.new"
+
+        BACKUP="$APP_DIR/klovychat.backup.$(date +%Y%m%d_%H%M%S)"
+
+
+
+        echo "=== Checking files ==="
+
+
+        if [ ! -f "$NEW" ]; then
+
+            echo "New binary missing!"
+
+            exit 1
+
+        fi
+
+
+
+        if [ ! -f "$APP" ]; then
+
+            echo "Current binary missing!"
+
+            exit 1
+
+        fi
+
+
+
+        echo "=== Backup current binary ==="
+
+
+        cp "$APP" "$BACKUP"
+
+
+
+        echo "Backup created:"
+        echo "$BACKUP"
+
+
+
+        echo "=== Installing new binary ==="
+
+
+        install \
+          -m755 \
+          "$NEW" \
+          "$APP"
+
+
+
+        echo "=== Restarting service ==="
 
 
         sudo systemctl restart klovychat
 
 
+
+        echo "=== Waiting for startup ==="
+
+
         sleep 5
 
 
-        echo "Sprawdzenie"
+
+        echo "=== Health check ==="
 
 
-        sudo systemctl is-active klovychat
+        if ! sudo systemctl is-active --quiet klovychat
+
+        then
+
+            echo "Service failed!"
+
+            echo "=== Rollback ==="
+
+
+            cp "$BACKUP" "$APP"
+
+
+            sudo systemctl restart klovychat
+
+
+            sleep 5
+
+
+
+            if ! sudo systemctl is-active --quiet klovychat
+
+            then
+
+                echo "Rollback failed!"
+
+                exit 1
+
+            fi
+
+
+            echo "Rollback successful"
+
+
+            exit 1
+
+        fi
+
+
+
+        echo "=== Deploy successful ==="
+
+
+        sudo systemctl status klovychat --no-pager || true
 
 
         EOF
