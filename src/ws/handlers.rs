@@ -15,9 +15,13 @@ use crate::utils::access::membership_gate::{
 use crate::utils::ratelimit::slowmode::check_channel_slowmode;
 use crate::utils::db::get_db;
 use crate::utils::friends::{are_friends, is_dm_blocked};
+use crate::utils::channel::can_access_channel;
 use crate::utils::voice::call_sessions::{
     accept_session, cancel_session, create_ringing_session, end_session, reject_session,
     CallPhase, CallSessionError,
+};
+use crate::utils::voice::channel_voice::{
+    join_channel_voice, leave_channel_voice, participants_in_channel,
 };
 use crate::utils::validators::sanitize_input::sanitize_message_content;
 use crate::utils::messages::access::{
@@ -1164,6 +1168,93 @@ async fn handle_call_timeout(connected: &str, payload: CallPayload) {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ChannelVoicePayload {
+    #[serde(rename = "channelId")]
+    channel_id: Option<String>,
+}
+
+async fn emit_channel_voice_state(channel_id: &str, participants: &[String]) {
+    let db = get_db();
+    let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
+        return;
+    };
+    let Ok(Some(channel)) = Channel::find_by_id(&db, channel_oid).await else {
+        return;
+    };
+    let recipients = registry::channel_recipient_ids(&channel);
+    let body = json!({
+        "channelId": channel_id,
+        "participants": participants,
+    });
+    for user_id in recipients {
+        registry::emit_to_user(&user_id, "channel-voice:state", body.clone());
+    }
+}
+
+async fn handle_channel_voice_join(connected: &str, payload: ChannelVoicePayload) {
+    let Some(channel_id) = payload.channel_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    if !is_valid_object_id(channel_id) {
+        return;
+    }
+    let db = get_db();
+    let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
+        return;
+    };
+    let Ok(Some(channel)) = Channel::find_by_id(&db, channel_oid).await else {
+        return;
+    };
+    if !can_access_channel(&channel, Some(connected)) {
+        return;
+    }
+    let participants = join_channel_voice(channel_id, connected);
+    emit_channel_voice_state(channel_id, &participants).await;
+}
+
+async fn handle_channel_voice_leave(connected: &str, payload: ChannelVoicePayload) {
+    let Some(channel_id) = payload.channel_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    if !is_valid_object_id(channel_id) {
+        return;
+    }
+    let participants = leave_channel_voice(channel_id, connected);
+    emit_channel_voice_state(channel_id, &participants).await;
+}
+
+async fn handle_channel_voice_state_request(connected: &str, payload: ChannelVoicePayload) {
+    let Some(channel_id) = payload.channel_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    if !is_valid_object_id(channel_id) {
+        return;
+    }
+    let db = get_db();
+    let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
+        return;
+    };
+    let Ok(Some(channel)) = Channel::find_by_id(&db, channel_oid).await else {
+        return;
+    };
+    if !can_access_channel(&channel, Some(connected)) {
+        return;
+    }
+    let participants = participants_in_channel(channel_id);
+    registry::emit_to_user(
+        connected,
+        "channel-voice:state",
+        json!({
+            "channelId": channel_id,
+            "participants": participants,
+        }),
+    );
+}
+
 /// Formats a call duration as `H:MM:SS` or `M:SS`.
 fn format_call_duration(total_secs: u64) -> String {
     let hours = total_secs / 3600;
@@ -1450,6 +1541,19 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
             }
             if let Ok(p) = serde_json::from_value::<CallPayload>(payload) {
                 handle_call_timeout(connected, p).await;
+            }
+        }
+        "channel-voice:join" | "channel-voice:leave" | "channel-voice:state" => {
+            if !state.check_rate_limit(connected, msg_type, 40, 60_000).await {
+                emit_rate_limit_error(connected);
+                return;
+            }
+            if let Ok(p) = serde_json::from_value::<ChannelVoicePayload>(payload) {
+                match msg_type {
+                    "channel-voice:join" => handle_channel_voice_join(connected, p).await,
+                    "channel-voice:leave" => handle_channel_voice_leave(connected, p).await,
+                    _ => handle_channel_voice_state_request(connected, p).await,
+                }
             }
         }
         _ => {}

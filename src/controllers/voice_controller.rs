@@ -7,10 +7,13 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::middlewares::auth_middleware::request_user_id;
+use crate::model::channel_model::Channel;
+use crate::utils::channel::can_access_channel;
 use crate::utils::db::get_db;
 use crate::utils::friends::are_friends;
 use crate::utils::ratelimit::Store;
 use crate::utils::voice::call_sessions::{active_session_for_user, token_allowed, CallSessionError};
+use mongodb::bson::oid::ObjectId;
 
 const TOKEN_TTL_SECS: i64 = 3 * 60;
 
@@ -22,10 +25,16 @@ pub fn build_dm_room_name(user_a: &str, user_b: &str) -> String {
     format!("dm_{}_{}", ids[0], ids[1])
 }
 
+pub fn build_channel_room_name(channel_id: &str) -> String {
+    format!("channel_{channel_id}")
+}
+
 #[derive(Deserialize)]
 pub struct VoiceTokenBody {
     #[serde(rename = "peerId")]
     pub peer_id: Option<String>,
+    #[serde(rename = "channelId")]
+    pub channel_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -74,22 +83,62 @@ pub async fn get_voice_token(req: HttpRequest, body: web::Json<VoiceTokenBody>) 
         }));
     }
 
-    let peer_id = match body.peer_id.as_deref() {
-        Some(p) if !p.is_empty() => p.to_string(),
-        _ => return HttpResponse::BadRequest().json(json!({ "message": "peerId is required." })),
-    };
+    let peer_id = body.peer_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let channel_id = body.channel_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    if peer_id == user_id {
-        return HttpResponse::BadRequest().json(json!({ "message": "Cannot call yourself." }));
-    }
+    let room = match (peer_id, channel_id) {
+        (Some(peer_id), None) => {
+            if peer_id == user_id {
+                return HttpResponse::BadRequest().json(json!({ "message": "Cannot call yourself." }));
+            }
 
-    let session = match token_allowed(&user_id, &peer_id) {
-        Ok(session) => session,
-        Err(err) => {
-            return HttpResponse::Forbidden().json(json!({
-                "message": token_denied_message(err),
-                "code": "CALL_NOT_ACCEPTED"
-            }));
+            let session = match token_allowed(&user_id, peer_id) {
+                Ok(session) => session,
+                Err(err) => {
+                    return HttpResponse::Forbidden().json(json!({
+                        "message": token_denied_message(err),
+                        "code": "CALL_NOT_ACCEPTED"
+                    }));
+                }
+            };
+
+            let db = get_db();
+            if !are_friends(&db, &user_id, peer_id).await {
+                return HttpResponse::Forbidden()
+                    .json(json!({ "message": "Możesz dzwonić tylko do znajomych." }));
+            }
+
+            let _ = session;
+            build_dm_room_name(&user_id, peer_id)
+        }
+        (None, Some(channel_id)) => {
+            let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
+                return HttpResponse::BadRequest().json(json!({ "message": "Invalid channel ID." }));
+            };
+            let db = get_db();
+            let channel = match Channel::find_by_id(&db, channel_oid).await {
+                Ok(Some(channel)) => channel,
+                Ok(None) => {
+                    return HttpResponse::NotFound().json(json!({ "message": "Channel not found." }));
+                }
+                Err(_) => {
+                    return HttpResponse::InternalServerError()
+                        .json(json!({ "message": "Failed to load channel." }));
+                }
+            };
+            if !can_access_channel(&channel, Some(&user_id)) {
+                return HttpResponse::Forbidden()
+                    .json(json!({ "message": "Nie masz dostępu do tego kanału." }));
+            }
+            build_channel_room_name(channel_id)
+        }
+        (Some(_), Some(_)) => {
+            return HttpResponse::BadRequest()
+                .json(json!({ "message": "Podaj wyłącznie peerId albo channelId." }));
+        }
+        (None, None) => {
+            return HttpResponse::BadRequest()
+                .json(json!({ "message": "peerId or channelId is required." }));
         }
     };
 
@@ -109,16 +158,8 @@ pub async fn get_voice_token(req: HttpRequest, body: web::Json<VoiceTokenBody>) 
             .json(json!({ "message": "Voice service is not configured." }));
     }
 
-    let db = get_db();
-    if !are_friends(&db, &user_id, &peer_id).await {
-        return HttpResponse::Forbidden()
-            .json(json!({ "message": "Możesz dzwonić tylko do znajomych." }));
-    }
-
-    let room = build_dm_room_name(&user_id, &peer_id);
-
     let now = chrono::Utc::now().timestamp();
-    let jti = format!("{}:{}", session.session_id, Uuid::new_v4());
+    let jti = format!("voice:{user_id}:{}", Uuid::new_v4());
     let claims = LiveKitClaims {
         exp: (now + TOKEN_TTL_SECS) as usize,
         iss: api_key,
