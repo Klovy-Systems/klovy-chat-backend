@@ -79,6 +79,25 @@ impl Store {
         }
         bucket.count += 1;
     }
+
+    /// Seconds until the current window resets (at least 1 when blocked).
+    pub fn retry_after_secs(&self, key: &str) -> u64 {
+        let map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        match map.get(key) {
+            Some(b) if now < b.reset => b.reset.duration_since(now).as_secs().max(1),
+            _ => self.window.as_secs().max(1),
+        }
+    }
+
+    /// Atomically checks quota and consumes one slot. Returns retry-after seconds on failure.
+    pub fn try_consume(&self, key: &str) -> Result<(), u64> {
+        if self.check_and_increment(key) {
+            Ok(())
+        } else {
+            Err(self.retry_after_secs(key))
+        }
+    }
 }
 
 use crate::middlewares::auth_middleware::RequestUserId;
@@ -176,6 +195,25 @@ static WS_HANDSHAKE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_se
 static CHANGE_PASSWORD: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static CHANGE_USERNAME: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static FRIEND_ACTION: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(5 * 60)));
+static CHAT_ATTACHMENT: Lazy<Store> = Lazy::new(|| {
+    Store::new(
+        crate::utils::upload_limits::MAX_CHAT_ATTACHMENTS_PER_WINDOW,
+        crate::utils::upload_limits::chat_attachment_window(),
+    )
+});
+
+fn chat_attachment_key(user_id: &str) -> String {
+    rate_limit_key("chat-attachment", user_id)
+}
+
+/// Rolling quota for DM/channel file uploads (images, documents, voice notes, etc.).
+pub fn try_consume_chat_attachment_quota(user_id: &str) -> Result<(), u64> {
+    CHAT_ATTACHMENT.try_consume(&chat_attachment_key(user_id))
+}
+
+pub fn chat_attachment_retry_after_secs(user_id: &str) -> u64 {
+    CHAT_ATTACHMENT.retry_after_secs(&chat_attachment_key(user_id))
+}
 
 pub async fn global_limiter(
     req: ServiceRequest,

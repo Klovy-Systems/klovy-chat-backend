@@ -308,6 +308,45 @@ pub async fn can_pin_message(db: &Database, user_id: &str, msg: &Message) -> boo
     false
 }
 
+pub fn dm_conversation_base_clauses(user: ObjectId, contact: ObjectId) -> Vec<mongodb::bson::Document> {
+    vec![
+        doc! { "$or": [
+            { "sender": user, "recipient": contact },
+            { "sender": contact, "recipient": user },
+        ]},
+        doc! { "deleted": { "$ne": true } },
+        doc! { "$or": dm_only_or_clause() },
+    ]
+}
+
+pub fn message_belongs_to_dm_conversation(msg: &Message, user: ObjectId, contact: ObjectId) -> bool {
+    msg.recipient.is_some()
+        && msg.channel.is_none()
+        && !msg.deleted
+        && ((msg.sender == user && msg.recipient == Some(contact))
+            || (msg.sender == contact && msg.recipient == Some(user)))
+}
+
+/// Kursor paginacji musi wskazywać wiadomość z tej samej rozmowy DM.
+pub async fn validate_dm_history_before_cursor(
+    db: &Database,
+    user: ObjectId,
+    contact: ObjectId,
+    before_id: &str,
+) -> Result<ObjectId, ()> {
+    let Ok(before_oid) = ObjectId::parse_str(before_id) else {
+        return Err(());
+    };
+    let Some(msg) = Message::find_by_id(db, before_oid).await.ok().flatten() else {
+        return Err(());
+    };
+    if message_belongs_to_dm_conversation(&msg, user, contact) {
+        Ok(before_oid)
+    } else {
+        Err(())
+    }
+}
+
 pub async fn can_access_dm_messages(db: &Database, user_id: &str, contact_id: &str) -> bool {
     require_dm_access(db, user_id, contact_id).await.is_ok()
 }
@@ -318,4 +357,74 @@ pub async fn can_access_channel_messages(
     channel_id: &str,
 ) -> Option<Channel> {
     require_channel_access(db, channel_id, user_id).await.ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::messages_model::MessageType;
+    use mongodb::bson::DateTime;
+    use std::collections::HashMap;
+
+    fn sample_dm_message(sender: ObjectId, recipient: ObjectId) -> Message {
+        let now = DateTime::now();
+        Message {
+            id: Some(ObjectId::new()),
+            sender,
+            recipient: Some(recipient),
+            channel: None,
+            content: "hello".to_string(),
+            message_type: MessageType::Text,
+            file_url: None,
+            file_type: None,
+            file_size: None,
+            file_name: None,
+            duration_ms: None,
+            timestamp: now,
+            read: false,
+            read_by: Vec::new(),
+            reactions: HashMap::new(),
+            quoted_message: None,
+            mentions: Vec::new(),
+            mentions_everyone: false,
+            edited: false,
+            edited_at: None,
+            deleted: false,
+            deleted_at: None,
+            pinned: false,
+            pinned_at: None,
+            pinned_by: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn message_belongs_to_dm_conversation_accepts_both_directions() {
+        let user = ObjectId::new();
+        let contact = ObjectId::new();
+        let outbound = sample_dm_message(user, contact);
+        let inbound = sample_dm_message(contact, user);
+
+        assert!(message_belongs_to_dm_conversation(&outbound, user, contact));
+        assert!(message_belongs_to_dm_conversation(&inbound, user, contact));
+    }
+
+    #[test]
+    fn message_belongs_to_dm_conversation_rejects_foreign_or_channel_messages() {
+        let user = ObjectId::new();
+        let contact = ObjectId::new();
+        let stranger = ObjectId::new();
+
+        let foreign = sample_dm_message(user, stranger);
+        assert!(!message_belongs_to_dm_conversation(&foreign, user, contact));
+
+        let mut channel_msg = sample_dm_message(user, contact);
+        channel_msg.channel = Some(ObjectId::new());
+        assert!(!message_belongs_to_dm_conversation(&channel_msg, user, contact));
+
+        let mut deleted = sample_dm_message(user, contact);
+        deleted.deleted = true;
+        assert!(!message_belongs_to_dm_conversation(&deleted, user, contact));
+    }
 }

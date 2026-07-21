@@ -1,8 +1,8 @@
 /// Maximum size for non-image chat attachments (10 MB).
 pub const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Maximum size for chat image uploads before re-encode (3 MB).
-pub const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 3 * 1024 * 1024;
+/// Maximum size for chat image uploads before re-encode (10 MB).
+pub const MAX_IMAGE_ATTACHMENT_BYTES: u64 = MAX_ATTACHMENT_BYTES;
 
 /// Maximum size for profile/channel avatars (6 MB).
 pub const MAX_AVATAR_BYTES: u64 = 6 * 1024 * 1024;
@@ -36,6 +36,16 @@ pub const AVATAR_WEBP_QUALITY: f32 = 85.0;
 
 /// Maximum pending (not yet sent in a message) attachment uploads per user.
 pub const MAX_PENDING_UPLOADS_PER_USER: u64 = 20;
+
+/// Maximum chat attachments (DM + channel) a user may upload within the rolling window.
+pub const MAX_CHAT_ATTACHMENTS_PER_WINDOW: u32 = 20;
+
+/// Rolling window for chat attachment uploads (40 minutes).
+pub const CHAT_ATTACHMENT_WINDOW_SECS: u64 = 40 * 60;
+
+pub fn chat_attachment_window() -> std::time::Duration {
+    std::time::Duration::from_secs(CHAT_ATTACHMENT_WINDOW_SECS)
+}
 
 /// Default total attachment storage per user (100 MB).
 pub const DEFAULT_USER_STORAGE_BYTES: u64 = 100 * 1024 * 1024;

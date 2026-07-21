@@ -78,6 +78,9 @@ pub async fn require_dm_access(
     if ObjectId::parse_str(user_id).is_err() || ObjectId::parse_str(contact_id).is_err() {
         return Err(AccessDeniedReason::InvalidId);
     }
+    if user_id == contact_id {
+        return Err(AccessDeniedReason::InvalidId);
+    }
     if !are_friends(db, user_id, contact_id).await {
         return Err(AccessDeniedReason::NotFriends);
     }
@@ -85,6 +88,19 @@ pub async fn require_dm_access(
         return Err(AccessDeniedReason::Blocked);
     }
     Ok(())
+}
+
+/// Autoryzacja odczytu historii DM — wymaga zalogowanego użytkownika będącego
+/// zaakceptowanym znajomym (bez blokady). Zwraca sparsowane ObjectId obu stron.
+pub async fn authorize_dm_history_read(
+    db: &Database,
+    user_id: &str,
+    contact_id: &str,
+) -> Result<(ObjectId, ObjectId), AccessDeniedReason> {
+    let user_oid = ObjectId::parse_str(user_id).map_err(|_| AccessDeniedReason::InvalidId)?;
+    let contact_oid = ObjectId::parse_str(contact_id).map_err(|_| AccessDeniedReason::InvalidId)?;
+    require_dm_access(db, user_id, contact_id).await?;
+    Ok((user_oid, contact_oid))
 }
 
 pub async fn require_message_participant(

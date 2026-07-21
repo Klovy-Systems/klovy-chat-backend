@@ -14,23 +14,25 @@ use crate::model::user_storage_usage_model::UserStorageUsage;
 use crate::utils::file_hash::sha256_hex;
 use crate::model::user_model::User;
 use crate::utils::attachment_audit::log_attachment_upload;
-use crate::utils::access::membership_gate::{require_dm_access, require_message_participant};
+use crate::utils::access::membership_gate::{authorize_dm_history_read, require_message_participant};
 use crate::utils::db::get_db;
 use crate::utils::image_reencode::{
     reencode_error_message, reencode_upload_to_webp_variants,
 };
 use crate::utils::messages::{
     access::cleanup_attachment_if_unreferenced,
-    can_access_channel_messages, can_access_dm_messages, can_pin_message, dm_only_or_clause,
-    escape_regex, serialize_message, serialize_messages_batch,
+    can_access_channel_messages, can_access_dm_messages, can_pin_message, dm_conversation_base_clauses,
+    escape_regex, serialize_message, serialize_messages_batch, validate_dm_history_before_cursor,
+    message_belongs_to_dm_conversation,
 };
 use crate::utils::validators::sanitize_input::sanitize_message_content;
 use crate::utils::storage::{
     attachment_dm_key, attachment_group_key, attachment_thumb_key, storage,
 };
+use crate::utils::ratelimit::try_consume_chat_attachment_quota;
 use crate::utils::upload_limits::{
     file_bytes_within_limit, is_image_extension, local_file_size, MAX_ATTACHMENT_BYTES,
-    MAX_IMAGE_ATTACHMENT_BYTES,
+    MAX_CHAT_ATTACHMENTS_PER_WINDOW, MAX_IMAGE_ATTACHMENT_BYTES, CHAT_ATTACHMENT_WINDOW_SECS,
 };
 use crate::utils::validators::archive_validation::validate_upload_document;
 use crate::utils::validators::file_magic::{resolve_upload_content_type, validate_file_magic};
@@ -69,51 +71,47 @@ pub struct GetMessagesBody {
 }
 
 pub async fn get_messages(req: HttpRequest, body: web::Json<GetMessagesBody>) -> HttpResponse {
-    let Some(user1) = request_user_id(&req) else {
+    let Some(user_id) = request_user_id(&req) else {
         return HttpResponse::Unauthorized().json(json!({
             "error": "UNAUTHORIZED",
             "message": "Authentication required.",
         }));
     };
-    let user2 = body.id.clone().unwrap_or_default();
+    let contact_id = body.id.clone().unwrap_or_default();
 
-    if user1.is_empty() || user2.is_empty() {
-        return HttpResponse::BadRequest().body("Both user IDs are required.");
-    }
-
-    if user1 == user2 {
-        return HttpResponse::BadRequest().body("Invalid contact.");
-    }
-
-    let (Ok(u1), Ok(u2)) = (ObjectId::parse_str(&user1), ObjectId::parse_str(&user2)) else {
-        return HttpResponse::BadRequest().body("Invalid user ID format.");
-    };
-
-    let db = get_db();
-    if let Err(reason) = require_dm_access(&db, &user1, &user2).await {
-        return HttpResponse::Forbidden().json(json!({
-            "error": "ACCESS_DENIED",
-            "message": reason.as_str(),
+    if contact_id.is_empty() {
+        return HttpResponse::BadRequest().json(json!({
+            "error": "INVALID_REQUEST",
+            "message": "Contact id is required.",
         }));
     }
+
+    let db = get_db();
+    let (user_oid, contact_oid) = match authorize_dm_history_read(&db, &user_id, &contact_id).await {
+        Ok(pair) => pair,
+        Err(reason) => {
+            return HttpResponse::Forbidden().json(json!({
+                "error": "ACCESS_DENIED",
+                "message": reason.as_str(),
+            }));
+        }
+    };
 
     let limit = body
         .limit
         .unwrap_or(DEFAULT_MESSAGE_LIMIT)
         .clamp(1, MAX_MESSAGE_LIMIT);
 
-    let mut and_clauses = vec![
-        doc! { "$or": [
-            { "sender": u1, "recipient": u2 },
-            { "sender": u2, "recipient": u1 },
-        ]},
-        doc! { "deleted": { "$ne": true } },
-        doc! { "$or": dm_only_or_clause() },
-    ];
+    let mut and_clauses = dm_conversation_base_clauses(user_oid, contact_oid);
 
     if let Some(before_id) = body.before.as_deref().filter(|s| !s.is_empty()) {
-        let Ok(before_oid) = ObjectId::parse_str(before_id) else {
-            return HttpResponse::BadRequest().body("Invalid cursor.");
+        let Ok(before_oid) =
+            validate_dm_history_before_cursor(&db, user_oid, contact_oid, before_id).await
+        else {
+            return HttpResponse::BadRequest().json(json!({
+                "error": "INVALID_CURSOR",
+                "message": "Invalid pagination cursor.",
+            }));
         };
         and_clauses.push(doc! { "_id": { "$lt": before_oid } });
     }
@@ -137,11 +135,7 @@ pub async fn get_messages(req: HttpRequest, body: web::Json<GetMessagesBody>) ->
         messages.truncate(limit as usize);
     }
     // Defense-in-depth: never return messages outside this DM pair.
-    messages.retain(|m| {
-        m.recipient.is_some()
-            && ((m.sender == u1 && m.recipient == Some(u2))
-                || (m.sender == u2 && m.recipient == Some(u1)))
-    });
+    messages.retain(|m| message_belongs_to_dm_conversation(m, user_oid, contact_oid));
     messages.reverse();
 
     let out = serialize_all(&db, &messages).await;
@@ -225,6 +219,22 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     }
 
     let db = get_db();
+
+    if matches!(context_type.as_str(), "dm" | "channel") {
+        if let Err(retry_after) = try_consume_chat_attachment_quota(&user_id) {
+            let window_minutes = CHAT_ATTACHMENT_WINDOW_SECS / 60;
+            return HttpResponse::TooManyRequests().json(json!({
+                "error": "CHAT_ATTACHMENT_LIMIT",
+                "message": format!(
+                    "Osiągnięto limit {} załączników na {} minut. Spróbuj ponownie później.",
+                    MAX_CHAT_ATTACHMENTS_PER_WINDOW,
+                    window_minutes,
+                ),
+                "retryAfter": retry_after,
+            }));
+        }
+    }
+
     let stored_ext = if is_image { "webp" } else { ext.as_str() };
 
     let logical_path = match context_type.as_str() {
@@ -600,14 +610,11 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
     }
 
     if let Some(contact_id) = body.contact_id.as_deref().filter(|s| !s.is_empty()) {
-        if !can_access_dm_messages(&db, &user_id, contact_id).await {
-            return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
-        }
-        let (Ok(uid), Ok(cid)) = (
-            ObjectId::parse_str(&user_id),
-            ObjectId::parse_str(contact_id),
-        ) else {
-            return HttpResponse::BadRequest().json(json!({ "error": "Invalid id" }));
+        let (uid, cid) = match authorize_dm_history_read(&db, &user_id, contact_id).await {
+            Ok(pair) => pair,
+            Err(_) => {
+                return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
+            }
         };
         let filter = doc! {
             "$and": [
@@ -629,11 +636,7 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
             Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
         };
         let mut messages = messages;
-        messages.retain(|m| {
-            m.recipient.is_some()
-                && ((m.sender == uid && m.recipient == Some(cid))
-                    || (m.sender == cid && m.recipient == Some(uid)))
-        });
+        messages.retain(|m| message_belongs_to_dm_conversation(m, uid, cid));
         let out = serialize_all(&db, &messages).await;
         return HttpResponse::Ok().json(json!({ "messages": out }));
     }
@@ -693,14 +696,11 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
     }
 
     if let Some(contact_id) = body.contact_id.as_deref().filter(|s| !s.is_empty()) {
-        if !can_access_dm_messages(&db, &user_id, contact_id).await {
-            return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
-        }
-        let (Ok(uid), Ok(cid)) = (
-            ObjectId::parse_str(&user_id),
-            ObjectId::parse_str(contact_id),
-        ) else {
-            return HttpResponse::BadRequest().json(json!({ "error": "Invalid id" }));
+        let (uid, cid) = match authorize_dm_history_read(&db, &user_id, contact_id).await {
+            Ok(pair) => pair,
+            Err(_) => {
+                return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
+            }
         };
         let filter = doc! {
             "$and": [
@@ -723,11 +723,7 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
             Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
         };
         let mut messages = messages;
-        messages.retain(|m| {
-            m.recipient.is_some()
-                && ((m.sender == uid && m.recipient == Some(cid))
-                    || (m.sender == cid && m.recipient == Some(uid)))
-        });
+        messages.retain(|m| message_belongs_to_dm_conversation(m, uid, cid));
         let out = serialize_all(&db, &messages).await;
         return HttpResponse::Ok().json(json!({ "messages": out }));
     }
