@@ -152,6 +152,11 @@ impl ChannelReport {
         Self::collection(db).find_one(doc! { "_id": id }).await
     }
 
+    pub async fn delete_by_id(db: &Database, id: ObjectId) -> mongodb::error::Result<bool> {
+        let result = Self::collection(db).delete_one(doc! { "_id": id }).await?;
+        Ok(result.deleted_count > 0)
+    }
+
     pub async fn update_status(
         db: &Database,
         id: ObjectId,

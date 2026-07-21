@@ -845,6 +845,41 @@ pub async fn update_channel_report_status(
     }))
 }
 
+pub async fn delete_channel_report(req: HttpRequest) -> HttpResponse {
+    let Ok(rid) = ObjectId::parse_str(param(&req, "reportId")) else {
+        return HttpResponse::NotFound().json(json!({ "message": "Zgłoszenie nie znalezione" }));
+    };
+
+    let db = get_db();
+    let report = match ChannelReport::find_by_id(&db, rid).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Zgłoszenie nie znalezione" }));
+        }
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({ "message": "Internal Server Error" }));
+        }
+    };
+
+    if !ChannelReport::delete_by_id(&db, rid).await.unwrap_or(false) {
+        return HttpResponse::NotFound().json(json!({ "message": "Zgłoszenie nie znalezione" }));
+    }
+
+    log_admin_action(
+        &req,
+        "report.delete",
+        Some("channel_report"),
+        Some(&rid.to_hex()),
+        json!({
+            "channelId": report.channel_id.to_hex(),
+            "channelName": report.channel_name,
+        }),
+    )
+    .await;
+
+    HttpResponse::Ok().json(json!({ "message": "Zgłoszenie zostało usunięte." }))
+}
+
 pub async fn list_badges() -> HttpResponse {
     let db = get_db();
     let badges: Vec<Badge> = match Badge::collection(&db)

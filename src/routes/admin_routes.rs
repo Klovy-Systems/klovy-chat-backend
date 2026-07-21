@@ -3,10 +3,10 @@ use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::admin_controller::{
     admin_logout, admin_session_status, assign_badge, block_user, create_badge,
-    delete_badge, delete_channel_admin, delete_user, delete_user_warning, get_user_badges,
-    list_badges, list_channel_reports, list_channels, list_user_warnings, list_users, remove_badge,
-    restore_user, set_user_password, set_user_whitelist, unblock_user, update_badge,
-    update_channel_report_status, warn_user,
+    delete_badge, delete_channel_admin, delete_channel_report, delete_user, delete_user_warning,
+    get_user_badges, list_badges, list_channel_reports, list_channels, list_user_warnings,
+    list_users, remove_badge, restore_user, set_user_password, set_user_whitelist, unblock_user,
+    update_badge, update_channel_report_status, warn_user,
 };
 use crate::controllers::announcement_controller::{
     create_announcement, delete_announcement, list_admin_announcements, update_announcement,
@@ -89,7 +89,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .service(web::resource("/reports").route(web::get().to(list_channel_reports)))
             .service(
                 web::resource("/reports/{reportId}")
-                    .route(web::patch().to(update_channel_report_status)),
+                    .route(web::patch().to(update_channel_report_status))
+                    .route(web::delete().to(delete_channel_report)),
             )
             .service(
                 web::resource("/badges")
