@@ -56,9 +56,19 @@ pub fn webm_has_video_track(data: &[u8]) -> bool {
         .any(|marker| data.windows(marker.len()).any(|window| window == *marker))
 }
 
+fn normalize_mime_type(mime: &str) -> String {
+    mime.trim()
+        .to_ascii_lowercase()
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 pub fn mime_allowed_for_extension(ext: &str, mime: &str) -> bool {
     let ext = ext.to_ascii_lowercase();
-    let mime = mime.trim().to_ascii_lowercase();
+    let mime = normalize_mime_type(mime);
     if mime.is_empty() {
         return false;
     }
@@ -100,9 +110,8 @@ pub fn mime_allowed_for_extension(ext: &str, mime: &str) -> bool {
 
 pub fn resolve_upload_content_type(ext: &str, client_mime: Option<&str>, data: &[u8]) -> String {
     if let Some(mime) = client_mime {
-        let mime = mime.trim();
         if mime_allowed_for_extension(ext, mime) {
-            return mime.to_string();
+            return normalize_mime_type(mime);
         }
     }
 
@@ -163,6 +172,16 @@ mod tests {
             resolve_upload_content_type("mp4", Some("video/mp4"), header),
             "video/mp4"
         );
+    }
+
+    #[test]
+    fn resolves_webm_audio_with_codecs_param() {
+        let header = b"\x1a\x45\xdf\xa3";
+        assert_eq!(
+            resolve_upload_content_type("webm", Some("audio/webm;codecs=opus"), header),
+            "audio/webm"
+        );
+        assert!(mime_allowed_for_extension("webm", "audio/webm;codecs=opus"));
     }
 
     #[test]
