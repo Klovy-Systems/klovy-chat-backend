@@ -37,7 +37,8 @@ use crate::utils::user::badges::{
 };
 use crate::utils::user::serialize_user::{resolve_display_name, serialize_user, BIO_MAX_LENGTH, DISPLAY_NAME_MAX_LENGTH};
 use crate::utils::upload_limits::{
-    file_bytes_within_limit, local_file_size, MAX_AVATAR_BYTES, MAX_BANNER_EDGE,
+    file_bytes_within_limit, local_file_size, MAX_AVATAR_BYTES, MAX_BANNER_BYTES,
+    MAX_BANNER_EDGE,
 };
 use crate::utils::validators::file_magic::validate_file_magic;
 use crate::utils::validators::normalize_username::{is_valid_username, looks_like_email, normalize_username};
@@ -1446,7 +1447,7 @@ pub async fn add_profile_image(
         .map(|size| !file_bytes_within_limit(size, MAX_AVATAR_BYTES))
         .unwrap_or(true)
     {
-        return HttpResponse::PayloadTooLarge().body("File too large. Maximum size is 5 MB.");
+        return HttpResponse::PayloadTooLarge().body("File too large. Maximum size is 6 MB.");
     }
 
     let db = get_db();
@@ -1548,10 +1549,10 @@ pub async fn add_profile_banner(
         return HttpResponse::BadRequest().body("Invalid file content.");
     }
     if local_file_size(form.file.file.path())
-        .map(|size| !file_bytes_within_limit(size, MAX_AVATAR_BYTES))
+        .map(|size| !file_bytes_within_limit(size, MAX_BANNER_BYTES))
         .unwrap_or(true)
     {
-        return HttpResponse::PayloadTooLarge().body("File too large. Maximum size is 5 MB.");
+        return HttpResponse::PayloadTooLarge().body("File too large. Maximum size is 7 MB.");
     }
 
     let db = get_db();

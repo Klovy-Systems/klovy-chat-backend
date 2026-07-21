@@ -13,21 +13,20 @@ use crate::utils::messages::mentions::{has_everyone_mention, resolve_mentions};
 use crate::model::user_storage_usage_model::UserStorageUsage;
 use crate::utils::file_hash::sha256_hex;
 use crate::model::user_model::User;
-use crate::utils::attachment_audit::{log_attachment_access, log_attachment_upload};
+use crate::utils::attachment_audit::log_attachment_upload;
 use crate::utils::access::membership_gate::{require_dm_access, require_message_participant};
 use crate::utils::db::get_db;
 use crate::utils::image_reencode::{
     reencode_error_message, reencode_upload_to_webp_variants,
 };
 use crate::utils::messages::{
-    access::{cleanup_attachment_if_unreferenced, user_can_access_attachment_path},
+    access::cleanup_attachment_if_unreferenced,
     can_access_channel_messages, can_access_dm_messages, can_pin_message, dm_only_or_clause,
     escape_regex, serialize_message, serialize_messages_batch,
 };
 use crate::utils::validators::sanitize_input::sanitize_message_content;
 use crate::utils::storage::{
-    attachment_dm_key, attachment_group_key, attachment_thumb_key, content_type_for_ext,
-    is_logical_message_path, storage,
+    attachment_dm_key, attachment_group_key, attachment_thumb_key, storage,
 };
 use crate::utils::upload_limits::{
     file_bytes_within_limit, is_image_extension, local_file_size, MAX_ATTACHMENT_BYTES,
@@ -353,121 +352,6 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     .await;
 
     HttpResponse::Ok().json(json!({ "filePath": logical_path }))
-}
-
-#[derive(Deserialize)]
-pub struct DownloadAttachmentQuery {
-    pub path: String,
-    pub name: Option<String>,
-}
-
-fn normalize_attachment_path(path: &str) -> Result<String, HttpResponse> {
-    let normalized = path.trim().replace('\\', "/");
-    if !is_logical_message_path(&normalized) {
-        return Err(HttpResponse::BadRequest().body("Invalid file path."));
-    }
-    Ok(normalized.trim_start_matches('/').to_string())
-}
-
-fn sanitize_download_filename(name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return "download".to_string();
-    }
-    let safe: String = trimmed
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
-        .take(255)
-        .collect();
-    if safe.is_empty() {
-        "download".to_string()
-    } else {
-        safe
-    }
-}
-
-async fn serve_protected_attachment(
-    req: &HttpRequest,
-    user_id: &str,
-    path: &str,
-    force_download: bool,
-    download_name: Option<&str>,
-    access_kind: &str,
-) -> HttpResponse {
-    let path = match normalize_attachment_path(path) {
-        Ok(path) => path,
-        Err(response) => return response,
-    };
-
-    let db = get_db();
-    if !user_can_access_attachment_path(&db, user_id, &path).await {
-        return HttpResponse::Forbidden().body("You do not have access to this file.");
-    }
-
-    // Stream bytes directly from R2 (via the S3 API) rather than redirecting to
-    // the public CDN domain, so media works regardless of CDN/edge configuration.
-    let (bytes, stored_content_type) = match storage().get_public_object(&path).await {
-        Ok(Some(object)) => object,
-        Ok(None) => return HttpResponse::NotFound().body("File not found."),
-        Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error."),
-    };
-
-    let ext = path.rsplit('.').next().unwrap_or("");
-    let content_type = stored_content_type
-        .unwrap_or_else(|| content_type_for_ext(ext).to_string());
-
-    log_attachment_access(req, user_id, &path, access_kind).await;
-
-    let mut builder = HttpResponse::Ok();
-    builder
-        .insert_header(("Content-Type", content_type))
-        .insert_header(("Cache-Control", "private, max-age=31536000, immutable"))
-        .insert_header(("X-Content-Type-Options", "nosniff"));
-
-    if force_download {
-        let filename = download_name
-            .map(sanitize_download_filename)
-            .or_else(|| path.rsplit('/').next().map(sanitize_download_filename))
-            .unwrap_or_else(|| "download".to_string());
-        builder.insert_header((
-            "Content-Disposition",
-            format!("attachment; filename=\"{filename}\""),
-        ));
-    }
-
-    builder.body(bytes)
-}
-
-pub async fn serve_attachment(
-    req: HttpRequest,
-    query: web::Query<DownloadAttachmentQuery>,
-) -> HttpResponse {
-    let user_id = request_user_id(&req).unwrap_or_default();
-    if user_id.is_empty() {
-        return HttpResponse::Unauthorized().body("Authentication required.");
-    }
-
-    serve_protected_attachment(&req, &user_id, &query.path, false, None, "inline").await
-}
-
-pub async fn download_attachment(
-    req: HttpRequest,
-    query: web::Query<DownloadAttachmentQuery>,
-) -> HttpResponse {
-    let user_id = request_user_id(&req).unwrap_or_default();
-    if user_id.is_empty() {
-        return HttpResponse::Unauthorized().body("Authentication required.");
-    }
-
-    serve_protected_attachment(
-        &req,
-        &user_id,
-        &query.path,
-        true,
-        query.name.as_deref(),
-        "download",
-    )
-    .await
 }
 
 #[derive(Deserialize)]

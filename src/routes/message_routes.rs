@@ -2,13 +2,13 @@ use actix_web::web;
 use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::messages_controller::{
-    delete_message, download_attachment, edit_message, get_messages, get_pinned_messages,
-    link_preview, pin_message, search_messages, serve_attachment, unpin_message, upload_file,
+    delete_message, edit_message, get_messages, get_pinned_messages,
+    link_preview, pin_message, search_messages, unpin_message, upload_file,
 };
 use crate::middlewares::auth_middleware::{
     log_suspicious_activity, require_active_account, verify_token,
 };
-use crate::utils::ratelimit::{attachment_access_limiter, upload_limiter};
+use crate::utils::ratelimit::upload_limiter;
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
@@ -76,22 +76,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .wrap(from_fn(verify_token))
             .wrap(from_fn(upload_limiter))
             .route(web::post().to(upload_file)),
-    );
-    cfg.service(
-        web::resource("/download-file")
-            .wrap(from_fn(log_suspicious_activity("download-attachment")))
-            .wrap(from_fn(require_active_account))
-            .wrap(from_fn(verify_token))
-            .wrap(from_fn(attachment_access_limiter))
-            .route(web::get().to(download_attachment)),
-    );
-    cfg.service(
-        web::resource("/attachment")
-            .wrap(from_fn(log_suspicious_activity("serve-attachment")))
-            .wrap(from_fn(require_active_account))
-            .wrap(from_fn(verify_token))
-            .wrap(from_fn(attachment_access_limiter))
-            .route(web::get().to(serve_attachment)),
     );
     cfg.service(
         web::resource("/link-preview")

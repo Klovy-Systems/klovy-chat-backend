@@ -516,7 +516,7 @@ pub async fn delete_channel_avatar(req: HttpRequest) -> HttpResponse {
 
 #[derive(MultipartForm)]
 pub struct ChannelAvatarForm {
-    #[multipart(rename = "avatar", limit = "5 MiB")]
+    #[multipart(rename = "avatar", limit = "6 MiB")]
     pub file: TempFile,
 }
 
@@ -557,7 +557,7 @@ pub async fn upload_channel_avatar(
         .unwrap_or(true)
     {
         return HttpResponse::PayloadTooLarge()
-            .json(json!({ "message": "File too large. Maximum size is 5 MB." }));
+            .json(json!({ "message": "File too large. Maximum size is 6 MB." }));
     }
 
     let previous_image = channel.image.clone();

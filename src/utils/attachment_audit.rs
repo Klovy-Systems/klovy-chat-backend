@@ -33,28 +33,3 @@ pub async fn log_attachment_upload(
         log::warn!("Failed to write attachment upload audit log ({path}): {e}");
     }
 }
-
-pub async fn log_attachment_access(
-    req: &HttpRequest,
-    user_id: &str,
-    path: &str,
-    access_kind: &str,
-) {
-    let client_ip = client_ip_from_http_request(req);
-    let db = get_db();
-    if let Err(e) = AuditLog::insert(
-        &db,
-        "attachment.access",
-        Some("attachment"),
-        Some(path),
-        json!({
-            "userId": user_id,
-            "kind": access_kind,
-        }),
-        Some(&client_ip),
-    )
-    .await
-    {
-        log::warn!("Failed to write attachment audit log ({path}): {e}");
-    }
-}

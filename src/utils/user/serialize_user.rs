@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use crate::model::user_model::{AvailabilityStatus, User};
+use crate::model::user_model::{AvailabilityStatus, ConnectedAccount, User};
 use crate::utils::auth::admin_session::is_admin_user_id;
 use crate::utils::listening::serialize::listening_for_viewer;
 
@@ -26,6 +26,22 @@ pub fn resolve_display_name(user: &User) -> Option<String> {
 
 fn iso(dt: &mongodb::bson::DateTime) -> Option<String> {
     dt.try_to_rfc3339_string().ok()
+}
+
+pub fn connected_accounts_json(accounts: &[ConnectedAccount]) -> Value {
+    if accounts.is_empty() {
+        return json!([]);
+    }
+    json!(accounts
+        .iter()
+        .map(|account| {
+            json!({
+                "provider": account.provider,
+                "accountName": account.account_name,
+                "profileUrl": account.profile_url,
+            })
+        })
+        .collect::<Vec<_>>())
 }
 
 pub fn serialize_user(user: &User, is_whitelist_enabled: Option<bool>) -> Value {
@@ -59,6 +75,7 @@ pub fn serialize_user_for_viewer(
         "isWhitelisted": user.is_whitelisted,
         "isWhitelistEnabled": is_whitelist_enabled,
         "twoFactorEnabled": user.two_factor_enabled,
+        "connectedAccounts": connected_accounts_json(&user.connected_accounts),
     });
 
     if is_self {

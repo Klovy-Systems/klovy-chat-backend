@@ -17,7 +17,7 @@ use crate::utils::messages::{
 use crate::utils::messages::escape_regex;
 use crate::utils::listening::serialize::{effective_listening, listening_activity_json};
 use crate::utils::user::badges::{populate_user_badges, BadgeVisibility};
-use crate::utils::user::serialize_user::resolve_display_name;
+use crate::utils::user::serialize_user::{connected_accounts_json, resolve_display_name};
 use crate::utils::whitelist::is_whitelist_enabled;
 
 const MIN_SEARCH_LENGTH: usize = 3;
@@ -254,6 +254,7 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
                 "lastSeen": friend.last_seen.as_ref().and_then(|d| d.try_to_rfc3339_string().ok()),
                 "availabilityStatus": crate::utils::user::serialize_user::availability_status_str(&friend.availability_status),
                 "listeningActivity": listening_activity,
+                "connectedAccounts": connected_accounts_json(&friend.connected_accounts),
                 "badges": badges,
                 "createdAt": friend.created_at.try_to_rfc3339_string().ok(),
                 "lastMessageTime": last.as_ref().and_then(|(t, _)| t.try_to_rfc3339_string().ok()),

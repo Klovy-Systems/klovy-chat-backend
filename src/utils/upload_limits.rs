@@ -4,8 +4,11 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 /// Maximum size for chat image uploads before re-encode (3 MB).
 pub const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 3 * 1024 * 1024;
 
-/// Maximum size for profile/channel avatars and banners (5 MB).
-pub const MAX_AVATAR_BYTES: u64 = 5 * 1024 * 1024;
+/// Maximum size for profile/channel avatars (6 MB).
+pub const MAX_AVATAR_BYTES: u64 = 6 * 1024 * 1024;
+
+/// Maximum size for profile banners (7 MB).
+pub const MAX_BANNER_BYTES: u64 = 7 * 1024 * 1024;
 
 /// Maximum width/height for uploaded source images (decompression bomb protection).
 pub const MAX_IMAGE_DIMENSION: u32 = 4096;

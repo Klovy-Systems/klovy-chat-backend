@@ -23,16 +23,11 @@ use crate::utils::security::client_id::{
 /// Ścieżki zwolnione z wymogu identyfikatora klienta:
 /// - publiczny endpoint informacyjny / health-check (`/api`, `/api/`),
 /// - webhook bezpieczeństwa server-to-server (`/api/security/*`, chroniony Bearer),
-/// - endpointy serwujące media ładowane bezpośrednio przez przeglądarkę w
-///   tagach `<img>/<video>/<audio>` oraz pobieranie plików — nie mogą one nieść
-///   nagłówków niestandardowych; są chronione ciasteczkiem sesji (`verify_token`),
-///   kontrolą członkostwa i limiterem dostępu do załączników.
+/// - OAuth callback (`/api/integrations/spotify/callback`).
 fn is_exempt(path: &str) -> bool {
     path == "/api"
         || path == "/api/"
         || path.starts_with("/api/security")
-        || path.starts_with("/api/messages/attachment")
-        || path.starts_with("/api/messages/download-file")
         || path.starts_with("/api/integrations/spotify/callback")
 }
 

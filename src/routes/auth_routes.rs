@@ -19,13 +19,13 @@ use crate::utils::ratelimit::{change_password_limiter, change_username_limiter, 
 
 #[derive(MultipartForm)]
 pub struct ProfileImageForm {
-    #[multipart(rename = "profile-image", limit = "5 MiB")]
+    #[multipart(rename = "profile-image", limit = "6 MiB")]
     pub file: TempFile,
 }
 
 #[derive(MultipartForm)]
 pub struct ProfileBannerForm {
-    #[multipart(rename = "profile-banner", limit = "5 MiB")]
+    #[multipart(rename = "profile-banner", limit = "7 MiB")]
     pub file: TempFile,
 }
 

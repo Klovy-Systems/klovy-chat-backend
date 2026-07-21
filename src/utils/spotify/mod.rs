@@ -219,6 +219,11 @@ struct SpotifyAlbum {
 }
 
 #[derive(Debug, Deserialize)]
+struct SpotifyDevice {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SpotifyExternalUrls {
     spotify: Option<String>,
 }
@@ -235,6 +240,16 @@ pub struct SpotifyTrack {
 pub struct CurrentlyPlayingResponse {
     is_playing: bool,
     item: Option<SpotifyTrack>,
+    device: Option<SpotifyDevice>,
+}
+
+/// Spotify Web Player reports device names like "Web Player (Chrome)".
+pub fn is_spotify_desktop_app_playback(response: &CurrentlyPlayingResponse) -> bool {
+    let Some(device) = &response.device else {
+        return true;
+    };
+    let name = device.name.to_lowercase();
+    !name.contains("web player") && !name.contains("webplayer")
 }
 
 pub async fn get_currently_playing(access_token: &str) -> Result<Option<CurrentlyPlayingResponse>, String> {
@@ -293,7 +308,7 @@ pub async fn get_active_playback(access_token: &str) -> Result<Option<CurrentlyP
     get_playback_state(access_token).await
 }
 
-pub async fn get_spotify_profile_id(access_token: &str) -> Result<Option<String>, String> {
+pub async fn get_spotify_profile(access_token: &str) -> Result<Option<SpotifyProfile>, String> {
     let client = reqwest::Client::new();
     let res = client
         .get("https://api.spotify.com/v1/me")
@@ -309,10 +324,41 @@ pub async fn get_spotify_profile_id(access_token: &str) -> Result<Option<String>
     #[derive(Deserialize)]
     struct Me {
         id: String,
+        #[serde(rename = "display_name")]
+        display_name: Option<String>,
     }
 
     let me = res.json::<Me>().await.map_err(|e| e.to_string())?;
-    Ok(Some(me.id))
+    Ok(Some(SpotifyProfile {
+        id: me.id,
+        display_name: me
+            .display_name
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty()),
+    }))
+}
+
+pub async fn get_spotify_profile_id(access_token: &str) -> Result<Option<String>, String> {
+    Ok(get_spotify_profile(access_token)
+        .await?
+        .map(|profile| profile.id))
+}
+
+#[derive(Debug, Clone)]
+pub struct SpotifyProfile {
+    pub id: String,
+    pub display_name: Option<String>,
+}
+
+pub fn connected_account_from_spotify_profile(profile: &SpotifyProfile) -> crate::model::user_model::ConnectedAccount {
+    crate::model::user_model::ConnectedAccount {
+        provider: PROVIDER_SPOTIFY.to_string(),
+        account_name: profile
+            .display_name
+            .clone()
+            .unwrap_or_else(|| "Spotify".to_string()),
+        profile_url: format!("https://open.spotify.com/user/{}", profile.id),
+    }
 }
 
 fn expires_at_from_secs(secs: i64) -> DateTime {
@@ -351,7 +397,7 @@ pub fn activity_from_spotify(
     client_type: &str,
     client_instance_id: &str,
 ) -> Option<ListeningActivity> {
-    if !response.is_playing {
+    if !response.is_playing || !is_spotify_desktop_app_playback(response) {
         return None;
     }
     let track = response.item.as_ref()?;
@@ -390,6 +436,7 @@ pub async fn store_tokens(
     refresh_token: &str,
     expires_in: i64,
     provider_user_id: Option<String>,
+    provider_display_name: Option<String>,
 ) -> Result<OauthToken, String> {
     let expires_at = expires_at_from_secs(expires_in);
     OauthToken::upsert(
@@ -401,6 +448,7 @@ pub async fn store_tokens(
         expires_at,
         SPOTIFY_SCOPES.split_whitespace().map(String::from).collect(),
         provider_user_id,
+        provider_display_name,
     )
     .await
 }

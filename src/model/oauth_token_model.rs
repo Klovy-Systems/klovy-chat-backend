@@ -23,6 +23,8 @@ pub struct OauthToken {
     pub scopes: Vec<String>,
     #[serde(rename = "providerUserId", skip_serializing_if = "Option::is_none")]
     pub provider_user_id: Option<String>,
+    #[serde(rename = "providerDisplayName", skip_serializing_if = "Option::is_none")]
+    pub provider_display_name: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: DateTime,
     #[serde(rename = "updatedAt")]
@@ -66,6 +68,7 @@ impl OauthToken {
         expires_at: DateTime,
         scopes: Vec<String>,
         provider_user_id: Option<String>,
+        provider_display_name: Option<String>,
     ) -> Result<Self, String> {
         let access_token_enc = encrypt_field(access_token)?;
         let refresh_token_enc = encrypt_field(refresh_token)?;
@@ -80,6 +83,9 @@ impl OauthToken {
         };
         if let Some(pid) = provider_user_id {
             set_doc.insert("providerUserId", pid);
+        }
+        if let Some(name) = provider_display_name {
+            set_doc.insert("providerDisplayName", name);
         }
 
         Self::collection(db)

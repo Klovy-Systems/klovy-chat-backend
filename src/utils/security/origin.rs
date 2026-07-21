@@ -55,13 +55,11 @@ pub fn origin_allowed(value: &str, allowed: &[String]) -> bool {
         .any(|origin| value == origin || value.starts_with(&format!("{origin}/")))
 }
 
-/// Ścieżki zwolnione z kontroli Origin (media w tagach HTML, OAuth redirect).
+/// Ścieżki zwolnione z kontroli Origin (OAuth redirect).
 pub fn is_origin_guard_exempt(path: &str) -> bool {
     path == "/api"
         || path == "/api/"
         || path.starts_with("/api/security")
-        || path.starts_with("/api/messages/attachment")
-        || path.starts_with("/api/messages/download-file")
         || path.starts_with("/api/integrations/spotify/callback")
 }
 

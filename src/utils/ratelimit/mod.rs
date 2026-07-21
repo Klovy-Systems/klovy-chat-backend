@@ -167,7 +167,6 @@ static ADMIN_WRITE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_sec
 static DISCOVERY: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
 static REFRESH: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(15 * 60)));
 static UPLOAD: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
-static ATTACHMENT_ACCESS: Lazy<Store> = Lazy::new(|| Store::new(600, Duration::from_secs(60)));
 static INVITE_ACCEPT: Lazy<Store> = Lazy::new(|| Store::new(15, Duration::from_secs(15 * 60)));
 static FRIEND_REQUEST: Lazy<Store> = Lazy::new(|| Store::new(40, Duration::from_secs(60 * 60)));
 static CHANNEL_REPORT: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
@@ -339,44 +338,6 @@ pub async fn upload_limiter(
                 ServiceResponse::new(
                     req,
                     too_many("Too many file uploads. Slow down.", 60),
-                )
-                .map_into_boxed_body(),
-            );
-        }
-    }
-
-    Ok(next.call(req).await?.map_into_boxed_body())
-}
-
-pub async fn attachment_access_limiter(
-    req: ServiceRequest,
-    next: Next<actix_web::body::BoxBody>,
-) -> Result<ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
-    let ip = client_ip(&req);
-    let ip_key = rate_limit_key("attachment-access", &ip);
-    if !ATTACHMENT_ACCESS.check_and_increment(&ip_key) {
-        let (req, _) = req.into_parts();
-        return Ok(
-            ServiceResponse::new(
-                req,
-                too_many("Too many attachment requests. Slow down.", 60),
-            )
-            .map_into_boxed_body(),
-        );
-    }
-
-    let user_id = req
-        .extensions()
-        .get::<RequestUserId>()
-        .map(|user| user.0.clone());
-    if let Some(user_id) = user_id {
-        let user_key = rate_limit_key("attachment-access-user", &user_id);
-        if !ATTACHMENT_ACCESS.check_and_increment(&user_key) {
-            let (req, _) = req.into_parts();
-            return Ok(
-                ServiceResponse::new(
-                    req,
-                    too_many("Too many attachment requests. Slow down.", 60),
                 )
                 .map_into_boxed_body(),
             );

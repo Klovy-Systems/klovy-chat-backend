@@ -81,37 +81,6 @@ pub async fn can_mark_message_as_read(db: &Database, user_id: &str, msg: &Messag
     are_friends(db, user_id, &msg.sender.to_hex()).await
 }
 
-pub async fn find_message_by_file_path(db: &Database, path: &str) -> Option<Message> {
-    let normalized = path.trim().trim_start_matches('/');
-    if normalized.is_empty() || !is_logical_message_path(normalized) {
-        return None;
-    }
-
-    let with_slash = format!("/{normalized}");
-    Message::collection(db)
-        .find_one(mongodb::bson::doc! {
-            "deleted": { "$ne": true },
-            "fileUrl": { "$in": [normalized, with_slash] },
-        })
-        .await
-        .ok()
-        .flatten()
-}
-
-pub async fn user_can_access_attachment_path(
-    db: &Database,
-    user_id: &str,
-    path: &str,
-) -> bool {
-    if !is_attachment_key(path) {
-        return false;
-    }
-    let Some(message) = find_message_by_file_path(db, path).await else {
-        return false;
-    };
-    can_react_to_message(db, user_id, &message).await
-}
-
 fn attachment_matches_send_context(
     path: &str,
     user_id: &str,

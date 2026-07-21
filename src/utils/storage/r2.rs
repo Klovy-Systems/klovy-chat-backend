@@ -192,44 +192,6 @@ impl R2Storage {
         Ok(objects)
     }
 
-    /// Fetches a public object's bytes and content-type, streaming directly from
-    /// R2 via the S3 API (bypasses the public CDN domain entirely).
-    pub async fn get_public_object(
-        &self,
-        key: &str,
-    ) -> Result<Option<(Vec<u8>, Option<String>)>, StorageError> {
-        let output = match self
-            .client
-            .get_object()
-            .bucket(&self.public_bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(output) => output,
-            Err(err) => {
-                let msg = err.to_string();
-                if msg.contains("NoSuchKey") || msg.contains("NotFound") || msg.contains("404") {
-                    return Ok(None);
-                }
-                return Err(StorageError::OperationFailed(format!(
-                    "get_public {key}: {err}"
-                )));
-            }
-        };
-
-        let content_type = output.content_type().map(|s| s.to_string());
-        let bytes = output
-            .body
-            .collect()
-            .await
-            .map_err(|e| StorageError::OperationFailed(format!("read_public {key}: {e}")))?
-            .into_bytes()
-            .to_vec();
-
-        Ok(Some((bytes, content_type)))
-    }
-
     pub async fn verify_public_sha256(&self, key: &str, expected_hex: &str) -> Result<bool, StorageError> {
         let expected = expected_hex.trim().to_ascii_lowercase();
         if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {

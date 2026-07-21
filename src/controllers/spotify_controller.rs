@@ -12,14 +12,16 @@ use crate::model::user_model::User;
 use crate::utils::auth::jwt_auth::jwt_secret;
 use crate::utils::crypto::keyed_hash::{hmac_sha256_hex, verify_hmac_sha256_hex};
 use crate::utils::db::get_db;
+use crate::utils::friends::emit_profile_event;
 use crate::utils::listening::broadcast::broadcast_listening_change;
 use crate::utils::listening::resolve::{should_apply_report, ListeningReport};
 use crate::utils::listening::serialize::listening_activity_json;
+use crate::utils::user::serialize_user::connected_accounts_json;
 use crate::utils::ratelimit::Store;
 use crate::utils::spotify::{
-    activity_from_spotify, build_auth_url, ensure_access_token, exchange_code,
-    generate_pkce_pair, get_active_playback, get_spotify_profile_id, is_connected, revoke_token,
-    spotify_enabled, store_tokens,
+    activity_from_spotify, build_auth_url, connected_account_from_spotify_profile,
+    ensure_access_token, exchange_code, generate_pkce_pair, get_active_playback,
+    get_spotify_profile, is_connected, revoke_token, spotify_enabled, store_tokens,
 };
 
 static SPOTIFY_STATUS: Lazy<Store> = Lazy::new(|| Store::new(15, Duration::from_secs(60)));
@@ -184,17 +186,54 @@ pub async fn spotify_status(req: HttpRequest) -> HttpResponse {
     ) {
         return HttpResponse::TooManyRequests().json(json!({ "error": "Rate limit exceeded" }));
     }
-    let Ok(user) = load_active_user(&user_id).await else {
-        return HttpResponse::Unauthorized().json(json!({ "error": "Authentication required" }));
+    let mut user = match load_active_user(&user_id).await {
+        Ok(u) => u,
+        Err(resp) => return resp,
     };
     let Some(oid) = user.id else {
         return HttpResponse::InternalServerError().json(json!({ "error": "Server error" }));
     };
+    let db = get_db();
     let connected = is_connected(oid).await;
+
+    if connected && !user.connected_accounts.iter().any(|a| a.provider == PROVIDER_SPOTIFY) {
+        if let Ok(Some(token_doc)) =
+            OauthToken::find_by_user_provider(&db, oid, PROVIDER_SPOTIFY).await
+        {
+            if let Some(provider_user_id) = token_doc.provider_user_id.clone() {
+                let account_name = token_doc
+                    .provider_display_name
+                    .clone()
+                    .unwrap_or_else(|| "Spotify".to_string());
+                let connected_account = crate::model::user_model::ConnectedAccount {
+                    provider: PROVIDER_SPOTIFY.to_string(),
+                    account_name,
+                    profile_url: format!("https://open.spotify.com/user/{provider_user_id}"),
+                };
+                let accounts_bson =
+                    mongodb::bson::to_bson(&vec![connected_account.clone()]).unwrap_or(Bson::Null);
+                if let Ok(Some(updated)) =
+                    User::set_fields(&db, oid, doc! { "connectedAccounts": accounts_bson }).await
+                {
+                    user = updated;
+                } else {
+                    user.connected_accounts = vec![connected_account];
+                }
+            }
+        }
+    }
+
+    let spotify_account = user
+        .connected_accounts
+        .iter()
+        .find(|account| account.provider == PROVIDER_SPOTIFY);
+
     HttpResponse::Ok().json(json!({
         "connected": connected,
         "shareListening": user.share_listening,
         "enabled": spotify_enabled(),
+        "accountName": spotify_account.map(|account| account.account_name.clone()),
+        "profileUrl": spotify_account.map(|account| account.profile_url.clone()),
     }))
 }
 
@@ -354,10 +393,13 @@ pub async fn spotify_callback(query: web::Query<SpotifyCallbackQuery>) -> HttpRe
         Err(e) => return fail(&return_origin, &e),
     };
 
-    let profile_id = get_spotify_profile_id(&tokens.access_token)
+    let profile = get_spotify_profile(&tokens.access_token)
         .await
         .ok()
         .flatten();
+
+    let profile_id = profile.as_ref().map(|p| p.id.clone());
+    let profile_display_name = profile.as_ref().and_then(|p| p.display_name.clone());
 
     if let Err(e) = store_tokens(
         user_oid,
@@ -365,6 +407,7 @@ pub async fn spotify_callback(query: web::Query<SpotifyCallbackQuery>) -> HttpRe
         &refresh,
         tokens.expires_in,
         profile_id,
+        profile_display_name,
     )
     .await
     {
@@ -373,6 +416,29 @@ pub async fn spotify_callback(query: web::Query<SpotifyCallbackQuery>) -> HttpRe
             &return_origin,
             "Nie udało się zapisać połączenia Spotify. Spróbuj połączyć ponownie.",
         );
+    }
+
+    if let Some(spotify_profile) = profile.as_ref() {
+        let connected_account = connected_account_from_spotify_profile(spotify_profile);
+        let accounts_bson = mongodb::bson::to_bson(&vec![connected_account]).unwrap_or(Bson::Null);
+        if let Ok(Some(updated)) = User::set_fields(
+            &get_db(),
+            user_oid,
+            doc! { "connectedAccounts": accounts_bson },
+        )
+        .await
+        {
+            emit_profile_event(
+                &get_db(),
+                &user_oid.to_hex(),
+                "profile-updated",
+                json!({
+                    "userId": user_oid.to_hex(),
+                    "connectedAccounts": connected_accounts_json(&updated.connected_accounts),
+                }),
+            )
+            .await;
+        }
     }
 
     log::info!("Spotify connected for user {user_oid}");
@@ -575,7 +641,10 @@ pub async fn spotify_disconnect(req: HttpRequest) -> HttpResponse {
     let updated = match User::set_fields(
         &db,
         oid,
-        doc! { "listeningActivity": Bson::Null },
+        doc! {
+            "listeningActivity": Bson::Null,
+            "connectedAccounts": [],
+        },
     )
     .await
     {
@@ -584,6 +653,16 @@ pub async fn spotify_disconnect(req: HttpRequest) -> HttpResponse {
     };
 
     broadcast_listening_change(&user_id, &updated).await;
+    emit_profile_event(
+        &db,
+        &user_id,
+        "profile-updated",
+        json!({
+            "userId": user_id,
+            "connectedAccounts": [],
+        }),
+    )
+    .await;
 
     HttpResponse::Ok().json(json!({ "success": true, "connected": false }))
 }
