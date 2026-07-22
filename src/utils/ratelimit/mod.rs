@@ -188,6 +188,9 @@ static SIGNUP: Lazy<Store> = Lazy::new(|| {
 });
 static ADMIN_READ: Lazy<Store> = Lazy::new(|| Store::new(200, Duration::from_secs(5 * 60)));
 static ADMIN_WRITE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(5 * 60)));
+static ADMIN_SESSION_PROBE: Lazy<Store> =
+    Lazy::new(|| Store::new(40, Duration::from_secs(15 * 60)));
+static ADMIN_ELEVATE: Lazy<Store> = Lazy::new(|| Store::new(8, Duration::from_secs(15 * 60)));
 static DISCOVERY: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
 static REFRESH: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(15 * 60)));
 static UPLOAD: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
@@ -335,6 +338,38 @@ pub async fn admin_action_limiter(
     };
 
     limit_all(store, "admin", error, retry_after, None, req, next).await
+}
+
+pub async fn admin_session_probe_limiter(
+    req: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
+    limit_all(
+        &ADMIN_SESSION_PROBE,
+        "admin-session",
+        "Too many admin session checks. Slow down.",
+        900,
+        None,
+        req,
+        next,
+    )
+    .await
+}
+
+pub async fn admin_elevate_limiter(
+    req: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
+    limit_all(
+        &ADMIN_ELEVATE,
+        "admin-elevate",
+        "Too many admin elevation attempts. Slow down.",
+        900,
+        None,
+        req,
+        next,
+    )
+    .await
 }
 
 pub async fn refresh_limiter(

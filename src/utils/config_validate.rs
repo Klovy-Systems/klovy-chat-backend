@@ -1,7 +1,7 @@
 use std::env;
 
 use crate::utils::app_env::{is_production, node_env};
-use crate::utils::auth::admin_session::admin_user_ids_configured;
+use crate::utils::auth::admin_session::{admin_ip_allowlist_configured, admin_user_ids_configured};
 use crate::utils::auth::jwt_auth::jwt_secret;
 use crate::utils::whitelist::is_whitelist_enabled;
 use crate::utils::registration::{
@@ -83,6 +83,11 @@ pub fn validate_startup_config() {
             log::warn!(
                 "ADMIN_USER_IDS is not set — the admin panel will be disabled until you configure \
                  comma-separated MongoDB user ObjectIds (e.g. ADMIN_USER_IDS=<objectId1>,<objectId2>)"
+            );
+        } else if !admin_ip_allowlist_configured() {
+            log::warn!(
+                "ADMIN_ALLOWED_IPS is not set — the admin panel accepts requests from any IP. \
+                 Set comma-separated IPs or CIDR ranges (e.g. ADMIN_ALLOWED_IPS=203.0.113.10,198.51.100.0/24)"
             );
         }
 

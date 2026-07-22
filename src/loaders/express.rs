@@ -14,6 +14,7 @@ use crate::routes::{
 };
 
 use crate::middlewares::{
+    admin_auth_middleware::check_admin_ip_allowlist,
     client_guard::client_guard_middleware,
     csrf::csrf_middleware,
     internal_proxy_guard::{internal_proxy_guard, internal_proxy_secret, INTERNAL_PROXY_HEADER},
@@ -248,15 +249,20 @@ pub fn create_app(
                 .wrap(from_fn(auth_rate_limiter))
                 .configure(auth_routes::configure),
         )
-        .service(web::scope("/api/admin").configure(admin_routes::configure))
-        .service(web::scope("/api/admins").configure(admin_routes::configure))
+        .service(
+            web::scope("/api/admin")
+                .wrap(from_fn(check_admin_ip_allowlist))
+                .configure(admin_routes::configure),
+        )
         .service(
             web::scope("/whitelist")
+                .wrap(from_fn(check_admin_ip_allowlist))
                 .wrap(from_fn(auth_rate_limiter))
                 .configure(whitelist_routes::configure),
         )
         .service(
             web::scope("/api/whitelist")
+                .wrap(from_fn(check_admin_ip_allowlist))
                 .wrap(from_fn(auth_rate_limiter))
                 .configure(whitelist_routes::configure),
         )

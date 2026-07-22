@@ -1,11 +1,34 @@
 use actix_web::HttpRequest;
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Validation};
 use mongodb::bson::oid::ObjectId;
+use serde::{Deserialize, Serialize};
 use std::env;
+use std::net::IpAddr;
 
+use crate::middlewares::auth_middleware::TokenPayload;
+use crate::model::refresh_token_model::RefreshToken;
 use crate::model::user_model::User;
-use crate::utils::auth::jwt_auth::{user_id_from_jwt_token, user_from_jwt};
+use crate::utils::app_env::is_production;
+use crate::utils::auth::jwt_auth::{
+    jwt_decoding_key, resolve_session_family_id, user_from_jwt_with_refresh,
+    user_id_from_jwt_token,
+};
+use crate::utils::auth::jwt_validation::hs256_validation;
+use crate::utils::auth::refresh_token::REFRESH_COOKIE;
+use crate::utils::db::get_db;
+use crate::utils::security::constant_time::constant_time_eq_str;
 
 pub const ADMIN_COOKIE: &str = "adminJwt";
+const ADMIN_ELEVATION_MAX_AGE_SECS: i64 = 8 * 60 * 60;
+const ADMIN_ELEVATION_PURPOSE: &str = "admin_panel";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdminElevationClaims {
+    #[serde(rename = "userId")]
+    user_id: String,
+    purpose: String,
+    exp: usize,
+}
 
 /// Lista ID użytkowników z bazy (ObjectId hex), rozdzielona przecinkami.
 /// Np. `ADMIN_USER_IDS=6a4e5425bc9f2cb279deaa4a,6a515be2534d14681c9965c7`
@@ -34,16 +57,179 @@ pub fn is_admin_user_id(user_id: &str) -> bool {
     get_admin_user_ids().iter().any(|allowed| allowed == &id)
 }
 
+fn admin_secret() -> Option<String> {
+    env::var("ADMIN_SECRET")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn admin_elevation_required() -> bool {
+    is_production() && admin_secret().is_some_and(|s| s.len() >= 16)
+}
+
+pub fn verify_admin_secret(provided: &str) -> bool {
+    let Some(expected) = admin_secret() else {
+        return false;
+    };
+    constant_time_eq_str(provided.trim(), &expected)
+}
+
+/// Dozwolone adresy IP dla panelu administratora (opcjonalnie).
+/// Np. `ADMIN_ALLOWED_IPS=203.0.113.10,198.51.100.0/24,2001:db8::1`
+/// Gdy puste — brak filtrowania po IP (zachowanie wsteczne).
+pub fn get_admin_allowed_ips() -> Vec<String> {
+    env::var("ADMIN_ALLOWED_IPS")
+        .or_else(|_| env::var("ADMIN_IP_ALLOWLIST"))
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn admin_ip_allowlist_configured() -> bool {
+    !get_admin_allowed_ips().is_empty()
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) if let Some(v4) = v6.to_ipv4_mapped() => IpAddr::V4(v4),
+        other => other,
+    }
+}
+
+fn ipv4_cidr_contains(network: std::net::Ipv4Addr, prefix: u8, ip: std::net::Ipv4Addr) -> bool {
+    if prefix > 32 {
+        return false;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (u32::from(network) & mask) == (u32::from(ip) & mask)
+}
+
+fn ipv6_cidr_contains(network: std::net::Ipv6Addr, prefix: u8, ip: std::net::Ipv6Addr) -> bool {
+    if prefix > 128 {
+        return false;
+    }
+    let net = network.octets();
+    let addr = ip.octets();
+    let full_bytes = (prefix / 8) as usize;
+    let rem_bits = prefix % 8;
+
+    if net[..full_bytes] != addr[..full_bytes] {
+        return false;
+    }
+    if rem_bits == 0 {
+        return true;
+    }
+    if full_bytes >= net.len() {
+        return false;
+    }
+    let mask = 0xFF_u8 << (8 - rem_bits);
+    (net[full_bytes] & mask) == (addr[full_bytes] & mask)
+}
+
+fn allowlist_entry_matches(entry: &str, ip: &IpAddr) -> bool {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return false;
+    }
+
+    if let Some((network, prefix)) = entry.split_once('/') {
+        let Ok(prefix) = prefix.trim().parse::<u8>() else {
+            return false;
+        };
+        let Ok(network_ip) = network.trim().parse::<IpAddr>() else {
+            return false;
+        };
+        return match (normalize_ip(network_ip), *ip) {
+            (IpAddr::V4(net), IpAddr::V4(addr)) => ipv4_cidr_contains(net, prefix, addr),
+            (IpAddr::V6(net), IpAddr::V6(addr)) => ipv6_cidr_contains(net, prefix, addr),
+            _ => false,
+        };
+    }
+
+    entry
+        .parse::<IpAddr>()
+        .ok()
+        .map(normalize_ip)
+        .map(|allowed| allowed == *ip)
+        .unwrap_or(false)
+}
+
+pub fn is_admin_ip_allowed(client_ip: &str) -> bool {
+    if !admin_ip_allowlist_configured() {
+        return true;
+    }
+
+    let trimmed = client_ip.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+        return false;
+    }
+
+    let Ok(parsed) = trimmed.parse::<IpAddr>() else {
+        return false;
+    };
+    let ip = normalize_ip(parsed);
+
+    get_admin_allowed_ips()
+        .iter()
+        .any(|entry| allowlist_entry_matches(entry, &ip))
+}
+
 pub fn user_id_from_request(req: &HttpRequest) -> Option<String> {
     let cookie = req.cookie("jwt")?;
     let token = cookie.value();
     user_id_from_jwt_token(token)
 }
 
-pub async fn resolve_admin_user(req: &HttpRequest) -> Option<User> {
+async fn session_is_bound(req: &HttpRequest, token: &str) -> bool {
+    if !is_production() {
+        return true;
+    }
+
+    let refresh_token = req.cookie(REFRESH_COOKIE).map(|c| c.value().to_string());
+    if refresh_token.is_none() {
+        return false;
+    }
+
+    let Ok(key) = jwt_decoding_key() else {
+        return false;
+    };
+    let Ok(data) = decode::<TokenPayload>(token, &key, &hs256_validation()) else {
+        return false;
+    };
+
+    let Some(family_id) =
+        resolve_session_family_id(&data.claims, refresh_token.as_deref()).await
+    else {
+        return false;
+    };
+
+    RefreshToken::family_is_active(&get_db(), &family_id)
+        .await
+        .unwrap_or(false)
+}
+
+/// Konto panelu admina po pełnej walidacji sesji użytkownika (jwt + refresh + ADMIN_USER_IDS).
+pub async fn resolve_panel_admin_account(req: &HttpRequest) -> Option<User> {
     let cookie = req.cookie("jwt")?;
-    let token = cookie.value();
-    let user = user_from_jwt(token).await?;
+    let token = cookie.value().trim();
+    if token.is_empty() || token.len() > 1000 {
+        return None;
+    }
+
+    let refresh_token = req.cookie(REFRESH_COOKIE).map(|c| c.value().to_string());
+    if !session_is_bound(req, token).await {
+        return None;
+    }
+
+    let user = user_from_jwt_with_refresh(token, refresh_token.as_deref()).await?;
     let id = user.id.map(|oid| oid.to_hex())?;
     if !is_admin_user_id(&id) {
         return None;
@@ -51,7 +237,80 @@ pub async fn resolve_admin_user(req: &HttpRequest) -> Option<User> {
     Some(user)
 }
 
-use crate::utils::app_env::is_production;
+fn admin_elevation_decoding_key() -> Option<DecodingKey> {
+    admin_secret().map(|secret| DecodingKey::from_secret(secret.as_bytes()))
+}
+
+fn admin_elevation_encoding_key() -> Option<EncodingKey> {
+    admin_secret().map(|secret| EncodingKey::from_secret(secret.as_bytes()))
+}
+
+pub fn admin_elevation_valid(req: &HttpRequest, user_id: &str) -> bool {
+    if !admin_elevation_required() {
+        return true;
+    }
+
+    let token = req
+        .cookie(ADMIN_COOKIE)
+        .map(|cookie| cookie.value().trim().to_string())
+        .unwrap_or_default();
+    if token.is_empty() || token.len() > 2048 {
+        return false;
+    }
+
+    let key = match admin_elevation_decoding_key() {
+        Some(key) => key,
+        None => return false,
+    };
+
+    let claims = match decode::<AdminElevationClaims>(&token, &key, &admin_elevation_validation()) {
+        Ok(data) => data.claims,
+        Err(_) => return false,
+    };
+
+    claims.purpose == ADMIN_ELEVATION_PURPOSE
+        && claims.user_id.eq_ignore_ascii_case(user_id)
+}
+
+pub async fn resolve_admin_user(req: &HttpRequest) -> Option<User> {
+    let user = resolve_panel_admin_account(req).await?;
+    let id = user.id.map(|oid| oid.to_hex())?;
+    if admin_elevation_required() && !admin_elevation_valid(req, &id) {
+        return None;
+    }
+    Some(user)
+}
+
+pub fn issue_admin_elevation_cookie(user_id: &str) -> Result<actix_web::cookie::Cookie<'static>, String> {
+    let encoding_key = admin_elevation_encoding_key()
+        .ok_or_else(|| "ADMIN_SECRET is not configured".to_string())?;
+
+    let exp = (chrono::Utc::now().timestamp() + ADMIN_ELEVATION_MAX_AGE_SECS) as usize;
+    let claims = AdminElevationClaims {
+        user_id: user_id.to_ascii_lowercase(),
+        purpose: ADMIN_ELEVATION_PURPOSE.to_string(),
+        exp,
+    };
+
+    let token = encode(
+        &crate::utils::auth::jwt_validation::hs256_header(),
+        &claims,
+        &encoding_key,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(build_admin_cookie(
+        &token,
+        ADMIN_ELEVATION_MAX_AGE_SECS * 1000,
+    ))
+}
+
+fn admin_elevation_validation() -> Validation {
+    let mut validation = Validation::default();
+    validation.validate_exp = true;
+    validation.required_spec_claims.clear();
+    validation
+}
 
 pub fn build_admin_cookie(value: &str, max_age_ms: i64) -> actix_web::cookie::Cookie<'static> {
     use actix_web::cookie::{time::Duration as CookieDuration, Cookie, SameSite};

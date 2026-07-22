@@ -16,6 +16,8 @@ pub struct AuditLog {
     pub details: Value,
     #[serde(rename = "clientIp", skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
+    #[serde(rename = "actorUserId", skip_serializing_if = "Option::is_none")]
+    pub actor_user_id: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: DateTime,
 }
@@ -32,6 +34,9 @@ impl AuditLog {
         Self::collection(db)
             .create_index(IndexModel::builder().keys(doc! { "action": 1 }).build())
             .await?;
+        Self::collection(db)
+            .create_index(IndexModel::builder().keys(doc! { "actorUserId": 1 }).build())
+            .await?;
         Ok(())
     }
 
@@ -42,6 +47,7 @@ impl AuditLog {
         target_id: Option<&str>,
         details: Value,
         client_ip: Option<&str>,
+        actor_user_id: Option<&str>,
     ) -> mongodb::error::Result<()> {
         let entry = AuditLog {
             id: None,
@@ -50,6 +56,7 @@ impl AuditLog {
             target_id: target_id.map(str::to_string),
             details,
             client_ip: client_ip.map(str::to_string),
+            actor_user_id: actor_user_id.map(str::to_string),
             created_at: DateTime::now(),
         };
         Self::collection(db).insert_one(entry).await?;

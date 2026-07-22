@@ -27,6 +27,7 @@ pub async fn log_attachment_upload(
             "fileSize": file_size,
         }),
         Some(&client_ip),
+        Some(user_id),
     )
     .await
     {

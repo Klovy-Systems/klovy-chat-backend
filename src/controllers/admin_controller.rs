@@ -1,4 +1,4 @@
-use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Bson};
 use serde::Deserialize;
@@ -17,8 +17,11 @@ use crate::model::warning_model::{
 use crate::utils::admin::purge_user_completely;
 use crate::utils::admin_audit::log_admin_action;
 use crate::utils::auth::admin_session::{
-    admin_user_ids_configured, clear_admin_cookie, resolve_admin_user,
+    admin_elevation_required, admin_elevation_valid, admin_user_ids_configured,
+    clear_admin_cookie, is_admin_user_id, issue_admin_elevation_cookie,
+    resolve_panel_admin_account, verify_admin_secret,
 };
+use crate::middlewares::auth_middleware::RequestUserId;
 use crate::utils::security::csrf::{csrf_token_for_response};
 use crate::utils::channel::channel_member_count;
 use crate::ws::registry::{channel_recipient_ids, disconnect_user, emit_to_user, emit_to_users};
@@ -35,6 +38,30 @@ use crate::utils::whitelist::is_whitelist_enabled;
 
 fn param<'a>(req: &'a HttpRequest, name: &str) -> &'a str {
     req.match_info().get(name).unwrap_or("")
+}
+
+fn actor_user_id(req: &HttpRequest) -> Option<String> {
+    req.extensions()
+        .get::<RequestUserId>()
+        .map(|row| row.0.clone())
+}
+
+/// Blokuje operacje moderacyjne na kontach z ADMIN_USER_IDS (oraz self-target dla actor).
+fn reject_protected_panel_admin_target(
+    req: &HttpRequest,
+    target_user_id: &str,
+) -> Option<HttpResponse> {
+    if is_admin_user_id(target_user_id) {
+        return Some(HttpResponse::Forbidden().json(json!({
+            "error": "Operacja niedozwolona na koncie administratora panelu."
+        })));
+    }
+    if actor_user_id(req).as_deref() == Some(target_user_id) {
+        return Some(HttpResponse::Forbidden().json(json!({
+            "error": "Nie możesz wykonać tej operacji na własnym koncie."
+        })));
+    }
+    None
 }
 
 async fn terminate_user_sessions(db: &mongodb::Database, uid: ObjectId) {
@@ -135,6 +162,75 @@ async fn warning_counts_for_users(
     counts
 }
 
+pub async fn admin_login_removed() -> HttpResponse {
+    HttpResponse::Gone().json(json!({
+        "error": "Osobne logowanie do panelu administratora zostało wyłączone. Zaloguj się na konto użytkownika i potwierdź dostęp w panelu.",
+        "code": "ADMIN_LOGIN_DISABLED",
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct AdminElevateBody {
+    #[serde(rename = "adminSecret")]
+    pub admin_secret: String,
+}
+
+pub async fn admin_elevate(req: HttpRequest, body: web::Json<AdminElevateBody>) -> HttpResponse {
+    if !admin_elevation_required() {
+        return HttpResponse::BadRequest().json(json!({
+            "error": "Potwierdzenie ADMIN_SECRET nie jest wymagane w tym środowisku.",
+            "code": "ADMIN_ELEVATION_NOT_REQUIRED",
+        }));
+    }
+
+    let has_session = req.cookie("jwt").is_some();
+    let Some(user) = resolve_panel_admin_account(&req).await else {
+        let status = if has_session {
+            actix_web::http::StatusCode::FORBIDDEN
+        } else {
+            actix_web::http::StatusCode::UNAUTHORIZED
+        };
+        return HttpResponse::build(status).json(json!({
+            "error": "Brak uprawnień administratora.",
+            "code": "ADMIN_FORBIDDEN",
+        }));
+    };
+
+    if !verify_admin_secret(&body.admin_secret) {
+        log::warn!(
+            "Failed admin panel elevation attempt for user {}",
+            user.username
+        );
+        return HttpResponse::Forbidden().json(json!({
+            "error": "Nieprawidłowy sekret administratora.",
+            "code": "ADMIN_SECRET_INVALID",
+        }));
+    }
+
+    let user_id = match user.id {
+        Some(id) => id.to_hex(),
+        None => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Nie udało się potwierdzić dostępu administratora.",
+            }));
+        }
+    };
+
+    let cookie = match issue_admin_elevation_cookie(&user_id) {
+        Ok(cookie) => cookie,
+        Err(e) => {
+            log::error!("Failed to issue admin elevation cookie: {e}");
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Nie udało się potwierdzić dostępu administratora.",
+            }));
+        }
+    };
+
+    HttpResponse::Ok()
+        .cookie(cookie)
+        .json(json!({ "message": "Potwierdzono dostęp do panelu administratora." }))
+}
+
 pub async fn admin_logout() -> HttpResponse {
     HttpResponse::Ok()
         .cookie(clear_admin_cookie())
@@ -145,14 +241,30 @@ pub async fn admin_session_status(req: HttpRequest) -> HttpResponse {
     if !admin_user_ids_configured() {
         return HttpResponse::Ok().json(json!({
             "authenticated": false,
+            "configured": false,
+            "reason": "not_configured",
         }));
     }
 
-    let Some(user) = resolve_admin_user(&req).await else {
+    let has_session = req.cookie("jwt").is_some();
+
+    let Some(user) = resolve_panel_admin_account(&req).await else {
+        let reason = if has_session { "forbidden" } else { "not_logged_in" };
         return HttpResponse::Ok().json(json!({
             "authenticated": false,
+            "configured": true,
+            "reason": reason,
         }));
     };
+
+    let user_id = user.id.map(|id| id.to_hex()).unwrap_or_default();
+    if admin_elevation_required() && !admin_elevation_valid(&req, &user_id) {
+        return HttpResponse::Ok().json(json!({
+            "authenticated": false,
+            "configured": true,
+            "reason": "elevation_required",
+        }));
+    }
 
     let (csrf, csrf_cookie) = csrf_token_for_response(&req);
     let mut builder = HttpResponse::Ok();
@@ -161,6 +273,7 @@ pub async fn admin_session_status(req: HttpRequest) -> HttpResponse {
     }
     builder.json(json!({
         "authenticated": true,
+        "configured": true,
         "userId": user.id.map(|id| id.to_hex()),
         "username": user.username,
         "csrfToken": csrf,
@@ -345,6 +458,9 @@ pub async fn set_user_password(
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
     };
+    if let Some(res) = reject_protected_panel_admin_target(&req, &uid.to_hex()) {
+        return res;
+    }
 
     let new_password = body.new_password.as_deref().unwrap_or("").trim();
     if new_password.is_empty() {
@@ -409,6 +525,9 @@ pub async fn block_user(req: HttpRequest, body: web::Json<BlockUserBody>) -> Htt
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
     };
+    if let Some(res) = reject_protected_panel_admin_target(&req, &uid.to_hex()) {
+        return res;
+    }
 
     let db = get_db();
     let user = match User::find_by_id(&db, uid).await {
@@ -521,6 +640,9 @@ pub async fn delete_user(req: HttpRequest) -> HttpResponse {
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
     };
+    if let Some(res) = reject_protected_panel_admin_target(&req, &uid.to_hex()) {
+        return res;
+    }
 
     let db = get_db();
     if User::find_by_id(&db, uid).await.ok().flatten().is_none() {

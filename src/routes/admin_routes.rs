@@ -2,7 +2,7 @@ use actix_web::web;
 use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::admin_controller::{
-    admin_logout, admin_session_status, assign_badge, block_user, create_badge,
+    admin_elevate, admin_login_removed, admin_logout, admin_session_status, assign_badge, block_user, create_badge,
     delete_badge, delete_channel_admin, delete_channel_report, delete_user, delete_user_warning,
     get_user_badges, list_badges, list_channel_reports, list_channels, list_user_warnings,
     list_users, remove_badge, restore_user, set_user_password, set_user_whitelist, unblock_user,
@@ -13,24 +13,40 @@ use crate::controllers::announcement_controller::{
 };
 use crate::middlewares::admin_auth_middleware::{check_admin_configured, verify_admin_session};
 use crate::middlewares::validation_middleware::validate_password;
-use crate::utils::ratelimit::admin_action_limiter;
+use crate::utils::ratelimit::{admin_action_limiter, admin_elevate_limiter, admin_session_probe_limiter};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::resource("")
+            .wrap(from_fn(admin_session_probe_limiter))
             .wrap(from_fn(check_admin_configured))
             .route(web::get().to(admin_session_status)),
     );
     cfg.service(
         web::resource("/")
+            .wrap(from_fn(admin_session_probe_limiter))
             .wrap(from_fn(check_admin_configured))
             .route(web::get().to(admin_session_status)),
     );
 
     cfg.service(
         web::resource("/session")
+            .wrap(from_fn(admin_session_probe_limiter))
             .wrap(from_fn(check_admin_configured))
             .route(web::get().to(admin_session_status)),
+    );
+
+    cfg.service(
+        web::resource("/login")
+            .route(web::post().to(admin_login_removed))
+            .route(web::get().to(admin_login_removed)),
+    );
+
+    cfg.service(
+        web::resource("/elevate")
+            .wrap(from_fn(admin_elevate_limiter))
+            .wrap(from_fn(check_admin_configured))
+            .route(web::post().to(admin_elevate)),
     );
 
     cfg.service(

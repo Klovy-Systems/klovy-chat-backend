@@ -17,8 +17,6 @@ fn is_exempt(path: &str) -> bool {
         "/api/auth/register",
         "/api/auth/login/2fa",
         "/api/auth/refresh",
-        "/api/admin/login",
-        "/api/admins/login",
     ];
 
     if EXACT.iter().any(|p| path == *p) {
