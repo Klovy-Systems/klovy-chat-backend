@@ -3,7 +3,8 @@ use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::e2e_controller::{
     append_e2e_prekeys, delete_e2e_keys, get_e2e_capabilities, get_e2e_key_bulk,
-    get_e2e_key_bundle, get_e2e_status, patch_e2e_settings, put_e2e_keys,
+    get_e2e_key_bundle, get_e2e_key_fingerprint, get_e2e_status, patch_e2e_settings,
+    put_e2e_keys,
 };
 use crate::middlewares::auth_middleware::{require_active_account, verify_token};
 use crate::utils::ratelimit::e2e_key_fetch_limiter;
@@ -47,6 +48,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .wrap(from_fn(require_active_account))
             .wrap(from_fn(verify_token))
             .route(web::get().to(get_e2e_capabilities)),
+    )
+    .service(
+        web::resource("/keys/{user_id}/fingerprint")
+            .wrap(from_fn(e2e_key_fetch_limiter))
+            .wrap(from_fn(require_active_account))
+            .wrap(from_fn(verify_token))
+            .route(web::get().to(get_e2e_key_fingerprint)),
     )
     .service(
         web::resource("/keys/{user_id}")

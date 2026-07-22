@@ -162,6 +162,63 @@ async fn warning_counts_for_users(
     counts
 }
 
+async fn admin_user_stats(db: &mongodb::Database) -> Value {
+    let col = User::collection(db);
+    let total = col.count_documents(doc! {}).await.unwrap_or(0);
+    let active = col
+        .count_documents(doc! {
+            "isActive": true,
+            "isDisabled": { "$ne": true },
+            "isBlocked": { "$ne": true },
+            "isBanned": { "$ne": true },
+        })
+        .await
+        .unwrap_or(0);
+    let banned = col
+        .count_documents(doc! {
+            "$or": [
+                { "isBlocked": true },
+                { "isBanned": true },
+            ],
+        })
+        .await
+        .unwrap_or(0);
+    json!({ "total": total, "active": active, "banned": banned })
+}
+
+async fn message_counts_for_channels(
+    db: &mongodb::Database,
+    channel_ids: &[ObjectId],
+) -> std::collections::HashMap<String, u64> {
+    let mut counts = std::collections::HashMap::new();
+    if channel_ids.is_empty() {
+        return counts;
+    }
+
+    let pipeline = vec![
+        doc! {
+            "$match": {
+                "channel": { "$in": channel_ids },
+                "deleted": { "$ne": true },
+            }
+        },
+        doc! { "$group": { "_id": "$channel", "count": { "$sum": 1 } } },
+    ];
+
+    if let Ok(mut cursor) = Message::collection(db).aggregate(pipeline).await {
+        while let Ok(Some(doc)) = cursor.try_next().await {
+            if let Ok(oid) = doc.get_object_id("_id") {
+                let count = doc.get_i32("count").map(|c| c as u64).unwrap_or_else(|_| {
+                    doc.get_i64("count").map(|c| c as u64).unwrap_or(0)
+                });
+                counts.insert(oid.to_hex(), count);
+            }
+        }
+    }
+
+    counts
+}
+
 pub async fn admin_login_removed() -> HttpResponse {
     HttpResponse::Gone().json(json!({
         "error": "Osobne logowanie do panelu administratora zostało wyłączone. Zaloguj się na konto użytkownika i potwierdź dostęp w panelu.",
@@ -320,6 +377,7 @@ pub async fn list_users(req: HttpRequest) -> HttpResponse {
 
     let db = get_db();
     let pending_count = pending_whitelist_count().await;
+    let stats = admin_user_stats(&db).await;
     let total = User::collection(&db).count_documents(filter.clone()).await.unwrap_or(0);
     let skip = (page - 1) * limit;
 
@@ -377,6 +435,7 @@ pub async fn list_users(req: HttpRequest) -> HttpResponse {
             "limit": limit,
             "pendingCount": pending_count,
             "whitelistEnabled": is_whitelist_enabled(),
+            "stats": stats,
         }))
 }
 
@@ -784,6 +843,8 @@ pub async fn list_channels(req: HttpRequest) -> HttpResponse {
     }
 
     let mut items = Vec::with_capacity(channels.len());
+    let channel_ids: Vec<ObjectId> = channels.iter().filter_map(|c| c.id).collect();
+    let message_counts = message_counts_for_channels(&db, &channel_ids).await;
     for ch in &channels {
         let admin = match admin_map.get(&ch.admin) {
             Some(u) => json!({
@@ -793,6 +854,7 @@ pub async fn list_channels(req: HttpRequest) -> HttpResponse {
             }),
             None => json!({ "id": Value::Null, "username": Value::Null, "displayName": Value::Null }),
         };
+        let channel_id = ch.id.map(|o| o.to_hex()).unwrap_or_default();
 
         items.push(json!({
             "id": ch.id.map(|o| o.to_hex()),
@@ -800,7 +862,7 @@ pub async fn list_channels(req: HttpRequest) -> HttpResponse {
             "description": ch.description.as_deref().unwrap_or(""),
             "isPrivate": ch.is_private,
             "memberCount": channel_member_count(ch),
-            "messageCount": ch.messages.len(),
+            "messageCount": message_counts.get(&channel_id).copied().unwrap_or(0),
             "admin": admin,
             "createdAt": iso(&ch.created_at),
         }));
@@ -859,6 +921,14 @@ pub async fn delete_channel_admin(req: HttpRequest) -> HttpResponse {
 
 pub async fn list_channel_reports() -> HttpResponse {
     let db = get_db();
+    let pending_count = ChannelReport::collection(&db)
+        .count_documents(doc! { "status": "pending" })
+        .await
+        .unwrap_or(0);
+    let total = ChannelReport::collection(&db)
+        .count_documents(doc! {})
+        .await
+        .unwrap_or(0);
     let reports: Vec<ChannelReport> = match ChannelReport::collection(&db)
         .find(doc! {})
         .sort(doc! { "createdAt": -1 })
@@ -870,13 +940,8 @@ pub async fn list_channel_reports() -> HttpResponse {
     };
 
     let mut rows = Vec::with_capacity(reports.len());
-    let mut pending_count = 0u64;
 
     for r in &reports {
-        if r.status == ChannelReportStatus::Pending {
-            pending_count += 1;
-        }
-
         let reporter = match User::find_by_id(&db, r.reported_by).await {
             Ok(Some(u)) => json!({
                 "id": u.id.map(|o| o.to_hex()),
@@ -904,7 +969,7 @@ pub async fn list_channel_reports() -> HttpResponse {
         }));
     }
 
-    HttpResponse::Ok().json(json!({ "reports": rows, "pendingCount": pending_count }))
+    HttpResponse::Ok().json(json!({ "reports": rows, "pendingCount": pending_count, "total": total }))
 }
 
 #[derive(Deserialize)]

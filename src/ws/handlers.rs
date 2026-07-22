@@ -461,7 +461,7 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
         return;
     };
 
-    create_and_broadcast_channel_message(
+    if create_and_broadcast_channel_message(
         &db,
         ChannelBroadcastInput {
             channel,
@@ -483,7 +483,18 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
             }),
         },
     )
-    .await;
+    .await
+    .is_none()
+    {
+        registry::emit_to_user(
+            connected,
+            "error",
+            json!({
+                "message": "Invalid encrypted message payload.",
+                "code": "INVALID_E2E_CIPHERTEXT",
+            }),
+        );
+    }
 }
 
 /// Parametry współdzielonej wysyłki wiadomości kanałowej.
@@ -908,32 +919,6 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
     if !is_connected_user(connected, &user_id) {
         return;
     }
-    let e2e_encrypted = payload.e2e_encrypted.unwrap_or(false);
-    let prepared = match prepare_inbound_content(
-        Some(content_raw.as_str()),
-        e2e_encrypted,
-        payload.e2e_version.or(if e2e_encrypted {
-            Some(E2E_VERSION_DM)
-        } else {
-            None
-        }),
-    ) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    if prepared.content.is_empty() {
-        return;
-    }
-    if !prepared.e2e_encrypted
-        && !crate::model::messages_model::is_message_content_within_limit(&prepared.content)
-    {
-        registry::emit_to_user(
-            connected,
-            "error",
-            json!({ "message": "Wiadomość nie może przekraczać 2000 znaków", "code": "CONTENT_TOO_LONG" }),
-        );
-        return;
-    }
     let Ok(mid) = ObjectId::parse_str(&message_id) else { return };
     let db = get_db();
     let Some(msg) = Message::find_by_id(&db, mid).await.ok().flatten() else {
@@ -946,6 +931,51 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
         .await
         .is_err()
     {
+        return;
+    }
+
+    let e2e_encrypted = payload.e2e_encrypted.unwrap_or(false);
+    let default_e2e_version = if msg.channel.is_some() {
+        E2E_VERSION_CHANNEL
+    } else {
+        E2E_VERSION_DM
+    };
+    let prepared = match prepare_inbound_content(
+        Some(content_raw.as_str()),
+        e2e_encrypted,
+        payload
+            .e2e_version
+            .or(msg.e2e_version)
+            .or(if e2e_encrypted {
+                Some(default_e2e_version)
+            } else {
+                None
+            }),
+    ) {
+        Ok(p) => p,
+        Err(code) => {
+            registry::emit_to_user(
+                connected,
+                "error",
+                json!({
+                    "message": "Invalid encrypted message payload.",
+                    "code": code,
+                }),
+            );
+            return;
+        }
+    };
+    if prepared.content.is_empty() {
+        return;
+    }
+    if !prepared.e2e_encrypted
+        && !crate::model::messages_model::is_message_content_within_limit(&prepared.content)
+    {
+        registry::emit_to_user(
+            connected,
+            "error",
+            json!({ "message": "Wiadomość nie może przekraczać 2000 znaków", "code": "CONTENT_TOO_LONG" }),
+        );
         return;
     }
 
@@ -1491,6 +1521,50 @@ async fn handle_e2e_sender_key(connected: &str, payload: E2eSenderKeyPayload) {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct E2eSenderKeyRequestPayload {
+    requester_id: String,
+    channel_id: String,
+    target_user_ids: Vec<String>,
+}
+
+async fn handle_e2e_sender_key_request(connected: &str, payload: E2eSenderKeyRequestPayload) {
+    if !is_connected_user(connected, &payload.requester_id) || payload.channel_id.is_empty() {
+        return;
+    }
+    if payload.target_user_ids.is_empty() {
+        return;
+    }
+    let db = get_db();
+    if require_channel_access(&db, &payload.channel_id, &payload.requester_id)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    for target_id in payload.target_user_ids {
+        if target_id.is_empty() || target_id == payload.requester_id {
+            continue;
+        }
+        if require_channel_access(&db, &payload.channel_id, &target_id)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        registry::emit_to_user(
+            &target_id,
+            "e2e-sender-key-request",
+            json!({
+                "channelId": payload.channel_id,
+                "requesterId": payload.requester_id,
+            }),
+        );
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct E2eSenderKeyPayload {
     sender: String,
     recipient_id: String,
@@ -1632,6 +1706,18 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
             }
             if let Ok(p) = serde_json::from_value::<E2eSenderKeyPayload>(payload) {
                 handle_e2e_sender_key(connected, p).await;
+            }
+        }
+        "e2e-sender-key-request" => {
+            if !state
+                .check_rate_limit(connected, "e2e-sender-key-request", 30, 60_000)
+                .await
+            {
+                emit_rate_limit_error(connected);
+                return;
+            }
+            if let Ok(p) = serde_json::from_value::<E2eSenderKeyRequestPayload>(payload) {
+                handle_e2e_sender_key_request(connected, p).await;
             }
         }
         "set-online" => {

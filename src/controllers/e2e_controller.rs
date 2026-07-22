@@ -181,6 +181,9 @@ pub async fn append_e2e_prekeys(
     if body.one_time_pre_keys.is_empty() {
         return HttpResponse::BadRequest().json(json!({ "error": "No prekeys provided" }));
     }
+    if !validate_one_time_prekeys(&body.one_time_pre_keys) {
+        return invalid_keys_response();
+    }
 
     let db = get_db();
     if E2eKeyBundle::append_one_time_prekeys(&db, oid, body.one_time_pre_keys.clone())
@@ -310,6 +313,14 @@ pub async fn get_e2e_capabilities(req: HttpRequest, query: web::Query<BulkQuery>
 
     let db = get_db();
     let mut users = Vec::new();
+    let fingerprint_rows = E2eKeyBundle::find_fingerprints_bulk(&db, &ids)
+        .await
+        .unwrap_or_default();
+    let fingerprint_by_id: std::collections::HashMap<String, String> = fingerprint_rows
+        .into_iter()
+        .map(|(oid, fingerprint, _)| (oid.to_hex(), fingerprint))
+        .collect();
+
     for id in ids {
         let id_hex = id.to_hex();
         if requester_id != id_hex
@@ -327,9 +338,57 @@ pub async fn get_e2e_capabilities(req: HttpRequest, query: web::Query<BulkQuery>
                 "userId": id.to_hex(),
                 "e2eEnabled": user.e2e_enabled,
                 "hasKeys": has_keys,
+                "fingerprint": fingerprint_by_id.get(&id_hex),
             }));
         }
     }
 
     HttpResponse::Ok().json(json!({ "users": users }))
+}
+
+pub async fn get_e2e_key_fingerprint(
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let Some(requester_id) = request_user_id(&req) else {
+        return HttpResponse::Unauthorized().json(json!({ "error": "Unauthorized" }));
+    };
+    let target_id = path.into_inner();
+    if target_id.is_empty() {
+        return HttpResponse::BadRequest().json(json!({ "error": "Invalid user id" }));
+    }
+    let Ok(target_oid) = ObjectId::parse_str(&target_id) else {
+        return HttpResponse::BadRequest().json(json!({ "error": "Invalid user id" }));
+    };
+
+    let db = get_db();
+    let user = match User::find_by_id(&db, target_oid).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "User not found" })),
+        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Server error" })),
+    };
+
+    if !user.e2e_enabled {
+        return HttpResponse::NotFound().json(json!({ "error": "E2E not enabled for user" }));
+    }
+
+    if requester_id != target_id {
+        if !crate::utils::friends::are_friends(&db, &requester_id, &target_id).await {
+            return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
+        }
+    }
+
+    let bundle = match E2eKeyBundle::find_by_user_id(&db, target_oid).await {
+        Ok(b) => b,
+        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Server error" })),
+    };
+
+    let Some(bundle) = bundle else {
+        return HttpResponse::NotFound().json(json!({ "error": "No key bundle" }));
+    };
+
+    HttpResponse::Ok().json(json!({
+        "userId": target_id,
+        "fingerprint": bundle.identity_fingerprint,
+    }))
 }

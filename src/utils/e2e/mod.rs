@@ -14,9 +14,18 @@ pub fn is_valid_e2e_ciphertext(content: &str) -> bool {
     if trimmed.is_empty() || trimmed.len() > MAX_E2E_CIPHERTEXT_LEN {
         return false;
     }
-    base64::engine::general_purpose::STANDARD
+    if base64::engine::general_purpose::STANDARD
         .decode(trimmed)
         .is_ok()
+    {
+        return true;
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(trimmed)
+        .is_ok()
+        || base64::engine::general_purpose::URL_SAFE
+            .decode(trimmed)
+            .is_ok()
 }
 
 pub fn compute_identity_fingerprint(identity_key_b64: &str) -> Option<String> {
