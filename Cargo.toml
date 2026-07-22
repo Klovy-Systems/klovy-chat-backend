@@ -66,6 +66,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 hex = "0.4"
+unicode-general-category = "0.6"
 zip = "2"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"

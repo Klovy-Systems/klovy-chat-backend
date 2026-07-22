@@ -1353,7 +1353,9 @@ pub async fn update_profile(req: HttpRequest, body: web::Json<UpdateProfileBody>
         return HttpResponse::NotFound().body("User not found.");
     };
 
-    let trimmed_name = body.display_name.as_deref().unwrap_or("").trim().to_string();
+    let trimmed_name = crate::utils::validators::unicode_text::sanitize_display_name(
+        body.display_name.as_deref().unwrap_or(""),
+    );
     if trimmed_name.is_empty() {
         return HttpResponse::BadRequest().body("Display name is required.");
     }
@@ -1362,7 +1364,9 @@ pub async fn update_profile(req: HttpRequest, body: web::Json<UpdateProfileBody>
             .body(format!("Display name must be at most {DISPLAY_NAME_MAX_LENGTH} characters."));
     }
 
-    let trimmed_bio = body.bio.as_deref().unwrap_or("").trim().to_string();
+    let trimmed_bio = crate::utils::validators::unicode_text::sanitize_bio(
+        body.bio.as_deref().unwrap_or(""),
+    );
     if trimmed_bio.chars().count() > BIO_MAX_LENGTH {
         return HttpResponse::BadRequest()
             .body(format!("Bio must be at most {BIO_MAX_LENGTH} characters."));

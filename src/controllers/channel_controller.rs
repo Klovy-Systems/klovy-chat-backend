@@ -11,6 +11,7 @@ use crate::utils::image_reencode::{reencode_error_message, reencode_upload_to_we
 use crate::utils::storage::{avatar_channel_key, avatar_key_owned_by_channel, storage};
 use crate::utils::upload_limits::{file_bytes_within_limit, local_file_size, MAX_AVATAR_BYTES};
 use crate::utils::validators::file_magic::validate_file_magic;
+use crate::utils::validators::unicode_text::sanitize_channel_name;
 use crate::model::channel_model::{Channel, CreateChannelInput};
 use crate::model::channel_report_model::{ChannelReport, CreateChannelReportInput};
 use crate::model::messages_model::Message;
@@ -334,8 +335,8 @@ pub struct RenameBody {
 pub async fn rename_channel(req: HttpRequest, body: web::Json<RenameBody>) -> HttpResponse {
     let user_id = request_user_id(&req).unwrap_or_default();
     let name = body.name.clone().unwrap_or_default();
-    let trimmed = name.trim();
-    if trimmed.chars().count() < 3 || trimmed.chars().count() > 50 {
+    let new_name = sanitize_channel_name(&name);
+    if new_name.chars().count() < 3 || new_name.chars().count() > 50 {
         return HttpResponse::BadRequest()
             .json(json!({ "error": "Nazwa kanału musi mieć od 3 do 50 znaków" }));
     }
@@ -355,7 +356,6 @@ pub async fn rename_channel(req: HttpRequest, body: web::Json<RenameBody>) -> Ht
             .json(json!({ "error": "Tylko administrator może zmienić nazwę kanału" }));
     }
 
-    let new_name = trimmed.to_string();
     let _ = Channel::collection(&db)
         .update_one(
             doc! { "_id": cid },

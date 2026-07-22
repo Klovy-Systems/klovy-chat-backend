@@ -8,6 +8,10 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use serde_json::Value;
 
+use super::unicode_text::{
+    sanitize_unicode_text, MAX_MESSAGE_BYTES, MAX_MESSAGE_CHARS, MAX_MESSAGE_COMBINING,
+};
+
 lazy_static! {
     static ref SCRIPT_TAG: Regex =
         Regex::new(r"(?is)<script\b[^>]*>.*?</script>").unwrap();
@@ -17,11 +21,12 @@ lazy_static! {
 
 pub fn sanitize_message_content(input: &str) -> String {
     let cleaned = strip_dangerous(input.trim());
-    if cleaned.len() > 10_000 {
-        cleaned.chars().take(10_000).collect()
-    } else {
-        cleaned
-    }
+    sanitize_unicode_text(
+        &cleaned,
+        MAX_MESSAGE_CHARS,
+        MAX_MESSAGE_BYTES,
+        MAX_MESSAGE_COMBINING,
+    )
 }
 
 pub fn strip_dangerous(input: &str) -> String {
@@ -34,12 +39,8 @@ pub fn strip_dangerous(input: &str) -> String {
 fn sanitize_json_value(value: &mut Value) {
     match value {
         Value::String(s) => {
-            let cleaned = strip_dangerous(s.trim());
-            if cleaned.len() > 10_000 {
-                *s = cleaned.chars().take(10_000).collect();
-            } else {
-                *s = cleaned;
-            }
+            let cleaned = sanitize_message_content(s.trim());
+            *s = cleaned;
         }
         Value::Array(items) => {
             for item in items {

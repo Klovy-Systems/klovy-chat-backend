@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::channel_moderation::{
     deserialize_moderation_entries, ChannelModerationEntry,
 };
+use crate::utils::validators::unicode_text::{sanitize_channel_description, sanitize_channel_name};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
@@ -94,19 +95,20 @@ impl std::fmt::Display for ChannelValidationError {
 impl std::error::Error for ChannelValidationError {}
 
 pub fn validate_channel(input: &CreateChannelInput) -> Result<(), ChannelValidationError> {
-    let name = input.name.trim();
+    let name = sanitize_channel_name(&input.name);
 
     if name.is_empty() {
         return Err(ChannelValidationError::NameRequired);
     }
-    if name.len() < 3 {
+    if name.chars().count() < 3 {
         return Err(ChannelValidationError::NameTooShort);
     }
-    if name.len() > 50 {
+    if name.chars().count() > 50 {
         return Err(ChannelValidationError::NameTooLong);
     }
     if let Some(desc) = &input.description {
-        if desc.trim().len() > 200 {
+        let desc = sanitize_channel_description(desc);
+        if desc.chars().count() > 200 {
             return Err(ChannelValidationError::DescriptionTooLong);
         }
     }
@@ -157,9 +159,11 @@ impl Channel {
         let now = DateTime::now();
         let channel = Channel {
             id: None,
-            name: input.name.trim().to_string(),
-            description: input.description
-                .map(|d| d.trim().to_string())
+            name: sanitize_channel_name(&input.name),
+            description: input
+                .description
+                .as_deref()
+                .map(sanitize_channel_description)
                 .filter(|d| !d.is_empty()),
             members: input.members.unwrap_or_default(),
             admin: input.admin,
