@@ -246,7 +246,6 @@ pub fn create_app(
         .service(web::resource("/").route(web::get().to(get_api_info)))
         .service(
             web::scope("/api/auth")
-                .wrap(from_fn(auth_rate_limiter))
                 .configure(auth_routes::configure),
         )
         .service(
