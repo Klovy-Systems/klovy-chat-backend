@@ -41,6 +41,7 @@ pub async fn check_admin_ip_allowlist(
             "authenticated": false,
             "configured": admin_user_ids_configured(),
             "reason": "ip_not_allowed",
+            "seenIp": client_ip,
         }))
     } else {
         HttpResponse::Forbidden().json(serde_json::json!({

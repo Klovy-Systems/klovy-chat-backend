@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use actix_web::{dev::ServiceRequest, HttpRequest};
 use http::HeaderMap;
@@ -12,80 +12,111 @@ fn trust_proxy_headers() -> bool {
         .unwrap_or(false)
 }
 
-fn ip_from_http_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let ip = value.trim();
-        if !ip.is_empty() {
-            return Some(ip.to_string());
+fn normalize_client_ip_candidate(raw: &str) -> Option<String> {
+    let mut ip = raw.trim().trim_matches('"');
+    if ip.is_empty() {
+        return None;
+    }
+
+    if ip.starts_with('[') {
+        if let Some(end) = ip.find(']') {
+            ip = &ip[1..end];
+        }
+    } else if ip.contains(':') && ip.contains('.') {
+        // IPv4 with port, e.g. 203.0.113.1:443
+        if let Some(host) = ip.rsplit_once(':').map(|(host, _)| host) {
+            ip = host;
         }
     }
 
-    if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = value.split(',').next() {
-            let ip = first.trim();
-            if !ip.is_empty() {
-                return Some(ip.to_string());
+    let parsed = ip.parse::<IpAddr>().ok()?;
+    Some(parsed.to_string())
+}
+
+fn forwarded_header_ip(raw: &str) -> Option<String> {
+    for part in raw.split(';') {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix("for=") {
+            if let Some(ip) = normalize_client_ip_candidate(value) {
+                return Some(ip);
             }
         }
     }
+    None
+}
 
-    if let Some(forwarded) = headers.get("forwarded").and_then(|v| v.to_str().ok()) {
-        for part in forwarded.split(';') {
-            let part = part.trim();
-            if let Some(value) = part.strip_prefix("for=") {
-                let value = value.trim().trim_matches('"');
-                if value.starts_with('[') {
-                    if let Some(end) = value.find(']') {
-                        return Some(value[1..end].to_string());
-                    }
-                } else if let Some(host) = value.split(':').next() {
-                    if !host.is_empty() {
-                        return Some(host.to_string());
-                    }
-                }
-            }
+fn x_forwarded_for_client_ip(raw: &str) -> Option<String> {
+    raw.split(',')
+        .find_map(|part| normalize_client_ip_candidate(part))
+}
+
+/// Prefer Cloudflare / reverse-proxy headers before X-Real-IP (often 127.0.0.1 behind Axum/nginx).
+fn client_ip_from_header_values(
+    cf_connecting_ip: Option<&str>,
+    true_client_ip: Option<&str>,
+    x_forwarded_for: Option<&str>,
+    forwarded: Option<&str>,
+    x_real_ip: Option<&str>,
+) -> Option<String> {
+    if let Some(raw) = cf_connecting_ip {
+        if let Some(ip) = normalize_client_ip_candidate(raw) {
+            return Some(ip);
+        }
+    }
+
+    if let Some(raw) = true_client_ip {
+        if let Some(ip) = normalize_client_ip_candidate(raw) {
+            return Some(ip);
+        }
+    }
+
+    if let Some(raw) = x_forwarded_for {
+        if let Some(ip) = x_forwarded_for_client_ip(raw) {
+            return Some(ip);
+        }
+    }
+
+    if let Some(raw) = forwarded {
+        if let Some(ip) = forwarded_header_ip(raw) {
+            return Some(ip);
+        }
+    }
+
+    if let Some(raw) = x_real_ip {
+        if let Some(ip) = normalize_client_ip_candidate(raw) {
+            return Some(ip);
         }
     }
 
     None
 }
 
+fn ip_from_http_headers(headers: &HeaderMap) -> Option<String> {
+    client_ip_from_header_values(
+        headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok()),
+        headers.get("true-client-ip").and_then(|v| v.to_str().ok()),
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok()),
+        headers.get("forwarded").and_then(|v| v.to_str().ok()),
+        headers.get("x-real-ip").and_then(|v| v.to_str().ok()),
+    )
+}
+
 fn ip_from_actix_headers(headers: &actix_web::http::header::HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let ip = value.trim();
-        if !ip.is_empty() {
-            return Some(ip.to_string());
-        }
-    }
-
-    if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = value.split(',').next() {
-            let ip = first.trim();
-            if !ip.is_empty() {
-                return Some(ip.to_string());
-            }
-        }
-    }
-
-    if let Some(forwarded) = headers.get("forwarded").and_then(|v| v.to_str().ok()) {
-        for part in forwarded.split(';') {
-            let part = part.trim();
-            if let Some(value) = part.strip_prefix("for=") {
-                let value = value.trim().trim_matches('"');
-                if value.starts_with('[') {
-                    if let Some(end) = value.find(']') {
-                        return Some(value[1..end].to_string());
-                    }
-                } else if let Some(host) = value.split(':').next() {
-                    if !host.is_empty() {
-                        return Some(host.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    None
+    client_ip_from_header_values(
+        headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok()),
+        headers.get("true-client-ip").and_then(|v| v.to_str().ok()),
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok()),
+        headers.get("forwarded").and_then(|v| v.to_str().ok()),
+        headers.get("x-real-ip").and_then(|v| v.to_str().ok()),
+    )
 }
 
 /// Resolve the client IP from proxy headers or the direct connection.
@@ -126,4 +157,33 @@ pub fn client_ip_from_service_request(req: &ServiceRequest) -> String {
         .and_then(|addr| addr.parse::<SocketAddr>().ok())
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_cloudflare_connecting_ip_over_local_real_ip() {
+        let ip = client_ip_from_header_values(
+            Some("91.232.90.164"),
+            None,
+            Some("203.0.113.10"),
+            None,
+            Some("127.0.0.1"),
+        );
+        assert_eq!(ip.as_deref(), Some("91.232.90.164"));
+    }
+
+    #[test]
+    fn parses_x_forwarded_for_first_hop() {
+        let ip = client_ip_from_header_values(
+            None,
+            None,
+            Some("91.232.90.164, 172.68.0.1"),
+            None,
+            Some("127.0.0.1"),
+        );
+        assert_eq!(ip.as_deref(), Some("91.232.90.164"));
+    }
 }

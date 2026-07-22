@@ -634,6 +634,8 @@ pub async fn run_server() -> std::io::Result<()> {
                     | "upgrade"
                     | "x-real-ip"
                     | "x-forwarded-for"
+                    | "cf-connecting-ip"
+                    | "true-client-ip"
             )
         }
 
