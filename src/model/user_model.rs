@@ -54,7 +54,7 @@ pub fn normalize_language(lang: &str) -> String {
     }
 }
 
-fn deserialize_bool_default_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
+pub fn deserialize_bool_default_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -235,6 +235,13 @@ pub struct User {
 
     #[serde(rename = "updatedAt")]
     pub updated_at: DateTime,
+
+    #[serde(
+        rename = "e2eEnabled",
+        default,
+        deserialize_with = "deserialize_bool_default_false"
+    )]
+    pub e2e_enabled: bool,
 }
 
 pub struct CreateUserInput {
@@ -380,6 +387,7 @@ impl User {
             backup_codes: None,
             created_at: now,
             updated_at: now,
+            e2e_enabled: false,
         };
 
         let result = Self::collection(db).insert_one(&user).await?;

@@ -1,3 +1,4 @@
+pub mod e2e_controller;
 pub mod admin_controller;
 pub mod announcement_controller;
 pub mod api_info_controller;

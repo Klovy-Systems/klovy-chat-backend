@@ -3,8 +3,8 @@ use klovy_chat_server::utils::app_env::is_production;
 use klovy_chat_server::model::{
     announcement_model::Announcement, audit_log_model::AuditLog, channel_model::Channel,
     channel_read_state_model::ChannelReadState, channel_report_model::ChannelReport,
-    friend_request_model::FriendRequest, invite_model::Invite, messages_model::Message,
-    oauth_token_model::OauthToken, pending_upload_model::PendingUpload,
+    e2e_keys_model::E2eKeyBundle, friend_request_model::FriendRequest, invite_model::Invite,
+    messages_model::Message, oauth_token_model::OauthToken, pending_upload_model::PendingUpload,
     refresh_token_model::RefreshToken, user_model::User, user_storage_usage_model::UserStorageUsage,
     warning_model::Warning,
 };
@@ -149,11 +149,12 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn ensure_indexes(db: &mongodb::Database) {
-    let tasks: [(&str, mongodb::error::Result<()>); 15] = [
+    let tasks: [(&str, mongodb::error::Result<()>); 16] = [
         ("users", User::create_indexes(db).await),
         ("signup_quotas", klovy_chat_server::utils::registration::create_indexes(db).await),
         ("channels", Channel::create_indexes(db).await),
         ("messages", Message::create_indexes(db).await),
+        ("e2e_keys", E2eKeyBundle::create_indexes(db).await),
         ("friend_requests", FriendRequest::create_indexes(db).await),
         ("invites", Invite::create_indexes(db).await),
         ("channel_read_states", ChannelReadState::create_indexes(db).await),

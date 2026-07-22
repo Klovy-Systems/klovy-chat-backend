@@ -12,6 +12,7 @@ pub mod auth;
 pub mod channel;
 pub mod config_validate;
 pub mod crypto;
+pub mod e2e;
 pub mod db;
 pub mod friends;
 pub mod image_reencode;

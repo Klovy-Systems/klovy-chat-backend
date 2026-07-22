@@ -8,7 +8,7 @@ use actix_web_lab::middleware::from_fn;
 use std::env;
 
 use crate::routes::{
-    admin_routes, auth_routes, channel_routes, contact_routes, emoji_routes,
+    admin_routes, auth_routes, channel_routes, contact_routes, e2e_routes, emoji_routes,
     friend_routes, gif_routes, integration_routes, invite_routes, message_routes, status_routes,
     sticker_routes, user_routes, voice_routes, whitelist_routes,
 };
@@ -293,6 +293,11 @@ pub fn create_app(
                 .wrap(from_fn(send_limiter))
                 .wrap(from_fn(whitelist_check))
                 .configure(message_routes::configure),
+        )
+        .service(
+            web::scope("/api/e2e")
+                .wrap(from_fn(whitelist_check))
+                .configure(e2e_routes::configure),
         )
         .service(
             web::scope("/api/friends")

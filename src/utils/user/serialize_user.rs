@@ -92,6 +92,7 @@ pub fn serialize_user_for_viewer(
                 "deletionScheduledAt".to_string(),
                 json!(user.deletion_scheduled_at.as_ref().and_then(iso)),
             );
+            obj.insert("e2eEnabled".to_string(), json!(user.e2e_enabled));
             if let Some(listening) = listening_for_viewer(user, true) {
                 obj.insert("listeningActivity".to_string(), listening);
             }

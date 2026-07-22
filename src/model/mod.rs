@@ -1,3 +1,4 @@
+pub mod e2e_keys_model;
 pub mod announcement_model;
 pub mod audit_log_model;
 pub mod badge_model;

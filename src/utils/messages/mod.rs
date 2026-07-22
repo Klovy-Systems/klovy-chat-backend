@@ -124,6 +124,8 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
         "pinnedBy": pinned_by,
         "createdAt": iso(&msg.created_at),
         "updatedAt": iso(&msg.updated_at),
+        "e2eEncrypted": msg.e2e_encrypted,
+        "e2eVersion": msg.e2e_version,
     })
 }
 
@@ -214,6 +216,8 @@ fn serialize_message_cached(
         "pinnedBy": pinned_by,
         "createdAt": iso(&msg.created_at),
         "updatedAt": iso(&msg.updated_at),
+        "e2eEncrypted": msg.e2e_encrypted,
+        "e2eVersion": msg.e2e_version,
     })
 }
 

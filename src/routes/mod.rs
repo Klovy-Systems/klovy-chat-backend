@@ -1,3 +1,4 @@
+pub mod e2e_routes;
 pub mod admin_routes;
 pub mod auth_routes;
 pub mod channel_routes;

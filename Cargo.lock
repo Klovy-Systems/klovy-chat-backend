@@ -2855,6 +2855,7 @@ dependencies = [
  "aws-sdk-s3",
  "axum",
  "base32",
+ "base64",
  "chrono",
  "dotenvy",
  "env_logger",

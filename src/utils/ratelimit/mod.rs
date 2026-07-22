@@ -197,6 +197,7 @@ static CHANNEL_REPORT: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_
 static TWO_FACTOR_MUTATION: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
 static INVITE_PREVIEW: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(15 * 60)));
 static WS_HANDSHAKE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
+static E2E_KEY_FETCH: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(15 * 60)));
 static CHANGE_PASSWORD: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static CHANGE_USERNAME: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static FRIEND_ACTION: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(5 * 60)));
@@ -532,6 +533,22 @@ pub async fn change_username_limiter(
         "change-username",
         "Too many username change attempts. Try again in 15 minutes.",
         15 * 60 * 1000,
+        req,
+        next,
+    )
+    .await
+}
+
+pub async fn e2e_key_fetch_limiter(
+    req: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
+    limit_all(
+        &E2E_KEY_FETCH,
+        "e2e-key-fetch",
+        "Too many key bundle requests. Try again later.",
+        15 * 60 * 1000,
+        None,
         req,
         next,
     )

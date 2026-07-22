@@ -680,6 +680,7 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
             "channel": channel_oid,
             "deleted": { "$ne": true },
             "messageType": "TEXT",
+            "e2eEncrypted": { "$ne": true },
             "content": { "$regex": &pattern, "$options": "i" },
         };
         let messages: Vec<Message> = match Message::collection(&db)
@@ -710,6 +711,7 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
                 ]},
                 { "deleted": { "$ne": true } },
                 { "messageType": "TEXT" },
+                { "e2eEncrypted": { "$ne": true } },
                 { "content": { "$regex": &pattern, "$options": "i" } },
             ]
         };
