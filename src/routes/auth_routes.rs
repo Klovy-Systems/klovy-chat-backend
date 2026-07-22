@@ -5,9 +5,10 @@ use actix_web_lab::middleware::from_fn;
 use crate::controllers::auth_controller::{
     acknowledge_my_warnings, add_profile_banner, add_profile_image, change_password,
     change_username, disable_account, disable_two_factor, enable_two_factor, get_my_warnings, get_user_info, list_sessions, login,
-    logout, refresh_session, remove_profile_banner, remove_profile_image, request_account_deletion, cancel_account_deletion, revoke_other_sessions, revoke_session, setup_two_factor, signup,
+    logout, refresh_session, registration_status, issue_ws_crypto_key, remove_profile_banner, remove_profile_image, request_account_deletion, cancel_account_deletion, revoke_other_sessions, revoke_session, setup_two_factor, signup,
     update_availability_status, update_featured_badges, update_language, update_profile, verify_two_factor_login,
 };
+use crate::middlewares::registration_guard::registration_guard;
 use crate::controllers::announcement_controller::{dismiss_announcements, get_my_announcements};
 use crate::middlewares::auth_fallback_guard::{auth_fallback_guard_login, auth_fallback_guard_signup};
 use crate::middlewares::auth_middleware::{
@@ -99,7 +100,20 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     );
 
     cfg.service(
+        web::resource("/registration-status")
+            .route(web::get().to(registration_status)),
+    );
+
+    cfg.service(
+        web::resource("/ws-crypto")
+            .wrap(from_fn(require_active_account))
+            .wrap(from_fn(verify_token))
+            .route(web::post().to(issue_ws_crypto_key)),
+    );
+
+    cfg.service(
         web::resource("/signup")
+            .wrap(from_fn(registration_guard))
             .wrap(from_fn(signup_limiter))
             .wrap(from_fn(validate_password))
             .wrap(from_fn(verify_turnstile_token))
@@ -109,6 +123,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     );
     cfg.service(
         web::resource("/register")
+            .wrap(from_fn(registration_guard))
             .wrap(from_fn(signup_limiter))
             .wrap(from_fn(validate_password))
             .wrap(from_fn(verify_turnstile_token))

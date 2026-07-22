@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::time::Duration;
 
-use crate::utils::app_env::is_development;
+use crate::utils::app_env::{is_development, is_production};
 
 const SITEVERIFY_URL: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
@@ -31,6 +31,10 @@ struct TurnstileResponse {
     success: Option<bool>,
     #[serde(rename = "error-codes", default)]
     error_codes: Vec<String>,
+}
+
+fn is_signup_path(path: &str) -> bool {
+    path.ends_with("/signup") || path.ends_with("/register")
 }
 
 #[derive(Deserialize)]
@@ -99,11 +103,25 @@ pub async fn verify_turnstile_token(
                 // Could not parse Cloudflare's response — fall back to the guard
                 // instead of hard-failing legitimate users.
                 log::warn!("Turnstile response parse error: {e}");
+                if is_production() && is_signup_path(http_req.path()) {
+                    let res = HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                        "error": "Captcha verification is temporarily unavailable. Try again later.",
+                        "code": "TURNSTILE_UNAVAILABLE"
+                    }));
+                    return Ok(ServiceResponse::new(http_req, res));
+                }
                 TurnstileOutcome::Bypassed
             }
         },
         Err(e) => {
             log::warn!("Turnstile siteverify request error: {e}");
+            if is_production() && is_signup_path(http_req.path()) {
+                let res = HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                    "error": "Captcha verification is temporarily unavailable. Try again later.",
+                    "code": "TURNSTILE_UNAVAILABLE"
+                }));
+                return Ok(ServiceResponse::new(http_req, res));
+            }
             TurnstileOutcome::Bypassed
         }
     };

@@ -149,8 +149,9 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn ensure_indexes(db: &mongodb::Database) {
-    let tasks: [(&str, mongodb::error::Result<()>); 14] = [
+    let tasks: [(&str, mongodb::error::Result<()>); 15] = [
         ("users", User::create_indexes(db).await),
+        ("signup_quotas", klovy_chat_server::utils::registration::create_indexes(db).await),
         ("channels", Channel::create_indexes(db).await),
         ("messages", Message::create_indexes(db).await),
         ("friend_requests", FriendRequest::create_indexes(db).await),

@@ -180,7 +180,12 @@ static SEND: Lazy<Store> = Lazy::new(|| Store::new(900, Duration::from_secs(60))
 static AUTH: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
 static LOGIN: Lazy<Store> = Lazy::new(|| Store::new(8, Duration::from_secs(15 * 60)));
 static TWO_FACTOR_LOGIN: Lazy<Store> = Lazy::new(|| Store::new(8, Duration::from_secs(15 * 60)));
-static SIGNUP: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(60 * 60)));
+static SIGNUP: Lazy<Store> = Lazy::new(|| {
+    Store::new(
+        crate::utils::registration::signup_max_per_ip_hour(),
+        Duration::from_secs(60 * 60),
+    )
+});
 static ADMIN_READ: Lazy<Store> = Lazy::new(|| Store::new(200, Duration::from_secs(5 * 60)));
 static ADMIN_WRITE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(5 * 60)));
 static DISCOVERY: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));

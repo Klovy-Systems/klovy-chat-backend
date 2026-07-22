@@ -19,6 +19,7 @@ pub mod link_preview;
 pub mod listening;
 pub mod messages;
 pub mod ratelimit;
+pub mod registration;
 pub mod security;
 pub mod spotify;
 pub mod unread;

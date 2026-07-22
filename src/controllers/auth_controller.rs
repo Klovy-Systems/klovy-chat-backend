@@ -46,6 +46,7 @@ use crate::utils::validators::pwned_password::{check_password_breach, PasswordBr
 use crate::utils::security::csrf::{build_csrf_cookie, clear_csrf_cookie, csrf_token_for_response, generate_csrf_token};
 use crate::utils::security::security_monitor::{SecurityEventType, SecurityMonitor};
 use crate::utils::whitelist::is_whitelist_enabled;
+use crate::utils::registration::{is_registration_open, try_consume_global_signup_slot};
 
 use crate::utils::app_env::is_production;
 use crate::utils::admin::DELETION_GRACE_DAYS;
@@ -318,11 +319,45 @@ fn account_status_response(user: &User) -> Option<HttpResponse> {
     None
 }
 
+pub async fn registration_status() -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "open": is_registration_open(),
+        "message": if is_registration_open() {
+            "Rejestracja jest otwarta."
+        } else {
+            "Rejestracja nowych kont jest obecnie wyłączona."
+        }
+    }))
+}
+
+pub async fn issue_ws_crypto_key(req: HttpRequest) -> HttpResponse {
+    let Some(user_id) = req_user_id(&req) else {
+        return HttpResponse::Unauthorized().json(json!({
+            "message": "User not authenticated."
+        }));
+    };
+
+    let (token, key) = crate::ws::crypto_store::issue_ws_crypto_key(&user_id);
+    HttpResponse::Ok().json(json!({
+        "token": token,
+        "key": key,
+        "expiresIn": 30
+    }))
+}
+
 pub async fn signup(
     body: web::Json<CredentialsBody>,
     monitor: web::Data<SecurityMonitor>,
 ) -> HttpResponse {
     let db = get_db();
+
+    if !is_registration_open() {
+        return HttpResponse::Forbidden().json(json!({
+            "message": "Rejestracja nowych kont jest obecnie wyłączona.",
+            "code": "REGISTRATION_DISABLED"
+        }));
+    }
+
     let raw_username = body.username.as_deref().unwrap_or("").trim();
     let raw_email = body.email.as_deref().unwrap_or("").trim();
 
@@ -384,6 +419,20 @@ pub async fn signup(
             }));
         }
         PasswordBreachCheck::Safe => {}
+    }
+
+    match try_consume_global_signup_slot(&db).await {
+        Ok(()) => {}
+        Err(err) => {
+            monitor.log_event(
+                SecurityEventType::AuthFailure,
+                json!({ "reason": err.code(), "action": "signup" }),
+            );
+            return HttpResponse::TooManyRequests().json(json!({
+                "message": err.user_message(),
+                "code": err.code()
+            }));
+        }
     }
 
     match User::create(

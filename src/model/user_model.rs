@@ -308,6 +308,13 @@ impl User {
                     .build(),
             )
             .await?;
+        Self::collection(db)
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "createdAt": -1 })
+                    .build(),
+            )
+            .await?;
 
         Ok(())
     }

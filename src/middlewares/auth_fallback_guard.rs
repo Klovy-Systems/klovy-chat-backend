@@ -25,7 +25,12 @@ use crate::utils::ratelimit::Store;
 use crate::utils::security::bot_detection::is_known_bot_user_agent;
 use crate::utils::security::client_user_agent::CLIENT_USER_AGENT_HEADER;
 
-static FALLBACK_SIGNUP: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(3600)));
+static FALLBACK_SIGNUP: Lazy<Store> = Lazy::new(|| {
+    Store::new(
+        crate::utils::registration::signup_max_per_ip_hour().min(2),
+        Duration::from_secs(3600),
+    )
+});
 static FALLBACK_LOGIN: Lazy<Store> = Lazy::new(|| Store::new(4, Duration::from_secs(15 * 60)));
 static LAST_AUTH_ATTEMPT: Lazy<Mutex<HashMap<String, Instant>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));

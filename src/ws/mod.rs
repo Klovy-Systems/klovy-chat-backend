@@ -1,3 +1,5 @@
+pub mod crypto_store;
+pub mod frame_crypto;
 pub mod handlers;
 pub mod registry;
 pub mod state;
@@ -22,8 +24,11 @@ use tokio::sync::{mpsc, watch};
 
 use crate::middlewares::ip_blocker::IPBlockerArc;
 use crate::utils::client_ip::client_ip_from_headers;
-use crate::utils::security::client_id::query_client_valid;
+use crate::utils::security::client_id::{query_client_valid, query_param, WS_CRYPTO_QUERY_PARAM};
 use crate::utils::security::origin::is_origin_header_allowed;
+use crate::utils::security::transport::is_secure_client_connection;
+use crate::ws::crypto_store::{consume_ws_crypto_key, ws_frame_encryption_required};
+use crate::ws::frame_crypto::{decrypt_frame, encrypt_frame};
 use crate::ws::handlers::{dispatch_message, on_user_connected, on_user_disconnected};
 use crate::ws::registry::ConnectionRegistry;
 use crate::ws::state::{is_valid_object_id, SocketState};
@@ -73,6 +78,11 @@ pub async fn ws_handler(
     if !is_origin_header_allowed(&headers) {
         log::warn!("WebSocket rejected — invalid origin");
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
+
+    if !is_secure_client_connection(&headers) {
+        log::warn!("WebSocket rejected — insecure transport (require HTTPS/WSS in production)");
+        return (StatusCode::FORBIDDEN, "Secure connection required").into_response();
     }
 
     let client_ip = client_ip_from_headers(&headers, Some(peer));
@@ -157,6 +167,34 @@ pub async fn ws_handler(
         return (StatusCode::TOO_MANY_REQUESTS, "Too many connections").into_response();
     }
 
+    let encryption_required = ws_frame_encryption_required();
+    let crypto_token = query_param(raw_query.as_deref(), WS_CRYPTO_QUERY_PARAM);
+    let frame_key = if encryption_required {
+        let Some(token) = crypto_token.as_deref() else {
+            log::warn!("WebSocket rejected — missing frame encryption token for user {}", user_id);
+            app_state
+                .socket_state
+                .unregister_ip_connection(&client_ip)
+                .await;
+            return (StatusCode::FORBIDDEN, "Encryption required").into_response();
+        };
+        match consume_ws_crypto_key(token, &user_id) {
+            Some(key) => Some(key),
+            None => {
+                log::warn!("WebSocket rejected — invalid frame encryption token for user {}", user_id);
+                app_state
+                    .socket_state
+                    .unregister_ip_connection(&client_ip)
+                    .await;
+                return (StatusCode::FORBIDDEN, "Invalid encryption token").into_response();
+            }
+        }
+    } else {
+        crypto_token
+            .as_deref()
+            .and_then(|token| consume_ws_crypto_key(token, &user_id))
+    };
+
     ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
@@ -165,9 +203,44 @@ pub async fn ws_handler(
             refresh_token,
             session_family_id,
             client_ip,
+            frame_key,
             app_state,
         )
     })
+}
+
+async fn process_incoming_text(
+    text: &str,
+    jwt_token: &str,
+    refresh_token: Option<&str>,
+    connected: &str,
+    state: &SocketState,
+    tx: &mpsc::Sender<String>,
+    last_pong_at: &mut std::time::Instant,
+    user_id: &str,
+) -> bool {
+    if user_from_jwt_with_refresh(jwt_token, refresh_token)
+        .await
+        .is_none()
+    {
+        log::info!("WebSocket auth failed mid-session for user {}", user_id);
+        return false;
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<IncomingFrame>(text) {
+        if parsed.msg_type == "pong" {
+            *last_pong_at = std::time::Instant::now();
+            return true;
+        }
+        if parsed.msg_type == "ping" {
+            *last_pong_at = std::time::Instant::now();
+            let _ = tx.try_send(json!({"type":"pong","payload":{}}).to_string());
+            return true;
+        }
+        dispatch_message(connected, &parsed.msg_type, parsed.payload, state).await;
+    }
+
+    true
 }
 
 async fn handle_socket(
@@ -177,6 +250,7 @@ async fn handle_socket(
     refresh_token: Option<String>,
     session_family_id: Option<String>,
     client_ip: String,
+    frame_key: Option<[u8; 32]>,
     app_state: WsAppState,
 ) {
     if !app_state.socket_state.register_connection(&user_id).await {
@@ -208,6 +282,8 @@ async fn handle_socket(
     // First tick completes immediately; skip so the first ping is after PING_INTERVAL.
     ping_interval.tick().await;
     let mut last_pong_at = std::time::Instant::now();
+
+    let encryption_required = frame_key.is_some();
 
     loop {
         tokio::select! {
@@ -262,7 +338,18 @@ async fn handle_socket(
             msg = rx.recv() => {
                 match msg {
                     Some(text) => {
-                        if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                        let outbound = if let Some(key) = frame_key {
+                            match encrypt_frame(&key, &text) {
+                                Ok(bytes) => Message::Binary(bytes.into()),
+                                Err(e) => {
+                                    log::warn!("WebSocket encrypt failed for user {}: {e}", user_id);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            Message::Text(text.into())
+                        };
+                        if ws_sender.send(outbound).await.is_err() {
                             break;
                         }
                     }
@@ -271,33 +358,59 @@ async fn handle_socket(
             }
             result = ws_receiver.next() => {
                 match result {
-                    Some(Ok(Message::Text(text))) => {
-                        if text.len() > MAX_PAYLOAD {
+                    Some(Ok(Message::Binary(data))) => {
+                        if data.len() > MAX_PAYLOAD {
                             continue;
                         }
-                        if user_from_jwt_with_refresh(
+                        let text = if let Some(key) = frame_key {
+                            match decrypt_frame(&key, &data) {
+                                Ok(value) => value,
+                                Err(e) => {
+                                    log::warn!("WebSocket decrypt failed for user {}: {e}", user_id);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            continue;
+                        };
+                        if !process_incoming_text(
+                            &text,
                             &jwt_token,
                             refresh_token.as_deref(),
+                            &connected,
+                            &state,
+                            &tx,
+                            &mut last_pong_at,
+                            &user_id,
                         )
                         .await
-                        .is_none()
                         {
-                            log::info!("WebSocket auth failed mid-session for user {}", user_id);
                             let _ = ws_sender.send(Message::Close(None)).await;
                             break;
                         }
-                        if let Ok(parsed) = serde_json::from_str::<IncomingFrame>(&text) {
-                            // Legacy JSON keepalive — browsers auto-answer protocol pings now.
-                            if parsed.msg_type == "pong" {
-                                last_pong_at = std::time::Instant::now();
-                                continue;
-                            }
-                            if parsed.msg_type == "ping" {
-                                last_pong_at = std::time::Instant::now();
-                                let _ = tx.try_send(json!({"type":"pong","payload":{}}).to_string());
-                                continue;
-                            }
-                            dispatch_message(&connected, &parsed.msg_type, parsed.payload, &state).await;
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        if encryption_required {
+                            log::warn!("WebSocket rejected plaintext frame for user {}", user_id);
+                            continue;
+                        }
+                        if text.len() > MAX_PAYLOAD {
+                            continue;
+                        }
+                        if !process_incoming_text(
+                            &text,
+                            &jwt_token,
+                            refresh_token.as_deref(),
+                            &connected,
+                            &state,
+                            &tx,
+                            &mut last_pong_at,
+                            &user_id,
+                        )
+                        .await
+                        {
+                            let _ = ws_sender.send(Message::Close(None)).await;
+                            break;
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -310,7 +423,6 @@ async fn handle_socket(
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(_)) => break,
-                    Some(Ok(_)) => {}
                 }
             }
         }

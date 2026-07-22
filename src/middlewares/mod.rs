@@ -6,6 +6,7 @@ pub mod csrf;
 pub mod internal_proxy_guard;
 pub mod ip_blocker;
 pub mod origin_guard;
+pub mod registration_guard;
 pub mod turnstile_middleware;
 pub mod validation_middleware;
 pub mod whitelist;

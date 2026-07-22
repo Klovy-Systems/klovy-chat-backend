@@ -44,3 +44,17 @@ pub fn query_client_valid(raw_query: Option<&str>) -> bool {
         )
     })
 }
+
+/// Nazwa parametru jednorazowego tokenu klucza szyfrującego ramki WebSocket.
+pub const WS_CRYPTO_QUERY_PARAM: &str = "wsk";
+
+pub fn query_param(raw_query: Option<&str>, name: &str) -> Option<String> {
+    let query = raw_query?;
+    query.split('&').find_map(|pair| {
+        let mut it = pair.splitn(2, '=');
+        match (it.next(), it.next()) {
+            (Some(key), Some(value)) if key == name => Some(value.to_string()),
+            _ => None,
+        }
+    })
+}

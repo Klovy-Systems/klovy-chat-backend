@@ -4,6 +4,10 @@ use crate::utils::app_env::{is_production, node_env};
 use crate::utils::auth::admin_session::admin_user_ids_configured;
 use crate::utils::auth::jwt_auth::jwt_secret;
 use crate::utils::whitelist::is_whitelist_enabled;
+use crate::utils::registration::{
+    is_registration_disabled, signup_max_global_per_day, signup_max_global_per_hour,
+    signup_max_per_ip_hour,
+};
 
 fn origin_looks_like_production(origin: &str) -> bool {
     let lower = origin.to_ascii_lowercase();
@@ -150,6 +154,19 @@ pub fn validate_startup_config() {
         if is_whitelist_enabled() {
             log::info!("Whitelist mode is enabled — new accounts require admin approval");
         }
+
+        if is_registration_disabled() {
+            log::warn!("Registration is DISABLED — new signups are rejected");
+        } else {
+            log::info!(
+                "Signup limits: {} per IP/hour, {} global/hour, {} global/day",
+                signup_max_per_ip_hour(),
+                signup_max_global_per_hour(),
+                signup_max_global_per_day()
+            );
+        }
+
+        log::info!("WebSocket frame encryption is required in production");
 
         log::info!(
             "Production security configuration validated (NODE_ENV={})",
