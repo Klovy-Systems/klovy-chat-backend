@@ -196,6 +196,14 @@ pub fn emit_to_user(user_id: &str, event: &str, data: impl Serialize + Send + Sy
     });
 }
 
+pub async fn user_is_connected(user_id: &str) -> bool {
+    let Some(reg) = registry() else {
+        return false;
+    };
+    let map = reg.connections.lock().await;
+    map.get(user_id).is_some_and(|entries| !entries.is_empty())
+}
+
 pub fn emit_to_users(user_ids: &[String], event: &str, data: Value) {
     for uid in user_ids {
         emit_to_user(uid, event, data.clone());

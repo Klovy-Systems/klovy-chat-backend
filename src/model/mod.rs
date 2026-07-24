@@ -11,6 +11,7 @@ pub mod invite_model;
 pub mod messages_model;
 pub mod oauth_token_model;
 pub mod pending_upload_model;
+pub mod push_token_model;
 pub mod refresh_token_model;
 pub mod user_model;
 pub mod user_storage_usage_model;

@@ -19,6 +19,7 @@ pub mod image_reencode;
 pub mod link_preview;
 pub mod listening;
 pub mod messages;
+pub mod push;
 pub mod ratelimit;
 pub mod registration;
 pub mod security;
