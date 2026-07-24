@@ -32,6 +32,15 @@ pub fn allowed_origins() -> Vec<String> {
         }
     }
 
+    if let Ok(mobile_origins) = env::var("MOBILE_ORIGIN") {
+        for origin in mobile_origins.split(',') {
+            push_origin(&mut origins, origin);
+        }
+    }
+
+    // Official React Native app (EXPO_PUBLIC_ORIGIN=klovychat://).
+    push_origin(&mut origins, "klovychat://");
+
     origins
 }
 
@@ -135,6 +144,12 @@ pub fn is_origin_header_allowed(headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mobile_app_origin_is_allowed() {
+        let allowed = allowed_origins();
+        assert!(origin_allowed("klovychat://", &allowed));
+    }
 
     #[test]
     fn strict_requires_allowed_origin_in_production() {
