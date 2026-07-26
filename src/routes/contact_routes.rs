@@ -2,8 +2,8 @@ use actix_web::web;
 use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::contacts_controller::{
-    delete_conversation, get_blocked_contacts, get_contacts_for_list, search_contacts,
-    toggle_contact_block, toggle_contact_mute,
+    delete_conversation, get_blocked_contacts, get_contact_profile, get_contacts_for_list,
+    search_contacts, toggle_contact_block, toggle_contact_mute,
 };
 use crate::middlewares::auth_middleware::{require_active_account, verify_token};
 use crate::utils::ratelimit::discovery_limiter;
@@ -45,6 +45,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .wrap(from_fn(require_active_account))
             .wrap(from_fn(verify_token))
             .route(web::get().to(get_blocked_contacts)),
+    );
+    cfg.service(
+        web::resource("/{contactId}/profile")
+            .wrap(from_fn(require_active_account))
+            .wrap(from_fn(verify_token))
+            .route(web::get().to(get_contact_profile)),
     );
     cfg.service(
         web::resource("/{contactId}/block")

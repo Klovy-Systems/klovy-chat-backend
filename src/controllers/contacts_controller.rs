@@ -83,6 +83,61 @@ pub struct SearchBody {
     pub search_term: Option<String>,
 }
 
+async fn friend_profile_json(db: &mongodb::Database, friend: &User) -> serde_json::Value {
+    let badges = populate_user_badges(db, friend, BadgeVisibility::All).await;
+    let listening_activity = effective_listening(friend).map(listening_activity_json);
+    json!({
+        "_id": friend.id.map(|o| o.to_hex()).unwrap_or_default(),
+        "username": friend.username,
+        "displayName": resolve_display_name(friend),
+        "bio": friend.bio,
+        "image": friend.image,
+        "banner": friend.banner,
+        "color": friend.color,
+        "isOnline": friend.is_online,
+        "lastSeen": friend.last_seen.as_ref().and_then(|d| d.try_to_rfc3339_string().ok()),
+        "availabilityStatus": crate::utils::user::serialize_user::availability_status_str(&friend.availability_status),
+        "listeningActivity": listening_activity,
+        "connectedAccounts": connected_accounts_json(&friend.connected_accounts),
+        "badges": badges,
+        "createdAt": friend.created_at.try_to_rfc3339_string().ok(),
+    })
+}
+
+pub async fn get_contact_profile(req: HttpRequest) -> HttpResponse {
+    let Some(user_id) = request_user_id(&req) else {
+        return HttpResponse::Unauthorized().json(json!({ "message": "Brak autoryzacji" }));
+    };
+    let contact_id = req.match_info().get("contactId").unwrap_or("");
+    let Ok(contact_oid) = ObjectId::parse_str(contact_id) else {
+        return HttpResponse::BadRequest()
+            .json(json!({ "message": "Nieprawidłowy identyfikator kontaktu" }));
+    };
+
+    let db = get_db();
+    if !are_friends(&db, &user_id, contact_id).await {
+        return HttpResponse::NotFound()
+            .json(json!({ "message": "Kontakt nie znaleziony lub brak relacji znajomości" }));
+    }
+
+    let friend = match User::find_by_id(&db, contact_oid).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Użytkownik nie znaleziony" }));
+        }
+        Err(e) => {
+            log::error!("get_contact_profile: user lookup: {e}");
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Nie udało się wczytać profilu",
+            }));
+        }
+    };
+
+    HttpResponse::Ok().json(json!({
+        "contact": friend_profile_json(&db, &friend).await,
+    }))
+}
+
 pub async fn search_contacts(req: HttpRequest, body: web::Json<SearchBody>) -> HttpResponse {
     let user_id = request_user_id(&req).unwrap_or_default();
     let Ok(uid) = ObjectId::parse_str(&user_id) else {
@@ -109,14 +164,7 @@ pub async fn search_contacts(req: HttpRequest, body: web::Json<SearchBody>) -> H
             continue;
         };
         if are_friends(&db, &user_id, &candidate_id).await {
-            results.push(json!({
-                "_id": candidate_id,
-                "username": c.username,
-                "displayName": resolve_display_name(c),
-                "bio": c.bio,
-                "image": c.image,
-                "color": c.color,
-            }));
+            results.push(friend_profile_json(&db, c).await);
         } else {
             results.push(json!({
                 "_id": candidate_id,
@@ -243,33 +291,25 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
         };
 
         let last_time_ms = last.as_ref().map(|(t, _)| t.timestamp_millis()).unwrap_or(0);
-        let listening_activity = effective_listening(friend).map(listening_activity_json);
-        let badges = populate_user_badges(&db, friend, BadgeVisibility::All).await;
+        let mut profile = friend_profile_json(&db, friend).await;
+        if let Some(obj) = profile.as_object_mut() {
+            obj.insert(
+                "lastMessageTime".to_string(),
+                json!(last.as_ref().and_then(|(t, _)| t.try_to_rfc3339_string().ok())),
+            );
+            obj.insert(
+                "lastMessage".to_string(),
+                json!(last.as_ref().map(|(_, c)| c.clone())),
+            );
+            obj.insert("unreadCount".to_string(), json!(unread));
+            obj.insert("isMuted".to_string(), json!(muted.contains(&fid_hex)));
+            obj.insert(
+                "isBlockedByMe".to_string(),
+                json!(blocked.contains(&fid_hex)),
+            );
+        }
 
-        contacts.push((
-            last_time_ms,
-            json!({
-                "_id": fid_hex,
-                "username": friend.username,
-                "displayName": resolve_display_name(friend),
-                "bio": friend.bio,
-                "image": friend.image,
-                "banner": friend.banner,
-                "color": friend.color,
-                "isOnline": friend.is_online,
-                "lastSeen": friend.last_seen.as_ref().and_then(|d| d.try_to_rfc3339_string().ok()),
-                "availabilityStatus": crate::utils::user::serialize_user::availability_status_str(&friend.availability_status),
-                "listeningActivity": listening_activity,
-                "connectedAccounts": connected_accounts_json(&friend.connected_accounts),
-                "badges": badges,
-                "createdAt": friend.created_at.try_to_rfc3339_string().ok(),
-                "lastMessageTime": last.as_ref().and_then(|(t, _)| t.try_to_rfc3339_string().ok()),
-                "lastMessage": last.as_ref().map(|(_, c)| c.clone()),
-                "unreadCount": unread,
-                "isMuted": muted.contains(&fid_hex),
-                "isBlockedByMe": blocked.contains(&fid_hex),
-            }),
-        ));
+        contacts.push((last_time_ms, profile));
     }
 
     contacts.sort_by(|a, b| b.0.cmp(&a.0));

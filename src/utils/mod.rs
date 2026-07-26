@@ -23,7 +23,7 @@ pub mod push;
 pub mod ratelimit;
 pub mod registration;
 pub mod security;
-pub mod spotify;
+pub mod integrations;
 pub mod unread;
 pub mod user;
 pub mod validators;

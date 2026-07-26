@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 
 use crate::model::friend_request_model::FriendRequest;
 use crate::model::user_model::User;
+use crate::utils::user::badges::{populate_user_badges, BadgeVisibility};
 use crate::utils::user::serialize_user::resolve_display_name;
 
 pub async fn are_friends(db: &Database, user_id1: &str, user_id2: &str) -> bool {
@@ -116,5 +117,20 @@ pub fn map_friend_user(user: &User) -> Value {
         "banner": user.banner,
         "color": user.color,
         "createdAt": user.created_at.try_to_rfc3339_string().ok(),
+    })
+}
+
+pub async fn map_friend_user_profile(db: &Database, user: &User) -> Value {
+    let badges = populate_user_badges(db, user, BadgeVisibility::All).await;
+    json!({
+        "_id": user.id.map(|o| o.to_hex()).unwrap_or_default(),
+        "username": user.username,
+        "displayName": resolve_display_name(user),
+        "bio": user.bio,
+        "image": user.image,
+        "banner": user.banner,
+        "color": user.color,
+        "createdAt": user.created_at.try_to_rfc3339_string().ok(),
+        "badges": badges,
     })
 }

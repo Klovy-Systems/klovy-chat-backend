@@ -69,7 +69,7 @@ pub fn is_origin_guard_exempt(path: &str) -> bool {
     path == "/api"
         || path == "/api/"
         || path.starts_with("/api/security")
-        || path.starts_with("/api/integrations/spotify/callback")
+        || path.starts_with("/api/integrations/") && path.ends_with("/callback")
 }
 
 pub fn requires_origin_guard(method: &Method, path: &str) -> bool {

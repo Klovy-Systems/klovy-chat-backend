@@ -8,7 +8,7 @@ use crate::middlewares::auth_middleware::request_user_id;
 use crate::model::friend_request_model::{FriendRequest, FriendRequestStatus};
 use crate::model::user_model::User;
 use crate::utils::db::get_db;
-use crate::utils::friends::{are_friends, map_friend_user};
+use crate::utils::friends::{are_friends, map_friend_user, map_friend_user_profile};
 use crate::utils::validators::normalize_username::normalize_username;
 use crate::utils::whitelist::is_whitelist_enabled;
 
@@ -143,7 +143,7 @@ pub async fn send_friend_request(
                     return HttpResponse::Ok().json(json!({
                         "message": "Wzajemne zaproszenie — jesteście teraz znajomymi.",
                         "autoAccepted": true,
-                        "friend": map_friend_user(&recipient),
+                        "friend": map_friend_user_profile(&db, &recipient).await,
                     }));
                 }
                 return HttpResponse::BadRequest().json(json!({
@@ -304,7 +304,7 @@ pub async fn accept_friend_request(req: HttpRequest) -> HttpResponse {
 
     HttpResponse::Ok().json(json!({
         "message": "Zaproszenie zaakceptowane.",
-        "friend": map_friend_user(&from_user),
+        "friend": map_friend_user_profile(&db, &from_user).await,
     }))
 }
 
@@ -402,10 +402,13 @@ pub async fn get_friends(req: HttpRequest) -> HttpResponse {
     // Fetch all friend users in a single query instead of one lookup per row.
     let user_map = fetch_users_map(&db, &ordered_ids).await;
 
-    let friends: Vec<_> = ordered_ids
-        .iter()
-        .filter_map(|id| user_map.get(id).map(map_friend_user))
-        .collect();
+    let mut friends = Vec::with_capacity(ordered_ids.len());
+    for id in &ordered_ids {
+        let Some(user) = user_map.get(id) else {
+            continue;
+        };
+        friends.push(map_friend_user_profile(&db, user).await);
+    }
 
     HttpResponse::Ok().json(json!({ "friends": friends }))
 }

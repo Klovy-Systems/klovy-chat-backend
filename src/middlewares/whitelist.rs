@@ -12,7 +12,7 @@ use crate::utils::whitelist::is_whitelist_enabled;
 /// OAuth browser redirects (Spotify) land here without session cookies —
 /// the signed `state` already identifies the user inside the handler.
 fn is_whitelist_exempt(path: &str) -> bool {
-    path.starts_with("/api/integrations/spotify/callback")
+    path.starts_with("/api/integrations/") && path.ends_with("/callback")
 }
 
 pub async fn whitelist_check(

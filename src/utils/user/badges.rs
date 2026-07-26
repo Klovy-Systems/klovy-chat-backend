@@ -64,6 +64,27 @@ fn badges_for_visibility<'a>(user: &'a User, visibility: BadgeVisibility) -> Vec
     }
 }
 
+fn user_badge_to_json(user_badge: &UserBadge, badge: &Badge) -> Value {
+    json!({
+        "_id": user_badge.id.map(|o| o.to_hex()),
+        "badgeId": {
+            "_id": badge.id.map(|o| o.to_hex()),
+            "name": badge.name,
+            "icon": badge.icon,
+            "color": badge.color,
+            "description": badge.description,
+            "createdAt": iso(&badge.created_at),
+            "updatedAt": iso(&badge.updated_at),
+        },
+        "assignedAt": iso(&user_badge.assigned_at),
+    })
+}
+
+pub async fn populate_user_badge_entry(db: &Database, user_badge: &UserBadge) -> Option<Value> {
+    let badge = Badge::find_by_id(db, user_badge.badge_id).await.ok()??;
+    Some(user_badge_to_json(user_badge, &badge))
+}
+
 pub async fn populate_user_badges(
     db: &Database,
     user: &User,
@@ -71,20 +92,8 @@ pub async fn populate_user_badges(
 ) -> Vec<Value> {
     let mut result = Vec::new();
     for user_badge in badges_for_visibility(user, visibility) {
-        if let Ok(Some(badge)) = Badge::find_by_id(db, user_badge.badge_id).await {
-            result.push(json!({
-                "_id": user_badge.id.map(|o| o.to_hex()),
-                "badgeId": {
-                    "_id": badge.id.map(|o| o.to_hex()),
-                    "name": badge.name,
-                    "icon": badge.icon,
-                    "color": badge.color,
-                    "description": badge.description,
-                    "createdAt": iso(&badge.created_at),
-                    "updatedAt": iso(&badge.updated_at),
-                },
-                "assignedAt": iso(&user_badge.assigned_at),
-            }));
+        if let Some(entry) = populate_user_badge_entry(db, user_badge).await {
+            result.push(entry);
         }
     }
     result
