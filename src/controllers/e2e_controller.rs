@@ -160,7 +160,6 @@ pub async fn put_e2e_keys(req: HttpRequest, body: web::Json<PutE2eKeysBody>) -> 
 
     match E2eKeyBundle::upsert(&db, upsert).await {
         Ok(bundle) => {
-            let _ = User::set_fields(&db, oid, doc! { "e2eEnabled": true }).await;
             HttpResponse::Ok().json(json!({
                 "success": true,
                 "fingerprint": bundle.identity_fingerprint,
@@ -322,7 +321,7 @@ pub async fn get_e2e_capabilities(req: HttpRequest, query: web::Query<BulkQuery>
         {
             continue;
         }
-        if User::find_by_id(&db, id).await.ok().flatten().is_some() {
+        if let Some(user) = User::find_by_id(&db, id).await.ok().flatten() {
             let has_keys = E2eKeyBundle::find_by_user_id(&db, id)
                 .await
                 .ok()
@@ -330,7 +329,7 @@ pub async fn get_e2e_capabilities(req: HttpRequest, query: web::Query<BulkQuery>
                 .is_some();
             users.push(json!({
                 "userId": id.to_hex(),
-                "e2eEnabled": has_keys,
+                "e2eEnabled": user.e2e_enabled,
                 "hasKeys": has_keys,
                 "fingerprint": fingerprint_by_id.get(&id_hex),
             }));
