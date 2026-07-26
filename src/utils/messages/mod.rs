@@ -1,5 +1,7 @@
 pub mod access;
+pub mod content_storage;
 pub mod mentions;
+pub mod seal_legacy_content;
 
 use futures::stream::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime};
@@ -60,6 +62,13 @@ fn reactions_to_json(msg: &Message) -> Value {
     Value::Object(map)
 }
 
+fn message_content_for_api(msg: &Message) -> String {
+    crate::utils::messages::content_storage::content_for_api(
+        &msg.content,
+        msg.e2e_encrypted,
+    )
+}
+
 async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bool) -> Value {
     let sender = populate_user(db, msg.sender).await;
 
@@ -101,7 +110,7 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
         "sender": sender,
         "recipient": recipient,
         "channel": msg.channel.map(|o| o.to_hex()),
-        "content": msg.content,
+        "content": message_content_for_api(msg),
         "messageType": serde_json::to_value(&msg.message_type).unwrap_or(Value::Null),
         "fileUrl": msg.file_url,
         "fileType": msg.file_type,
@@ -193,7 +202,7 @@ fn serialize_message_cached(
         "sender": sender,
         "recipient": recipient,
         "channel": msg.channel.map(|o| o.to_hex()),
-        "content": msg.content,
+        "content": message_content_for_api(msg),
         "messageType": serde_json::to_value(&msg.message_type).unwrap_or(Value::Null),
         "fileUrl": msg.file_url,
         "fileType": msg.file_type,
@@ -400,6 +409,8 @@ mod tests {
             pinned_by: None,
             created_at: now,
             updated_at: now,
+            e2e_encrypted: false,
+            e2e_version: None,
         }
     }
 

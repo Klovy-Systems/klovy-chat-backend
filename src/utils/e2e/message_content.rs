@@ -1,3 +1,4 @@
+use crate::utils::messages::content_storage::inbound_plaintext_for_processing;
 use crate::utils::e2e::is_valid_e2e_ciphertext;
 use crate::utils::validators::sanitize_input::sanitize_message_content;
 
@@ -25,7 +26,8 @@ pub fn prepare_inbound_content(
             skip_mentions: true,
         })
     } else {
-        let content = sanitize_message_content(raw.unwrap_or(""));
+        let sanitized = sanitize_message_content(raw.unwrap_or(""));
+        let content = inbound_plaintext_for_processing(&sanitized, false);
         Ok(PreparedMessageContent {
             content,
             e2e_encrypted: false,

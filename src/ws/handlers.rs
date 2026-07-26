@@ -256,6 +256,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         return;
     };
 
+    let msg_type = parse_message_type(payload.message_type.as_deref().unwrap_or("TEXT"));
     let e2e_encrypted = payload.e2e_encrypted.unwrap_or(false);
     let prepared = match prepare_inbound_content(
         payload.content.as_deref(),
@@ -296,7 +297,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         recipient: Some(recipient),
         channel: None,
         content: prepared.content,
-        message_type: Some(parse_message_type(payload.message_type.as_deref().unwrap_or("TEXT"))),
+        message_type: Some(msg_type),
         file_url: payload.file_url,
         file_type: payload.file_type,
         file_size: payload.file_size,
@@ -1059,11 +1060,18 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
     };
 
     let mentions_bson = mongodb::bson::to_bson(&mentions).unwrap_or(Bson::Array(vec![]));
+    let stored_content = match crate::utils::messages::content_storage::prepare_content_for_storage(
+        prepared.content.trim(),
+        prepared.e2e_encrypted,
+    ) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
     let _ = Message::collection(&db)
         .update_one(
             doc! { "_id": mid },
             doc! { "$set": {
-                "content": prepared.content.trim(),
+                "content": stored_content,
                 "mentions": mentions_bson,
                 "mentionsEveryone": mentions_everyone,
                 "edited": true,

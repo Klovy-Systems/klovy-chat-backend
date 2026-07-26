@@ -159,11 +159,14 @@ pub async fn put_e2e_keys(req: HttpRequest, body: web::Json<PutE2eKeysBody>) -> 
     };
 
     match E2eKeyBundle::upsert(&db, upsert).await {
-        Ok(bundle) => HttpResponse::Ok().json(json!({
-            "success": true,
-            "fingerprint": bundle.identity_fingerprint,
-            "oneTimePreKeysRemaining": bundle.one_time_pre_keys.len(),
-        })),
+        Ok(bundle) => {
+            let _ = User::set_fields(&db, oid, doc! { "e2eEnabled": true }).await;
+            HttpResponse::Ok().json(json!({
+                "success": true,
+                "fingerprint": bundle.identity_fingerprint,
+                "oneTimePreKeysRemaining": bundle.one_time_pre_keys.len(),
+            }))
+        }
         Err(_) => HttpResponse::InternalServerError().json(json!({ "error": "Server error" })),
     }
 }
@@ -233,14 +236,8 @@ pub async fn get_e2e_key_bundle(
     };
 
     let db = get_db();
-    let user = match User::find_by_id(&db, target_oid).await {
-        Ok(Some(u)) => u,
-        Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "User not found" })),
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Server error" })),
-    };
-
-    if !user.e2e_enabled {
-        return HttpResponse::NotFound().json(json!({ "error": "E2E not enabled for user" }));
+    if User::find_by_id(&db, target_oid).await.ok().flatten().is_none() {
+        return HttpResponse::NotFound().json(json!({ "error": "User not found" }));
     }
 
     if requester_id != target_id {
@@ -249,7 +246,7 @@ pub async fn get_e2e_key_bundle(
         }
     }
 
-    match E2eKeyBundle::consume_public_bundle(&db, target_oid, user.e2e_enabled).await {
+    match E2eKeyBundle::consume_public_bundle(&db, target_oid, true).await {
         Ok(Some(bundle)) => HttpResponse::Ok().json(bundle),
         Ok(None) => HttpResponse::NotFound().json(json!({ "error": "No key bundle" })),
         Err(_) => HttpResponse::InternalServerError().json(json!({ "error": "Server error" })),
@@ -276,18 +273,15 @@ pub async fn get_e2e_key_bulk(req: HttpRequest, query: web::Query<BulkQuery>) ->
     let mut bundles = Vec::new();
     for id in ids {
         let id_hex = id.to_hex();
-        let user = match User::find_by_id(&db, id).await {
-            Ok(Some(u)) if u.e2e_enabled => u,
-            _ => continue,
+        if User::find_by_id(&db, id).await.ok().flatten().is_none() {
+            continue;
         };
         if requester_id != id_hex
             && !crate::utils::friends::are_friends(&db, &requester_id, &id_hex).await
         {
             continue;
         }
-        if let Ok(Some(bundle)) =
-            E2eKeyBundle::consume_public_bundle(&db, id, user.e2e_enabled).await
-        {
+        if let Ok(Some(bundle)) = E2eKeyBundle::consume_public_bundle(&db, id, true).await {
             bundles.push(bundle);
         }
     }
@@ -328,7 +322,7 @@ pub async fn get_e2e_capabilities(req: HttpRequest, query: web::Query<BulkQuery>
         {
             continue;
         }
-        if let Ok(Some(user)) = User::find_by_id(&db, id).await {
+        if User::find_by_id(&db, id).await.ok().flatten().is_some() {
             let has_keys = E2eKeyBundle::find_by_user_id(&db, id)
                 .await
                 .ok()
@@ -336,7 +330,7 @@ pub async fn get_e2e_capabilities(req: HttpRequest, query: web::Query<BulkQuery>
                 .is_some();
             users.push(json!({
                 "userId": id.to_hex(),
-                "e2eEnabled": user.e2e_enabled,
+                "e2eEnabled": has_keys,
                 "hasKeys": has_keys,
                 "fingerprint": fingerprint_by_id.get(&id_hex),
             }));
@@ -362,14 +356,8 @@ pub async fn get_e2e_key_fingerprint(
     };
 
     let db = get_db();
-    let user = match User::find_by_id(&db, target_oid).await {
-        Ok(Some(u)) => u,
-        Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "User not found" })),
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Server error" })),
-    };
-
-    if !user.e2e_enabled {
-        return HttpResponse::NotFound().json(json!({ "error": "E2E not enabled for user" }));
+    if User::find_by_id(&db, target_oid).await.ok().flatten().is_none() {
+        return HttpResponse::NotFound().json(json!({ "error": "User not found" }));
     }
 
     if requester_id != target_id {

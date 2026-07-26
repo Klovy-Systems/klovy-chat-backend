@@ -25,7 +25,8 @@ use crate::utils::messages::{
     escape_regex, serialize_message, serialize_messages_batch, validate_dm_history_before_cursor,
     message_belongs_to_dm_conversation,
 };
-use crate::utils::validators::sanitize_input::sanitize_message_content;
+use crate::utils::e2e::message_content::prepare_inbound_content;
+use crate::utils::e2e::{E2E_VERSION_CHANNEL, E2E_VERSION_DM};
 use crate::utils::storage::{
     attachment_dm_key, attachment_group_key, attachment_thumb_key, storage,
 };
@@ -367,6 +368,10 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
 #[derive(Deserialize)]
 pub struct EditMessageBody {
     pub content: Option<String>,
+    #[serde(rename = "e2eEncrypted", default)]
+    pub e2e_encrypted: Option<bool>,
+    #[serde(rename = "e2eVersion")]
+    pub e2e_version: Option<u8>,
 }
 
 pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) -> HttpResponse {
@@ -406,17 +411,46 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
         return HttpResponse::Forbidden().json(json!({ "error": reason.as_str() }));
     }
 
-    let content = sanitize_message_content(body.content.as_deref().unwrap_or(""));
+    let e2e_encrypted = body.e2e_encrypted.unwrap_or(message.e2e_encrypted);
+    let default_e2e_version = if message.channel.is_some() {
+        E2E_VERSION_CHANNEL
+    } else {
+        E2E_VERSION_DM
+    };
+    let prepared = match prepare_inbound_content(
+        body.content.as_deref(),
+        e2e_encrypted,
+        body
+            .e2e_version
+            .or(message.e2e_version)
+            .or(if e2e_encrypted {
+                Some(default_e2e_version)
+            } else {
+                None
+            }),
+    ) {
+        Ok(p) => p,
+        Err(code) => {
+            return HttpResponse::BadRequest().json(json!({
+                "error": "Invalid encrypted message payload.",
+                "code": code,
+            }));
+        }
+    };
+
+    let content = prepared.content;
     if content.trim().is_empty() {
         return HttpResponse::BadRequest().json(json!({ "error": "Treść wiadomości jest wymagana" }));
     }
-    if !is_message_content_within_limit(&content) {
+    if !prepared.e2e_encrypted && !is_message_content_within_limit(&content) {
         return HttpResponse::BadRequest()
             .json(json!({ "error": "Wiadomość nie może przekraczać 2000 znaków" }));
     }
 
     // Przelicz wzmianki tak samo jak ścieżka WS, aby dane nie były nieaktualne po edycji.
-    let (mentions, mentions_everyone) = if let Some(channel_id) = message.channel {
+    let (mentions, mentions_everyone) = if prepared.skip_mentions {
+        (Vec::new(), false)
+    } else if let Some(channel_id) = message.channel {
         match Channel::find_by_id(&db, channel_id).await.ok().flatten() {
             Some(channel) => {
                 let mut ids: Vec<String> = channel.members.iter().map(|m| m.to_hex()).collect();
@@ -439,17 +473,29 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
 
     let mentions_bson =
         mongodb::bson::to_bson(&mentions).unwrap_or(mongodb::bson::Bson::Array(vec![]));
+    let stored_content = match crate::utils::messages::content_storage::prepare_content_for_storage(
+        content.trim(),
+        prepared.e2e_encrypted,
+    ) {
+        Ok(c) => c,
+        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error" })),
+    };
+    let mut set_doc = doc! {
+        "content": stored_content,
+        "mentions": mentions_bson,
+        "mentionsEveryone": mentions_everyone,
+        "e2eEncrypted": prepared.e2e_encrypted,
+        "edited": true,
+        "editedAt": DateTime::now(),
+        "updatedAt": DateTime::now(),
+    };
+    if let Some(version) = prepared.e2e_version {
+        set_doc.insert("e2eVersion", i32::from(version));
+    }
     if Message::collection(&db)
         .update_one(
             doc! { "_id": mid },
-            doc! { "$set": {
-                "content": content.trim(),
-                "mentions": mentions_bson,
-                "mentionsEveryone": mentions_everyone,
-                "edited": true,
-                "editedAt": DateTime::now(),
-                "updatedAt": DateTime::now(),
-            }},
+            doc! { "$set": set_doc },
         )
         .await
         .is_err()

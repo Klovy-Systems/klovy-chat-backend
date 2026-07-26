@@ -22,6 +22,10 @@ path = "src/bin/hash_admin_password.rs"
 name = "oauth-diag"
 path = "src/bin/oauth_diag.rs"
 
+[[bin]]
+name = "migrate-message-content-seal"
+path = "src/bin/migrate_message_content_seal.rs"
+
 [dependencies]
 actix-web = "4"
 actix-multipart = "0.7"

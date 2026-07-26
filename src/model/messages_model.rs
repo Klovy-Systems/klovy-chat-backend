@@ -136,6 +136,7 @@ pub enum MessageValidationError {
     ContentRequired,
     ContentTooLong,
     FileUrlRequired,
+    PlaintextNotAllowed,
 }
 
 impl std::fmt::Display for MessageValidationError {
@@ -144,6 +145,7 @@ impl std::fmt::Display for MessageValidationError {
             Self::ContentRequired => "Treść wiadomości jest wymagana",
             Self::ContentTooLong  => "Wiadomość nie może przekraczać 2000 znaków",
             Self::FileUrlRequired => "URL pliku jest wymagany dla wiadomości typu FILE, IMAGE, VIDEO lub AUDIO",
+            Self::PlaintextNotAllowed => "Treść wiadomości musi być zaszyfrowana",
         };
         write!(f, "{}", msg)
     }
@@ -210,7 +212,14 @@ pub fn validate_message(input: &CreateMessageInput) -> Result<(), MessageValidat
     if input.content.trim().is_empty() {
         return Err(MessageValidationError::ContentRequired);
     }
-    if !is_message_content_within_limit(&input.content) {
+    let plain = crate::utils::messages::content_storage::inbound_plaintext_for_processing(
+        input.content.trim(),
+        false,
+    );
+    if plain.trim().is_empty() {
+        return Err(MessageValidationError::ContentRequired);
+    }
+    if !is_message_content_within_limit(&plain) {
         return Err(MessageValidationError::ContentTooLong);
     }
     Ok(())
@@ -245,13 +254,20 @@ impl Message {
     ) -> Result<Message, Box<dyn std::error::Error>> {
         validate_message(&input)?;
 
+        let e2e_encrypted = input.e2e_encrypted.unwrap_or(false);
+        let stored_content = crate::utils::messages::content_storage::prepare_content_for_storage(
+            input.content.trim(),
+            e2e_encrypted,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
         let now = DateTime::now();
         let msg = Message {
             id: None,
             sender: input.sender,
             recipient: input.recipient,
             channel: input.channel,
-            content: input.content.trim().to_string(),
+            content: stored_content,
             message_type: input.message_type.unwrap_or_default(),
             file_url: input.file_url,
             file_type: input.file_type,
@@ -274,7 +290,7 @@ impl Message {
             pinned_by: None,
             created_at: now,
             updated_at: now,
-            e2e_encrypted: input.e2e_encrypted.unwrap_or(false),
+            e2e_encrypted,
             e2e_version: input.e2e_version,
         };
 
