@@ -4,6 +4,16 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      migration:
+        description: "Message content migration (after deploy)"
+        type: choice
+        options:
+          - skip
+          - dry-run
+          - apply
+        default: skip
 
 permissions:
   contents: read
@@ -29,11 +39,12 @@ jobs:
         run: cargo build --release
 
 
-      - name: Verify binary
+      - name: Verify binaries
         run: |
           ls -lh target/release/
           test -f target/release/klovy-chat-server
-          echo "Binary OK"
+          test -f target/release/migrate-message-content-seal
+          echo "Binaries OK"
 
 
       - name: Setup SSH
@@ -58,7 +69,7 @@ jobs:
             "whoami && echo SSH_OK"
 
 
-      - name: Upload binary
+      - name: Upload binaries
         run: |
           rsync \
             -avz \
@@ -66,6 +77,13 @@ jobs:
             -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }}" \
             target/release/klovy-chat-server \
             ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/klovychat.new
+
+          rsync \
+            -avz \
+            --timeout=30 \
+            -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }}" \
+            target/release/migrate-message-content-seal \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/migrate-message-content-seal.new
 
 
       - name: Deploy backend
@@ -80,16 +98,28 @@ jobs:
 
           APP_DIR="/opt/klovy/backend"
           APP="$APP_DIR/klovychat"
+          MIGRATE="$APP_DIR/migrate-message-content-seal"
           NEW="/tmp/klovychat.new"
+          MIGRATE_NEW="/tmp/migrate-message-content-seal.new"
           BACKUP="$APP_DIR/klovychat.backup.$(date +%Y%m%d_%H%M%S)"
 
 
-          echo "=== Check new binary ==="
+          echo "=== Check new binaries ==="
 
           if [ ! -f "$NEW" ]; then
-              echo "Missing uploaded binary"
+              echo "Missing uploaded klovychat binary"
               exit 1
           fi
+
+          if [ ! -f "$MIGRATE_NEW" ]; then
+              echo "Missing uploaded migration binary"
+              exit 1
+          fi
+
+
+          echo "=== Install migration binary ==="
+
+          install -m755 "$MIGRATE_NEW" "$MIGRATE"
 
 
           echo "=== Backup current binary ==="
@@ -174,5 +204,51 @@ jobs:
 
           echo "DEPLOY SUCCESS"
 
+
+          EOF
+
+
+      - name: Run message content migration (dry-run)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.migration == 'dry-run'
+        run: |
+          ssh \
+            -i ~/.ssh/id_ed25519 \
+            -p ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+
+          set -euo pipefail
+
+          APP_DIR="/opt/klovy/backend"
+          MIGRATE="$APP_DIR/migrate-message-content-seal"
+
+          echo "=== Message content migration (dry-run) ==="
+
+          cd "$APP_DIR"
+          sudo -u klovychat "$MIGRATE" --dry-run
+
+          echo "MIGRATION DRY-RUN SUCCESS"
+
+          EOF
+
+
+      - name: Run message content migration (apply)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.migration == 'apply'
+        run: |
+          ssh \
+            -i ~/.ssh/id_ed25519 \
+            -p ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+
+          set -euo pipefail
+
+          APP_DIR="/opt/klovy/backend"
+          MIGRATE="$APP_DIR/migrate-message-content-seal"
+
+          echo "=== Message content migration (apply) ==="
+
+          cd "$APP_DIR"
+          sudo -u klovychat "$MIGRATE" --apply
+
+          echo "MIGRATION APPLY SUCCESS"
 
           EOF
