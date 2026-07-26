@@ -38,23 +38,6 @@ impl Default for MigrateContentSealOptions {
     }
 }
 
-fn is_likely_plain_chat_text(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let total = trimmed.chars().count();
-    let readable = trimmed
-        .chars()
-        .filter(|c| {
-            c.is_alphanumeric()
-                || c.is_whitespace()
-                || ".,!?…@#:;/-_'\"()[]{}+=*&%$<>".contains(*c)
-        })
-        .count();
-    readable * 10 >= total * 7
-}
-
 /// Whether a non-E2E message body should be sealed in MongoDB.
 pub fn message_content_needs_seal_migration(stored: &str, e2e_encrypted: bool) -> bool {
     if e2e_encrypted || stored.trim().is_empty() {
@@ -64,10 +47,14 @@ pub fn message_content_needs_seal_migration(stored: &str, e2e_encrypted: bool) -
         return false;
     }
     if is_client_opaque(stored) {
-        let inner = unwrap_client_opaque(stored);
-        if is_likely_plain_chat_text(&inner) {
-            return true;
+        if is_valid_e2e_ciphertext(stored) && !rejects_plaintext_storage(stored) {
+            let inner = unwrap_client_opaque(stored);
+            // Signal blobs can decode as UTF-8 control bytes — do not re-seal those.
+            if inner.chars().any(|c| c.is_control() && !c.is_whitespace()) {
+                return false;
+            }
         }
+        return true;
     } else if is_valid_e2e_ciphertext(stored) && !rejects_plaintext_storage(stored) {
         return false;
     }
@@ -207,9 +194,19 @@ pub async fn migrate_message_content_seal(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use base64::Engine;
 
     use super::*;
+
+    static TEST_KEY: Mutex<()> = Mutex::new(());
+
+    fn with_test_key<F: FnOnce()>(f: F) {
+        let _guard = TEST_KEY.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("JWT_KEY", "test-jwt-key-seal-legacy-migration-suite");
+        f();
+    }
 
     #[test]
     fn migrates_legacy_plaintext() {
@@ -218,10 +215,11 @@ mod tests {
 
     #[test]
     fn skips_already_sealed() {
-        std::env::set_var("JWT_KEY", "test-jwt-key-for-seal-legacy-migration");
-        let stored =
-            prepare_content_for_storage("hello", false).expect("seal");
-        assert!(!message_content_needs_seal_migration(&stored, false));
+        with_test_key(|| {
+            let stored =
+                prepare_content_for_storage("hello", false).expect("seal");
+            assert!(!message_content_needs_seal_migration(&stored, false));
+        });
     }
 
     #[test]
@@ -249,14 +247,51 @@ mod tests {
     }
 
     #[test]
+    fn migrates_emoji_client_opaque() {
+        let opaque =
+            crate::utils::messages::content_storage::wrap_client_opaque("👍🎉🔥💯✨");
+        assert!(message_content_needs_seal_migration(&opaque, false));
+    }
+
+    #[test]
+    fn migration_preserves_api_opaque_for_legacy_plaintext() {
+        with_test_key(|| {
+            let plain = "cześć, jak leci?";
+            let api_before = crate::utils::messages::content_storage::content_for_api(plain, false);
+            let sealed = seal_legacy_message_content(plain, false)
+                .expect("ok")
+                .expect("some");
+            let api_after =
+                crate::utils::messages::content_storage::content_for_api(&sealed, false);
+            assert_eq!(api_before, api_after);
+            assert_ne!(api_after, plain);
+        });
+    }
+
+    #[test]
+    fn post_deploy_sealed_messages_are_skipped() {
+        with_test_key(|| {
+            let opaque =
+                crate::utils::messages::content_storage::wrap_client_opaque("nowa wiadomość");
+            let stored =
+                prepare_content_for_storage(&opaque, false).expect("store like live server");
+            assert!(!message_content_needs_seal_migration(&stored, false));
+            assert!(seal_legacy_message_content(&stored, false)
+                .expect("ok")
+                .is_none());
+        });
+    }
+
+    #[test]
     fn seal_roundtrip_preserves_plaintext() {
-        std::env::set_var("JWT_KEY", "test-jwt-key-for-seal-legacy-migration-roundtrip");
-        let sealed = seal_legacy_message_content("test wiadomość", false)
-            .expect("ok")
-            .expect("some");
-        assert_eq!(
-            reveal_content_internal(&sealed, false),
-            "test wiadomość"
-        );
+        with_test_key(|| {
+            let sealed = seal_legacy_message_content("test wiadomość", false)
+                .expect("ok")
+                .expect("some");
+            assert_eq!(
+                reveal_content_internal(&sealed, false),
+                "test wiadomość"
+            );
+        });
     }
 }
