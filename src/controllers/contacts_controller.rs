@@ -152,7 +152,13 @@ async fn dm_last_message(
         .await
         .ok()?;
     let msg = cursor.try_next().await.ok().flatten()?;
-    Some((msg.timestamp, msg.content))
+    Some((
+        msg.timestamp,
+        crate::utils::messages::content_storage::content_for_api(
+            &msg.content,
+            msg.e2e_encrypted,
+        ),
+    ))
 }
 
 async fn dm_unread_count(db: &mongodb::Database, uid: ObjectId, fid: ObjectId) -> u64 {

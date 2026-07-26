@@ -124,7 +124,13 @@ pub async fn enrich_channel_unread(
         .await
     {
         Ok(mut cursor) => match cursor.try_next().await.ok().flatten() {
-            Some(m) => Some((m.timestamp, m.content)),
+            Some(m) => Some((
+                m.timestamp,
+                crate::utils::messages::content_storage::content_for_api(
+                    &m.content,
+                    m.e2e_encrypted,
+                ),
+            )),
             None => None,
         },
         Err(_) => None,
