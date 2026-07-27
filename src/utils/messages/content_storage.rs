@@ -33,12 +33,12 @@ pub fn inbound_plaintext_for_processing(incoming: &str, e2e_encrypted: bool) -> 
         return incoming.to_string();
     }
     if is_client_opaque(incoming) {
-        return unwrap_client_opaque(incoming);
+        return normalize_client_opaque_to_plaintext(incoming);
     }
     if is_server_sealed(incoming) {
         if let Ok(plain) = decrypt_field(incoming.trim()) {
             if is_client_opaque(&plain) {
-                return unwrap_client_opaque(&plain);
+                return normalize_client_opaque_to_plaintext(&plain);
             }
             return plain;
         }
@@ -50,15 +50,12 @@ pub fn prepare_content_for_storage(incoming: &str, e2e_encrypted: bool) -> Resul
     if e2e_encrypted {
         return Ok(incoming.to_string());
     }
-    let opaque = if is_client_opaque(incoming) {
-        incoming.to_string()
-    } else if is_server_sealed(incoming) {
-        let plain = decrypt_field(incoming.trim())?;
-        wrap_client_opaque(&plain)
+    let plain = if is_client_opaque(incoming) || is_server_sealed(incoming) {
+        inbound_plaintext_for_processing(incoming, false)
     } else {
-        wrap_client_opaque(incoming)
+        incoming.to_string()
     };
-    encrypt_field(&opaque)
+    encrypt_field(&wrap_client_opaque(&plain))
 }
 
 /// API / WS payload: never human-readable plaintext.
@@ -107,6 +104,36 @@ pub fn unwrap_client_opaque(stored: &str) -> String {
     trimmed.to_string()
 }
 
+/// Peel nested client opaque layers down to plaintext (guards legacy double-wrap).
+pub fn normalize_client_opaque_to_plaintext(incoming: &str) -> String {
+    let mut current = incoming.trim().to_string();
+    for _ in 0..4 {
+        if !is_client_opaque(&current) {
+            return current;
+        }
+        let inner = unwrap_client_opaque(&current);
+        if inner == current {
+            return current;
+        }
+        if inner.starts_with('{') {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&inner) {
+                let is_e2e = value.get("type").and_then(|v| v.as_i64()).is_some()
+                    && value.get("body").and_then(|v| v.as_str()).is_some()
+                    || value.get("keyId").and_then(|v| v.as_i64()).is_some()
+                        && value.get("data").and_then(|v| v.as_str()).is_some();
+                if is_e2e {
+                    return current;
+                }
+            }
+        }
+        if !is_client_opaque(&inner) {
+            return inner;
+        }
+        current = inner;
+    }
+    current
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +156,16 @@ mod tests {
     fn e2e_passes_through() {
         let cipher = "QKJVBEVCTFR-signal-ciphertext";
         assert_eq!(content_for_api(cipher, true), cipher);
+    }
+
+    #[test]
+    fn normalize_double_opaque_wrap() {
+        let plain = "noo";
+        let once = wrap_client_opaque(plain);
+        let twice = wrap_client_opaque(&once);
+        assert_eq!(normalize_client_opaque_to_plaintext(&twice), plain);
+        let stored = prepare_content_for_storage(&twice, false).expect("store");
+        assert_eq!(reveal_content_internal(&stored, false), plain);
+        assert_ne!(content_for_api(&stored, false), plain);
     }
 }

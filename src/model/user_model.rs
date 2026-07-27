@@ -387,7 +387,7 @@ impl User {
             backup_codes: None,
             created_at: now,
             updated_at: now,
-            e2e_enabled: false,
+            e2e_enabled: true,
         };
 
         let result = Self::collection(db).insert_one(&user).await?;
