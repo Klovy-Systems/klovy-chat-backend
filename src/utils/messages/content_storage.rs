@@ -12,10 +12,23 @@ pub fn is_client_opaque(stored: &str) -> bool {
     if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with('[') {
         return false;
     }
-    base64::engine::general_purpose::STANDARD
-        .decode(trimmed)
-        .ok()
-        .is_some_and(|bytes| std::str::from_utf8(&bytes).is_ok())
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(trimmed) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    if text.contains('\u{FFFD}') {
+        return false;
+    }
+    client_opaque_normalized_equal(&wrap_client_opaque(text), trimmed)
+}
+
+fn client_opaque_normalized_equal(a: &str, b: &str) -> bool {
+    fn strip_pad(s: &str) -> &str {
+        s.trim_end_matches('=')
+    }
+    strip_pad(a) == strip_pad(b)
 }
 
 fn is_server_sealed(stored: &str) -> bool {
@@ -167,5 +180,17 @@ mod tests {
         let stored = prepare_content_for_storage(&twice, false).expect("store");
         assert_eq!(reveal_content_internal(&stored, false), plain);
         assert_ne!(content_for_api(&stored, false), plain);
+    }
+
+    #[test]
+    fn reject_binary_false_opaque() {
+        let bytes = vec![0xff, 0xfe, 0xfd, 0x00];
+        let fake = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert!(!is_client_opaque(&fake));
+    }
+
+    #[test]
+    fn plaintext_words_are_not_opaque() {
+        assert!(!is_client_opaque("cycki"));
     }
 }
