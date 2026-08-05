@@ -63,7 +63,8 @@ pub fn role_has_permission(role: UserRole, permission: PanelPermission) -> bool 
 
     match permission {
         AccessPanel => role >= Support,
-        SupportTickets => matches!(role, Support | Admin | Root),
+        // support + moderator + admin + root (aligned with dashboard role matrix)
+        SupportTickets => role >= Support,
         ViewUsers => role >= Support,
         WarnUser | DeleteWarning => role >= Moderator,
         BanUser | DeleteUser | ResetPassword | ManageWhitelist => role >= Admin,

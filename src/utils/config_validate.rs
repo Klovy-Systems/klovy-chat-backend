@@ -1,7 +1,7 @@
 use std::env;
 
 use crate::utils::app_env::{is_production, node_env};
-use crate::utils::auth::admin_session::{admin_ip_allowlist_configured, admin_user_ids_configured};
+use crate::utils::auth::admin_session::admin_ip_allowlist_configured;
 use crate::utils::auth::jwt_auth::jwt_secret;
 use crate::utils::whitelist::is_whitelist_enabled;
 use crate::utils::registration::{
@@ -77,14 +77,17 @@ pub fn validate_startup_config() {
             panic!("ADMIN_SECRET must be at least 16 characters in production");
         }
 
-        if !admin_user_ids_configured() {
-            // Nie przerywamy startu — panel administratora jest po prostu wyłączony
-            // (middleware zwraca 503), a reszta komunikatora działa normalnie.
+        let root_ids = env::var("ROOT_USER_IDS")
+            .or_else(|_| env::var("ROOT_USER_ID"))
+            .unwrap_or_default();
+        if root_ids.trim().is_empty() {
             log::warn!(
-                "ADMIN_USER_IDS is not set — the admin panel will be disabled until you configure \
-                 comma-separated MongoDB user ObjectIds (e.g. ADMIN_USER_IDS=<objectId1>,<objectId2>)"
+                "ROOT_USER_IDS is not set — no bootstrap root. Set comma-separated MongoDB user \
+                 ObjectIds so a root can assign panel roles (admin, moderator, support) at dash.klovy.chat"
             );
-        } else if !admin_ip_allowlist_configured() {
+        }
+
+        if !admin_ip_allowlist_configured() {
             log::warn!(
                 "ADMIN_ALLOWED_IPS is not set — the admin panel accepts requests from any IP. \
                  Set comma-separated IPs or CIDR ranges (e.g. ADMIN_ALLOWED_IPS=203.0.113.10,198.51.100.0/24)"

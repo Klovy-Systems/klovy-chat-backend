@@ -330,7 +330,8 @@ pub struct PanelHandoffRedeemBody {
     pub handoff_token: String,
 }
 
-/// Wymaga aktywnej sesji komunikatora + `isAdmin: true` w MongoDB.
+/// Wymaga aktywnej sesji komunikatora + roli panelu (support+ lub root z ROOT_USER_IDS).
+/// Token jest wymieniany na dash.klovy.chat po potwierdzeniu w oknie autoryzacji.
 pub async fn create_panel_handoff(req: HttpRequest) -> HttpResponse {
     let Some(user) = resolve_chat_session_user(&req).await else {
         return HttpResponse::Unauthorized().json(json!({
