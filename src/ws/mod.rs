@@ -34,7 +34,7 @@ use crate::ws::registry::ConnectionRegistry;
 use crate::ws::state::{is_valid_object_id, SocketState};
 use crate::middlewares::auth_middleware::TokenPayload;
 use crate::model::user_model::User;
-use crate::utils::auth::admin_session::is_admin_user_id;
+use crate::utils::auth::admin_session::is_panel_admin_user_id;
 use crate::utils::auth::jwt_auth::{
     jwt_decoding_key, parse_jwt_from_cookie_header, parse_refresh_from_cookie_header,
     resolve_session_family_id, user_from_jwt_with_refresh,
@@ -130,7 +130,7 @@ pub async fn ws_handler(
 
     // Whitelist gate: pending users must not get realtime messaging/calls.
     // Approval is detected via HTTP polling on /pending.
-    if is_whitelist_enabled() && !is_admin_user_id(&user_id) {
+    if is_whitelist_enabled() && !is_panel_admin_user_id(&user_id).await {
         let allowed = match ObjectId::parse_str(&user_id) {
             Ok(oid) => match User::find_by_id(&get_db(), oid).await {
                 Ok(Some(u)) => u.is_whitelisted,
@@ -320,7 +320,7 @@ async fn handle_socket(
                     let _ = ws_sender.send(Message::Close(None)).await;
                     break;
                 }
-                if is_whitelist_enabled() && !is_admin_user_id(&user_id) {
+                if is_whitelist_enabled() && !is_panel_admin_user_id(&user_id).await {
                     let still_allowed = match ObjectId::parse_str(&user_id) {
                         Ok(oid) => match User::find_by_id(&get_db(), oid).await {
                             Ok(Some(u)) => u.is_whitelisted,

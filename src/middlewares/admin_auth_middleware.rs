@@ -108,13 +108,6 @@ pub async fn check_admin_configured(
     req: ServiceRequest,
     next: Next<impl MessageBody + 'static>,
 ) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
-    if !admin_user_ids_configured() {
-        let (req, _) = req.into_parts();
-        let res = HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "error": "Panel administratora nie jest skonfigurowany (ustaw ADMIN_USER_IDS w .env)."
-        }));
-        return Ok(ServiceResponse::new(req, res));
-    }
-
+    let _ = admin_user_ids_configured();
     Ok(next.call(req).await?.map_into_boxed_body())
 }

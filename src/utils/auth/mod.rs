@@ -1,4 +1,5 @@
 pub mod admin_session;
+pub mod panel_permissions;
 pub mod jwt_auth;
 pub mod jwt_validation;
 pub mod refresh_token;

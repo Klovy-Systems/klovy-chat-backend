@@ -8,6 +8,8 @@ use crate::model::announcement_model::{
     validate_announcement, Announcement, AnnouncementDismissal, CreateAnnouncementInput,
 };
 use crate::utils::admin_audit::log_admin_action;
+use crate::utils::auth::admin_session::require_panel_permission;
+use crate::utils::auth::panel_permissions::PanelPermission;
 use crate::utils::db::get_db;
 use crate::ws::registry::emit_to_all_connected;
 
@@ -40,7 +42,13 @@ fn broadcast_announcement(a: &Announcement) {
     );
 }
 
-pub async fn list_admin_announcements() -> HttpResponse {
+pub async fn list_admin_announcements(req: HttpRequest) -> HttpResponse {
+    if let Err(response) =
+        require_panel_permission(&req, PanelPermission::ManageAnnouncements).await
+    {
+        return response;
+    }
+
     let db = get_db();
     match Announcement::list_all(&db).await {
         Ok(items) => HttpResponse::Ok().json(json!({
@@ -62,6 +70,12 @@ pub struct CreateAnnouncementBody {
 }
 
 pub async fn create_announcement(req: HttpRequest, body: web::Json<CreateAnnouncementBody>) -> HttpResponse {
+    if let Err(response) =
+        require_panel_permission(&req, PanelPermission::ManageAnnouncements).await
+    {
+        return response;
+    }
+
     let title = body.title.as_deref().unwrap_or("");
     let content = body.body.as_deref().unwrap_or("");
     if let Err(message) = validate_announcement(title, content) {
@@ -113,6 +127,12 @@ pub async fn update_announcement(
     req: HttpRequest,
     body: web::Json<UpdateAnnouncementBody>,
 ) -> HttpResponse {
+    if let Err(response) =
+        require_panel_permission(&req, PanelPermission::ManageAnnouncements).await
+    {
+        return response;
+    }
+
     let Ok(aid) = ObjectId::parse_str(param(&req, "announcementId")) else {
         return HttpResponse::BadRequest().json(json!({ "error": "Nieprawidłowe ID ogłoszenia." }));
     };
@@ -183,6 +203,12 @@ pub async fn update_announcement(
 }
 
 pub async fn delete_announcement(req: HttpRequest) -> HttpResponse {
+    if let Err(response) =
+        require_panel_permission(&req, PanelPermission::ManageAnnouncements).await
+    {
+        return response;
+    }
+
     let Ok(aid) = ObjectId::parse_str(param(&req, "announcementId")) else {
         return HttpResponse::BadRequest().json(json!({ "error": "Nieprawidłowe ID ogłoszenia." }));
     };

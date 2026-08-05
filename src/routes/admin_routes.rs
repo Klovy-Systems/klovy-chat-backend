@@ -2,11 +2,12 @@ use actix_web::web;
 use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::admin_controller::{
-    admin_elevate, admin_login_removed, admin_logout, admin_session_status, assign_badge, block_user, create_badge,
-    delete_badge, delete_channel_admin, delete_channel_report, delete_user, delete_user_warning,
-    get_user_badges, list_badges, list_channel_reports, list_channels, list_user_warnings,
-    list_users, remove_badge, restore_user, set_user_password, set_user_whitelist, unblock_user,
-    update_badge, update_channel_report_status, warn_user,
+    admin_elevate, admin_login_removed, admin_logout, admin_session_status, assign_badge, block_user,
+    create_badge, create_panel_handoff, delete_badge, delete_channel_admin, delete_channel_report,
+    delete_user, delete_user_warning, get_user_badges, list_badges, list_channel_reports,
+    list_channels, list_user_warnings, list_users, redeem_panel_handoff, remove_badge, restore_user,
+    set_user_panel_role, set_user_password, set_user_whitelist, unblock_user, update_badge, update_channel_report_status,
+    warn_user,
 };
 use crate::controllers::announcement_controller::{
     create_announcement, delete_announcement, list_admin_announcements, update_announcement,
@@ -50,6 +51,17 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     );
 
     cfg.service(
+        web::resource("/panel-handoff")
+            .wrap(from_fn(admin_session_probe_limiter))
+            .route(web::post().to(create_panel_handoff)),
+    );
+
+    cfg.service(
+        web::resource("/panel-handoff/redeem")
+            .route(web::post().to(redeem_panel_handoff)),
+    );
+
+    cfg.service(
         web::resource("/logout")
             .wrap(from_fn(verify_admin_session))
             .route(web::post().to(admin_logout)),
@@ -72,6 +84,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .service(
                 web::resource("/users/{userId}/whitelist")
                     .route(web::patch().to(set_user_whitelist)),
+            )
+            .service(
+                web::resource("/users/{userId}/panel-role")
+                    .route(web::patch().to(set_user_panel_role)),
             )
             .service(
                 web::resource("/users/{userId}/password")

@@ -24,6 +24,11 @@ async fn main() -> std::io::Result<()> {
         .expect("Failed to connect to MongoDB");
 
     db::sync_user_indexes().await.ok();
+    if let Ok(count) = User::migrate_legacy_is_admin(&db::get_db()).await {
+        if count > 0 {
+            log::info!("Migrated {count} legacy isAdmin users to role=admin");
+        }
+    }
 
     klovy_chat_server::utils::config_validate::validate_startup_config();
 

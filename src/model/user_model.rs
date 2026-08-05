@@ -11,11 +11,14 @@ use crate::utils::crypto::credential_hash::{
 use crate::utils::validators::normalize_username::{is_valid_username, normalize_username};
 use crate::utils::whitelist::is_whitelist_enabled;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UserRole {
     User,
+    Support,
+    Moderator,
     Admin,
+    Root,
 }
 
 impl Default for UserRole {
@@ -173,11 +176,12 @@ pub struct User {
     #[serde(rename = "deletionScheduledAt", skip_serializing_if = "Option::is_none")]
     pub deletion_scheduled_at: Option<DateTime>,
 
-    #[serde(rename = "isAdmin", default)]
-    pub is_admin: bool,
-
     #[serde(default)]
     pub role: UserRole,
+
+    /// Odczyt legacy `isAdmin` z bazy (migracja). Nigdy nie zapisywane z API.
+    #[serde(rename = "isAdmin", default, skip_serializing)]
+    pub(crate) legacy_is_admin: bool,
 
     #[serde(rename = "isOnline", default)]
     pub is_online: bool,
@@ -362,8 +366,8 @@ impl User {
             disabled_at: None,
             deletion_requested_at: None,
             deletion_scheduled_at: None,
-            is_admin: false,
             role: UserRole::User,
+            legacy_is_admin: false,
             is_online: false,
             availability_status: AvailabilityStatus::Online,
             last_seen: None,
@@ -424,6 +428,22 @@ impl User {
                 "isBot": { "$ne": true },
             })
             .await
+    }
+
+    pub async fn migrate_legacy_is_admin(db: &Database) -> mongodb::error::Result<u64> {
+        let result = Self::collection(db)
+            .update_many(
+                doc! {
+                    "isAdmin": true,
+                    "role": { "$in": ["user", null] },
+                },
+                doc! {
+                    "$set": { "role": "admin" },
+                    "$unset": { "isAdmin": "" },
+                },
+            )
+            .await?;
+        Ok(result.modified_count)
     }
 
     pub async fn login(

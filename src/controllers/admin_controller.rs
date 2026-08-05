@@ -17,11 +17,19 @@ use crate::model::warning_model::{
 use crate::utils::admin::purge_user_completely;
 use crate::utils::admin_audit::log_admin_action;
 use crate::utils::auth::admin_session::{
-    admin_elevation_required, admin_elevation_valid, admin_user_ids_configured,
-    clear_admin_cookie, is_admin_user_id, issue_admin_elevation_cookie,
-    resolve_panel_admin_account, verify_admin_secret,
+    admin_elevation_required, admin_elevation_valid,
+    clear_admin_cookie, issue_admin_elevation_cookie, issue_panel_handoff_token,
+    redeem_panel_handoff_token, require_panel_permission, resolve_chat_session_user,
+    resolve_panel_admin_account, panel_role_for_user, user_can_manage_panel_roles,
+    user_is_panel_admin, user_is_root, verify_admin_secret,
+};
+use crate::utils::auth::panel_permissions::{
+    actor_can_moderate_target, parse_assignable_role, permissions_for_user,
+    role_to_bson, PanelPermission,
 };
 use crate::middlewares::auth_middleware::RequestUserId;
+use crate::utils::auth::refresh_token::REFRESH_COOKIE;
+use crate::utils::security::csrf::CSRF_COOKIE_NAME;
 use crate::utils::security::csrf::{csrf_token_for_response};
 use crate::utils::channel::channel_member_count;
 use crate::ws::registry::{channel_recipient_ids, disconnect_user, emit_to_user, emit_to_users};
@@ -46,22 +54,44 @@ fn actor_user_id(req: &HttpRequest) -> Option<String> {
         .map(|row| row.0.clone())
 }
 
-/// Blokuje operacje moderacyjne na kontach z ADMIN_USER_IDS (oraz self-target dla actor).
-fn reject_protected_panel_admin_target(
+/// Blokuje operacje moderacyjne na kontach staff o równym/wyższym poziomie oraz self-target.
+async fn reject_protected_staff_target(
     req: &HttpRequest,
     target_user_id: &str,
 ) -> Option<HttpResponse> {
-    if is_admin_user_id(target_user_id) {
-        return Some(HttpResponse::Forbidden().json(json!({
-            "error": "Operacja niedozwolona na koncie administratora panelu."
-        })));
-    }
     if actor_user_id(req).as_deref() == Some(target_user_id) {
         return Some(HttpResponse::Forbidden().json(json!({
             "error": "Nie możesz wykonać tej operacji na własnym koncie."
         })));
     }
+
+    let actor_id = actor_user_id(req)?;
+    let Ok(actor_oid) = ObjectId::parse_str(&actor_id) else {
+        return None;
+    };
+    let Ok(oid) = ObjectId::parse_str(target_user_id) else {
+        return None;
+    };
+    let db = get_db();
+    let Ok(Some(actor)) = User::find_by_id(&db, actor_oid).await else {
+        return None;
+    };
+    let Ok(Some(target)) = User::find_by_id(&db, oid).await else {
+        return None;
+    };
+    if !actor_can_moderate_target(&actor, &target) {
+        return Some(HttpResponse::Forbidden().json(json!({
+            "error": "Operacja niedozwolona na koncie staff o równym lub wyższym poziomie."
+        })));
+    }
     None
+}
+
+async fn require_admin_permission(
+    req: &HttpRequest,
+    permission: PanelPermission,
+) -> Result<User, HttpResponse> {
+    require_panel_permission(req, permission).await
 }
 
 async fn terminate_user_sessions(db: &mongodb::Database, uid: ObjectId) {
@@ -294,15 +324,90 @@ pub async fn admin_logout() -> HttpResponse {
         .json(json!({ "message": "Zamknięto panel administratora." }))
 }
 
-pub async fn admin_session_status(req: HttpRequest) -> HttpResponse {
-    if !admin_user_ids_configured() {
-        return HttpResponse::Ok().json(json!({
-            "authenticated": false,
-            "configured": false,
-            "reason": "not_configured",
+#[derive(Deserialize)]
+pub struct PanelHandoffRedeemBody {
+    #[serde(rename = "handoffToken")]
+    pub handoff_token: String,
+}
+
+/// Wymaga aktywnej sesji komunikatora + `isAdmin: true` w MongoDB.
+pub async fn create_panel_handoff(req: HttpRequest) -> HttpResponse {
+    let Some(user) = resolve_chat_session_user(&req).await else {
+        return HttpResponse::Unauthorized().json(json!({
+            "error": "Zaloguj się w Klovy Chat, aby otworzyć panel administratora.",
+            "code": "NOT_LOGGED_IN",
+        }));
+    };
+
+    if !user_is_panel_admin(&user) {
+        return HttpResponse::Forbidden().json(json!({
+            "error": "To konto nie ma dostępu do panelu. Poproś administratora o nadanie roli.",
+            "code": "ADMIN_FORBIDDEN",
         }));
     }
 
+    let jwt = req
+        .cookie("jwt")
+        .map(|c| c.value().trim().to_string())
+        .unwrap_or_default();
+    let refresh = req
+        .cookie(REFRESH_COOKIE)
+        .map(|c| c.value().trim().to_string())
+        .unwrap_or_default();
+    if jwt.is_empty() || refresh.is_empty() {
+        return HttpResponse::Unauthorized().json(json!({
+            "error": "Brak aktywnej sesji.",
+            "code": "NOT_LOGGED_IN",
+        }));
+    }
+
+    let user_id = match user.id {
+        Some(id) => id.to_hex(),
+        None => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Nie udało się utworzyć tokenu panelu.",
+            }));
+        }
+    };
+
+    let csrf = req.cookie(CSRF_COOKIE_NAME).map(|c| c.value().to_string());
+    let handoff_token = match issue_panel_handoff_token(&user_id, &jwt, &refresh, csrf.as_deref()) {
+        Ok(token) => token,
+        Err(e) => {
+            log::error!("Failed to issue panel handoff token: {e}");
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Nie udało się utworzyć tokenu panelu.",
+            }));
+        }
+    };
+
+    HttpResponse::Ok().json(json!({
+        "handoffToken": handoff_token,
+        "expiresIn": 90,
+    }))
+}
+
+/// Wymienia jednorazowy token z komunikatora na dane sesji (dla zewnętrznego panelu).
+pub async fn redeem_panel_handoff(body: web::Json<PanelHandoffRedeemBody>) -> HttpResponse {
+    let claims = match redeem_panel_handoff_token(body.handoff_token.trim()) {
+        Ok(claims) => claims,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(json!({
+                "error": message,
+                "code": "HANDOFF_INVALID",
+            }));
+        }
+    };
+
+    HttpResponse::Ok().json(json!({
+        "userId": claims.user_id,
+        "jwt": claims.jwt,
+        "refreshToken": claims.refresh_token,
+        "csrfToken": claims.csrf,
+    }))
+}
+
+pub async fn admin_session_status(req: HttpRequest) -> HttpResponse {
     let has_session = req.cookie("jwt").is_some();
 
     let Some(user) = resolve_panel_admin_account(&req).await else {
@@ -333,6 +438,9 @@ pub async fn admin_session_status(req: HttpRequest) -> HttpResponse {
         "configured": true,
         "userId": user.id.map(|id| id.to_hex()),
         "username": user.username,
+        "panelRole": panel_role_for_user(&user),
+        "canManageRoles": user_can_manage_panel_roles(&user),
+        "permissions": permissions_for_user(&user),
         "csrfToken": csrf,
         "whitelistEnabled": is_whitelist_enabled(),
         "pendingWhitelistCount": pending_whitelist_count().await,
@@ -350,6 +458,10 @@ async fn pending_whitelist_count() -> u64 {
 }
 
 pub async fn list_users(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ViewUsers).await {
+        return response;
+    }
+
     let page = query_u64(&req, "page", 1).max(1);
     let limit = query_u64(&req, "limit", 50).clamp(1, 100);
     let search = query_str(&req, "search")
@@ -420,6 +532,7 @@ pub async fn list_users(req: HttpRequest) -> HttpResponse {
                 "blockReason": u.block_reason,
                 "blockedAt": u.blocked_at.as_ref().and_then(iso),
                 "isWhitelisted": u.is_whitelisted,
+                "panelRole": panel_role_for_user(u),
                 "warningCount": warning_count,
                 "createdAt": iso(&u.created_at),
             })
@@ -445,6 +558,10 @@ pub struct SetWhitelistBody {
 }
 
 pub async fn set_user_whitelist(req: HttpRequest, body: web::Json<SetWhitelistBody>) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ManageWhitelist).await {
+        return response;
+    }
+
     if !is_whitelist_enabled() {
         return HttpResponse::BadRequest().json(json!({
             "error": "Whitelista nie jest włączona na tym serwerze."
@@ -504,6 +621,88 @@ pub async fn set_user_whitelist(req: HttpRequest, body: web::Json<SetWhitelistBo
 }
 
 #[derive(Deserialize)]
+pub struct SetPanelRoleBody {
+    pub role: String,
+}
+
+/// Nadaje lub zmienia rolę platformy. Tylko root.
+pub async fn set_user_panel_role(
+    req: HttpRequest,
+    body: web::Json<SetPanelRoleBody>,
+) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ManageRoles).await {
+        return response;
+    }
+
+    let target_id = param(&req, "userId");
+    if actor_user_id(&req).as_deref() == Some(target_id) {
+        return HttpResponse::Forbidden().json(json!({
+            "error": "Nie możesz zmienić własnej roli.",
+        }));
+    }
+
+    let Ok(uid) = ObjectId::parse_str(target_id) else {
+        return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
+    };
+
+    let db = get_db();
+    let Some(target) = User::find_by_id(&db, uid).await.ok().flatten() else {
+        return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
+    };
+
+    if user_is_root(&target) {
+        return HttpResponse::Forbidden().json(json!({
+            "error": "Nie można zmienić roli konta root.",
+        }));
+    }
+
+    let new_role = match parse_assignable_role(&body.role) {
+        Ok(role) => role,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(json!({ "error": message }));
+        }
+    };
+
+    match User::set_fields(
+        &db,
+        uid,
+        doc! {
+            "role": role_to_bson(&new_role),
+        },
+    )
+    .await
+    {
+        Ok(Some(updated)) => {
+            let _ = User::collection(&db)
+                .update_one(
+                    doc! { "_id": uid },
+                    doc! { "$unset": { "isAdmin": "" } },
+                )
+                .await;
+            log_admin_action(
+                &req,
+                "panel_role.set",
+                Some("user"),
+                Some(&uid.to_hex()),
+                json!({ "role": panel_role_for_user(&updated).unwrap_or("user") }),
+            )
+            .await;
+            HttpResponse::Ok().json(json!({
+                "message": "Zaktualizowano rolę użytkownika.",
+                "user": {
+                    "id": updated.id.map(|o| o.to_hex()),
+                    "username": updated.username,
+                    "panelRole": panel_role_for_user(&updated),
+                },
+            }))
+        }
+        Ok(None) => HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." })),
+        Err(_) => HttpResponse::InternalServerError()
+            .json(json!({ "error": "Nie udało się zaktualizować roli." })),
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetUserPasswordBody {
     pub new_password: Option<String>,
@@ -514,10 +713,14 @@ pub async fn set_user_password(
     req: HttpRequest,
     body: web::Json<SetUserPasswordBody>,
 ) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ResetPassword).await {
+        return response;
+    }
+
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
     };
-    if let Some(res) = reject_protected_panel_admin_target(&req, &uid.to_hex()) {
+    if let Some(res) = reject_protected_staff_target(&req, &uid.to_hex()).await {
         return res;
     }
 
@@ -581,10 +784,14 @@ pub struct BlockUserBody {
 }
 
 pub async fn block_user(req: HttpRequest, body: web::Json<BlockUserBody>) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::BanUser).await {
+        return response;
+    }
+
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
     };
-    if let Some(res) = reject_protected_panel_admin_target(&req, &uid.to_hex()) {
+    if let Some(res) = reject_protected_staff_target(&req, &uid.to_hex()).await {
         return res;
     }
 
@@ -646,6 +853,10 @@ pub async fn block_user(req: HttpRequest, body: web::Json<BlockUserBody>) -> Htt
 }
 
 pub async fn unblock_user(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::BanUser).await {
+        return response;
+    }
+
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
     };
@@ -696,10 +907,14 @@ pub async fn unblock_user(req: HttpRequest) -> HttpResponse {
 }
 
 pub async fn delete_user(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::DeleteUser).await {
+        return response;
+    }
+
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
     };
-    if let Some(res) = reject_protected_panel_admin_target(&req, &uid.to_hex()) {
+    if let Some(res) = reject_protected_staff_target(&req, &uid.to_hex()).await {
         return res;
     }
 
@@ -730,6 +945,10 @@ pub async fn delete_user(req: HttpRequest) -> HttpResponse {
 }
 
 pub async fn restore_user(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::BanUser).await {
+        return response;
+    }
+
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
     };
@@ -796,6 +1015,10 @@ pub async fn restore_user(req: HttpRequest) -> HttpResponse {
 }
 
 pub async fn list_channels(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ViewChannels).await {
+        return response;
+    }
+
     let page = query_u64(&req, "page", 1).max(1);
     let limit = query_u64(&req, "limit", 50).clamp(1, 100);
     let search = query_str(&req, "search").trim().to_string();
@@ -874,6 +1097,10 @@ pub async fn list_channels(req: HttpRequest) -> HttpResponse {
 }
 
 pub async fn delete_channel_admin(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::DeleteChannel).await {
+        return response;
+    }
+
     let Ok(cid) = ObjectId::parse_str(param(&req, "channelId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje." }));
     };
@@ -919,7 +1146,11 @@ pub async fn delete_channel_admin(req: HttpRequest) -> HttpResponse {
     HttpResponse::Ok().json(json!({ "message": "Kanał został usunięty." }))
 }
 
-pub async fn list_channel_reports() -> HttpResponse {
+pub async fn list_channel_reports(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ViewReports).await {
+        return response;
+    }
+
     let db = get_db();
     let pending_count = ChannelReport::collection(&db)
         .count_documents(doc! { "status": "pending" })
@@ -981,6 +1212,10 @@ pub async fn update_channel_report_status(
     req: HttpRequest,
     body: web::Json<UpdateReportBody>,
 ) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ManageReports).await {
+        return response;
+    }
+
     let status = body.status.clone().unwrap_or_default();
     if status != "reviewed" && status != "dismissed" {
         return HttpResponse::BadRequest().json(json!({ "message": "Nieprawidłowy status" }));
@@ -1033,6 +1268,10 @@ pub async fn update_channel_report_status(
 }
 
 pub async fn delete_channel_report(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ManageReports).await {
+        return response;
+    }
+
     let Ok(rid) = ObjectId::parse_str(param(&req, "reportId")) else {
         return HttpResponse::NotFound().json(json!({ "message": "Zgłoszenie nie znalezione" }));
     };
@@ -1067,7 +1306,11 @@ pub async fn delete_channel_report(req: HttpRequest) -> HttpResponse {
     HttpResponse::Ok().json(json!({ "message": "Zgłoszenie zostało usunięte." }))
 }
 
-pub async fn list_badges() -> HttpResponse {
+pub async fn list_badges(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ViewBadges).await {
+        return response;
+    }
+
     let db = get_db();
     let badges: Vec<Badge> = match Badge::collection(&db)
         .find(doc! {})
@@ -1098,7 +1341,11 @@ pub struct CreateBadgeBody {
     pub description: Option<String>,
 }
 
-pub async fn create_badge(body: web::Json<CreateBadgeBody>) -> HttpResponse {
+pub async fn create_badge(req: HttpRequest, body: web::Json<CreateBadgeBody>) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ManageBadges).await {
+        return response;
+    }
+
     let name = body.name.clone().unwrap_or_default();
     let icon = body.icon.clone().unwrap_or_default();
     if name.trim().is_empty() || icon.trim().is_empty() {
@@ -1175,6 +1422,10 @@ pub struct UpdateBadgeBody {
 }
 
 pub async fn update_badge(req: HttpRequest, body: web::Json<UpdateBadgeBody>) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ManageBadges).await {
+        return response;
+    }
+
     let Ok(bid) = ObjectId::parse_str(param(&req, "badgeId")) else {
         return HttpResponse::BadRequest().json(json!({ "success": false, "message": "Invalid badge ID" }));
     };
@@ -1276,6 +1527,10 @@ pub async fn update_badge(req: HttpRequest, body: web::Json<UpdateBadgeBody>) ->
 }
 
 pub async fn delete_badge(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ManageBadges).await {
+        return response;
+    }
+
     let Ok(bid) = ObjectId::parse_str(param(&req, "badgeId")) else {
         return HttpResponse::BadRequest().json(json!({ "success": false, "message": "Invalid badge ID" }));
     };
@@ -1312,6 +1567,10 @@ pub struct AssignBadgeBody {
 }
 
 pub async fn assign_badge(req: HttpRequest, body: web::Json<AssignBadgeBody>) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::ManageBadges).await {
+        return response;
+    }
+
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::BadRequest().json(json!({ "success": false, "message": "Invalid user ID" }));
     };
@@ -1539,9 +1798,17 @@ pub struct WarnUserBody {
 }
 
 pub async fn warn_user(req: HttpRequest, body: web::Json<WarnUserBody>) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::WarnUser).await {
+        return response;
+    }
+
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
     };
+
+    if let Some(res) = reject_protected_staff_target(&req, &uid.to_hex()).await {
+        return res;
+    }
 
     let reason = body
         .reason
@@ -1611,6 +1878,10 @@ pub async fn warn_user(req: HttpRequest, body: web::Json<WarnUserBody>) -> HttpR
 }
 
 pub async fn list_user_warnings(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::WarnUser).await {
+        return response;
+    }
+
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
     };
@@ -1635,6 +1906,10 @@ pub async fn list_user_warnings(req: HttpRequest) -> HttpResponse {
 }
 
 pub async fn delete_user_warning(req: HttpRequest) -> HttpResponse {
+    if let Err(response) = require_admin_permission(&req, PanelPermission::DeleteWarning).await {
+        return response;
+    }
+
     let Ok(uid) = ObjectId::parse_str(param(&req, "userId")) else {
         return HttpResponse::NotFound().json(json!({ "error": "Użytkownik nie istnieje." }));
     };

@@ -1,13 +1,18 @@
-use actix_web::HttpRequest;
+use actix_web::{HttpRequest, HttpResponse};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Validation};
 use mongodb::bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::env;
 use std::net::IpAddr;
 
 use crate::middlewares::auth_middleware::TokenPayload;
 use crate::model::refresh_token_model::RefreshToken;
-use crate::model::user_model::User;
+use crate::model::user_model::{User, UserRole};
+use crate::utils::auth::panel_permissions::{
+    panel_role_label, user_can_manage_panel_roles as can_manage_roles,
+    user_has_panel_access, user_has_permission, PanelPermission,
+};
 use crate::utils::app_env::is_production;
 use crate::utils::auth::jwt_auth::{
     jwt_decoding_key, resolve_session_family_id, user_from_jwt_with_refresh,
@@ -46,15 +51,83 @@ pub fn get_admin_user_ids() -> Vec<String> {
 }
 
 pub fn admin_user_ids_configured() -> bool {
-    !get_admin_user_ids().is_empty()
+    true
 }
 
-pub fn is_admin_user_id(user_id: &str) -> bool {
+/// ID kont root (ObjectId hex), rozdzielone przecinkami — bootstrap bez ręcznej edycji MongoDB.
+/// Np. `ROOT_USER_IDS=6a4e5425bc9f2cb279deaa4a`
+pub fn get_root_user_ids() -> Vec<String> {
+    let raw = env::var("ROOT_USER_IDS")
+        .or_else(|_| env::var("ROOT_USER_ID"))
+        .unwrap_or_default();
+
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| ObjectId::parse_str(s).is_ok())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+pub fn user_id_is_env_root(user_id: &str) -> bool {
     let id = user_id.trim().to_ascii_lowercase();
-    if id.is_empty() || ObjectId::parse_str(&id).is_err() {
-        return false;
+    get_root_user_ids().iter().any(|root_id| root_id == &id)
+}
+
+pub fn user_is_root(user: &User) -> bool {
+    if user.role == UserRole::Root {
+        return true;
     }
-    get_admin_user_ids().iter().any(|allowed| allowed == &id)
+    user.id
+        .map(|oid| user_id_is_env_root(&oid.to_hex()))
+        .unwrap_or(false)
+}
+
+/// Dostęp do panelu: rola support i wyżej (oraz root z env).
+pub fn user_is_panel_admin(user: &User) -> bool {
+    user_has_panel_access(user)
+}
+
+pub fn panel_role_for_user(user: &User) -> Option<&'static str> {
+    panel_role_label(user)
+}
+
+pub fn user_can_manage_panel_roles(user: &User) -> bool {
+    can_manage_roles(user)
+}
+
+pub async fn require_panel_permission(
+    req: &HttpRequest,
+    permission: PanelPermission,
+) -> Result<User, HttpResponse> {
+    let user = resolve_admin_user(req).await.ok_or_else(|| {
+        HttpResponse::Unauthorized().json(json!({ "error": "Brak uprawnień do panelu." }))
+    })?;
+    if !user_has_permission(&user, permission) {
+        return Err(HttpResponse::Forbidden().json(json!({
+            "error": "Brak uprawnień do tej operacji.",
+        })));
+    }
+    Ok(user)
+}
+
+pub async fn is_panel_admin_user_id(user_id: &str) -> bool {
+    let id = user_id.trim();
+    let Ok(oid) = ObjectId::parse_str(id) else {
+        return false;
+    };
+    User::find_by_id(&get_db(), oid)
+        .await
+        .ok()
+        .flatten()
+        .map(|user| user_is_panel_admin(&user))
+        .unwrap_or(false)
+}
+
+/// Zachowane dla starszych wywołań — preferuj `user_is_panel_admin` / `is_panel_admin_user_id`.
+pub fn is_admin_user_id(user_id: &str) -> bool {
+    let _ = user_id;
+    false
 }
 
 fn admin_secret() -> Option<String> {
@@ -216,7 +289,23 @@ async fn session_is_bound(req: &HttpRequest, token: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Konto panelu admina po pełnej walidacji sesji użytkownika (jwt + refresh + ADMIN_USER_IDS).
+/// Zalogowany użytkownik komunikatora (bez sprawdzania isAdmin).
+pub async fn resolve_chat_session_user(req: &HttpRequest) -> Option<User> {
+    let cookie = req.cookie("jwt")?;
+    let token = cookie.value().trim();
+    if token.is_empty() || token.len() > 1000 {
+        return None;
+    }
+
+    let refresh_token = req.cookie(REFRESH_COOKIE).map(|c| c.value().to_string());
+    if !session_is_bound(req, token).await {
+        return None;
+    }
+
+    user_from_jwt_with_refresh(token, refresh_token.as_deref()).await
+}
+
+/// Konto panelu admina po pełnej walidacji sesji użytkownika (jwt + refresh + isAdmin).
 pub async fn resolve_panel_admin_account(req: &HttpRequest) -> Option<User> {
     let cookie = req.cookie("jwt")?;
     let token = cookie.value().trim();
@@ -230,8 +319,7 @@ pub async fn resolve_panel_admin_account(req: &HttpRequest) -> Option<User> {
     }
 
     let user = user_from_jwt_with_refresh(token, refresh_token.as_deref()).await?;
-    let id = user.id.map(|oid| oid.to_hex())?;
-    if !is_admin_user_id(&id) {
+    if !user_is_panel_admin(&user) {
         return None;
     }
     Some(user)
@@ -270,6 +358,72 @@ pub fn admin_elevation_valid(req: &HttpRequest, user_id: &str) -> bool {
 
     claims.purpose == ADMIN_ELEVATION_PURPOSE
         && claims.user_id.eq_ignore_ascii_case(user_id)
+}
+
+const PANEL_HANDOFF_MAX_AGE_SECS: i64 = 90;
+const PANEL_HANDOFF_PURPOSE: &str = "panel_handoff";
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PanelHandoffClaims {
+    pub jwt: String,
+    #[serde(rename = "refreshToken")]
+    pub refresh_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub csrf: Option<String>,
+    #[serde(rename = "userId")]
+    pub user_id: String,
+    pub purpose: String,
+    pub exp: usize,
+}
+
+fn panel_handoff_decoding_key() -> Result<DecodingKey, String> {
+    crate::utils::auth::jwt_auth::jwt_decoding_key()
+}
+
+fn panel_handoff_encoding_key() -> Result<EncodingKey, String> {
+    let secret = crate::utils::auth::jwt_auth::jwt_secret()?;
+    Ok(EncodingKey::from_secret(secret.as_bytes()))
+}
+
+pub fn issue_panel_handoff_token(
+    user_id: &str,
+    jwt: &str,
+    refresh_token: &str,
+    csrf: Option<&str>,
+) -> Result<String, String> {
+    let encoding_key = panel_handoff_encoding_key()?;
+    let exp = (chrono::Utc::now().timestamp() + PANEL_HANDOFF_MAX_AGE_SECS) as usize;
+    let claims = PanelHandoffClaims {
+        jwt: jwt.to_string(),
+        refresh_token: refresh_token.to_string(),
+        csrf: csrf.map(str::to_string),
+        user_id: user_id.to_string(),
+        purpose: PANEL_HANDOFF_PURPOSE.to_string(),
+        exp,
+    };
+    encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &encoding_key,
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub fn redeem_panel_handoff_token(token: &str) -> Result<PanelHandoffClaims, String> {
+    let token = token.trim();
+    if token.is_empty() || token.len() > 8192 {
+        return Err("Invalid handoff token".to_string());
+    }
+    let key = panel_handoff_decoding_key()?;
+    let mut validation = hs256_validation();
+    validation.validate_exp = true;
+    let claims = decode::<PanelHandoffClaims>(&token, &key, &validation)
+        .map_err(|_| "Invalid or expired handoff token".to_string())?
+        .claims;
+    if claims.purpose != PANEL_HANDOFF_PURPOSE {
+        return Err("Invalid handoff token purpose".to_string());
+    }
+    Ok(claims)
 }
 
 pub async fn resolve_admin_user(req: &HttpRequest) -> Option<User> {
