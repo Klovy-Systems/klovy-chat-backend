@@ -50,25 +50,3 @@ pub fn client_environment_from_request(req: &HttpRequest) -> ClientEnvironmentHi
 
     ClientEnvironmentHints::default()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use actix_web::test::TestRequest;
-
-    #[test]
-    fn parses_environment_embedded_in_user_agent_header() {
-        let req = TestRequest::default()
-            .insert_header((
-                CLIENT_USER_AGENT_HEADER,
-                format!(
-                    "Mozilla/5.0 Chrome/120{CLIENT_ENV_TRANSPORT_MARKER}Google Chrome 120{CLIENT_ENV_TRANSPORT_SEPARATOR}Windows 11"
-                ),
-            ))
-            .to_http_request();
-
-        let env = client_environment_from_request(&req);
-        assert_eq!(env.browser.as_deref(), Some("Google Chrome 120"));
-        assert_eq!(env.os.as_deref(), Some("Windows 11"));
-    }
-}

@@ -1,5 +1,3 @@
-pub mod e2e_routes;
-pub mod admin_routes;
 pub mod auth_routes;
 pub mod channel_routes;
 pub mod contact_routes;
@@ -13,4 +11,3 @@ pub mod status_routes;
 pub mod sticker_routes;
 pub mod user_routes;
 pub mod voice_routes;
-pub mod whitelist_routes;

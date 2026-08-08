@@ -119,16 +119,6 @@ pub struct Message {
 
     #[serde(rename = "updatedAt")]
     pub updated_at: DateTime,
-
-    #[serde(
-        rename = "e2eEncrypted",
-        default,
-        deserialize_with = "super::user_model::deserialize_bool_default_false"
-    )]
-    pub e2e_encrypted: bool,
-
-    #[serde(rename = "e2eVersion", skip_serializing_if = "Option::is_none")]
-    pub e2e_version: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -136,7 +126,6 @@ pub enum MessageValidationError {
     ContentRequired,
     ContentTooLong,
     FileUrlRequired,
-    PlaintextNotAllowed,
 }
 
 impl std::fmt::Display for MessageValidationError {
@@ -145,7 +134,6 @@ impl std::fmt::Display for MessageValidationError {
             Self::ContentRequired => "Treść wiadomości jest wymagana",
             Self::ContentTooLong  => "Wiadomość nie może przekraczać 2000 znaków",
             Self::FileUrlRequired => "URL pliku jest wymagany dla wiadomości typu FILE, IMAGE, VIDEO lub AUDIO",
-            Self::PlaintextNotAllowed => "Treść wiadomości musi być zaszyfrowana",
         };
         write!(f, "{}", msg)
     }
@@ -167,8 +155,6 @@ pub struct CreateMessageInput {
     pub quoted_message: Option<ObjectId>,
     pub mentions: Option<Vec<ObjectId>>,
     pub mentions_everyone: Option<bool>,
-    pub e2e_encrypted: Option<bool>,
-    pub e2e_version: Option<u8>,
 }
 
 /// Maksymalna długość treści wiadomości (znaki). Wspólny limit dla tworzenia i edycji.
@@ -181,14 +167,6 @@ pub fn is_message_content_within_limit(content: &str) -> bool {
 
 pub fn validate_message(input: &CreateMessageInput) -> Result<(), MessageValidationError> {
     let msg_type = input.message_type.as_ref().unwrap_or(&MessageType::Text);
-    let e2e = input.e2e_encrypted.unwrap_or(false);
-
-    if e2e {
-        if !crate::utils::e2e::is_valid_e2e_ciphertext(&input.content) {
-            return Err(MessageValidationError::ContentRequired);
-        }
-        return Ok(());
-    }
 
     // Call log entries are system-generated: no file, content acts as a label.
     if *msg_type == MessageType::Call {
@@ -254,10 +232,8 @@ impl Message {
     ) -> Result<Message, Box<dyn std::error::Error>> {
         validate_message(&input)?;
 
-        let e2e_encrypted = input.e2e_encrypted.unwrap_or(false);
         let stored_content = crate::utils::messages::content_storage::prepare_content_for_storage(
             input.content.trim(),
-            e2e_encrypted,
         )
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
@@ -290,8 +266,6 @@ impl Message {
             pinned_by: None,
             created_at: now,
             updated_at: now,
-            e2e_encrypted,
-            e2e_version: input.e2e_version,
         };
 
         let result = Self::collection(db).insert_one(&msg).await?;

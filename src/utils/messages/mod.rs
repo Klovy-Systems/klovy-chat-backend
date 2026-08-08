@@ -65,7 +65,6 @@ fn reactions_to_json(msg: &Message) -> Value {
 fn message_content_for_api(msg: &Message) -> String {
     crate::utils::messages::content_storage::content_for_api(
         &msg.content,
-        msg.e2e_encrypted,
     )
 }
 
@@ -133,8 +132,6 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
         "pinnedBy": pinned_by,
         "createdAt": iso(&msg.created_at),
         "updatedAt": iso(&msg.updated_at),
-        "e2eEncrypted": msg.e2e_encrypted,
-        "e2eVersion": msg.e2e_version,
     })
 }
 
@@ -225,8 +222,6 @@ fn serialize_message_cached(
         "pinnedBy": pinned_by,
         "createdAt": iso(&msg.created_at),
         "updatedAt": iso(&msg.updated_at),
-        "e2eEncrypted": msg.e2e_encrypted,
-        "e2eVersion": msg.e2e_version,
     })
 }
 
@@ -370,76 +365,4 @@ pub async fn can_access_channel_messages(
     channel_id: &str,
 ) -> Option<Channel> {
     require_channel_access(db, channel_id, user_id).await.ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::messages_model::MessageType;
-    use mongodb::bson::DateTime;
-    use std::collections::HashMap;
-
-    fn sample_dm_message(sender: ObjectId, recipient: ObjectId) -> Message {
-        let now = DateTime::now();
-        Message {
-            id: Some(ObjectId::new()),
-            sender,
-            recipient: Some(recipient),
-            channel: None,
-            content: "hello".to_string(),
-            message_type: MessageType::Text,
-            file_url: None,
-            file_type: None,
-            file_size: None,
-            file_name: None,
-            duration_ms: None,
-            timestamp: now,
-            read: false,
-            read_by: Vec::new(),
-            reactions: HashMap::new(),
-            quoted_message: None,
-            mentions: Vec::new(),
-            mentions_everyone: false,
-            edited: false,
-            edited_at: None,
-            deleted: false,
-            deleted_at: None,
-            pinned: false,
-            pinned_at: None,
-            pinned_by: None,
-            created_at: now,
-            updated_at: now,
-            e2e_encrypted: false,
-            e2e_version: None,
-        }
-    }
-
-    #[test]
-    fn message_belongs_to_dm_conversation_accepts_both_directions() {
-        let user = ObjectId::new();
-        let contact = ObjectId::new();
-        let outbound = sample_dm_message(user, contact);
-        let inbound = sample_dm_message(contact, user);
-
-        assert!(message_belongs_to_dm_conversation(&outbound, user, contact));
-        assert!(message_belongs_to_dm_conversation(&inbound, user, contact));
-    }
-
-    #[test]
-    fn message_belongs_to_dm_conversation_rejects_foreign_or_channel_messages() {
-        let user = ObjectId::new();
-        let contact = ObjectId::new();
-        let stranger = ObjectId::new();
-
-        let foreign = sample_dm_message(user, stranger);
-        assert!(!message_belongs_to_dm_conversation(&foreign, user, contact));
-
-        let mut channel_msg = sample_dm_message(user, contact);
-        channel_msg.channel = Some(ObjectId::new());
-        assert!(!message_belongs_to_dm_conversation(&channel_msg, user, contact));
-
-        let mut deleted = sample_dm_message(user, contact);
-        deleted.deleted = true;
-        assert!(!message_belongs_to_dm_conversation(&deleted, user, contact));
-    }
 }

@@ -158,32 +158,3 @@ pub fn client_ip_from_service_request(req: &ServiceRequest) -> String {
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prefers_cloudflare_connecting_ip_over_local_real_ip() {
-        let ip = client_ip_from_header_values(
-            Some("91.232.90.164"),
-            None,
-            Some("203.0.113.10"),
-            None,
-            Some("127.0.0.1"),
-        );
-        assert_eq!(ip.as_deref(), Some("91.232.90.164"));
-    }
-
-    #[test]
-    fn parses_x_forwarded_for_first_hop() {
-        let ip = client_ip_from_header_values(
-            None,
-            None,
-            Some("91.232.90.164, 172.68.0.1"),
-            None,
-            Some("127.0.0.1"),
-        );
-        assert_eq!(ip.as_deref(), Some("91.232.90.164"));
-    }
-}

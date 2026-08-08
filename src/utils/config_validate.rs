@@ -1,7 +1,6 @@
 use std::env;
 
 use crate::utils::app_env::{is_production, node_env};
-use crate::utils::auth::admin_session::admin_ip_allowlist_configured;
 use crate::utils::auth::jwt_auth::jwt_secret;
 use crate::utils::whitelist::is_whitelist_enabled;
 use crate::utils::registration::{
@@ -72,25 +71,11 @@ pub fn validate_startup_config() {
         if turnstile.trim().is_empty() {
             panic!("TURNSTILE_SECRET_KEY must be set in production");
         }
-        let admin_secret = env::var("ADMIN_SECRET").unwrap_or_default();
-        if admin_secret.trim().len() < 16 {
-            panic!("ADMIN_SECRET must be at least 16 characters in production");
-        }
-
-        let root_ids = env::var("ROOT_USER_IDS")
-            .or_else(|_| env::var("ROOT_USER_ID"))
-            .unwrap_or_default();
-        if root_ids.trim().is_empty() {
+        let report_secret = env::var("SECURITY_REPORT_SECRET").unwrap_or_default();
+        if report_secret.trim().len() < 16 {
             log::warn!(
-                "ROOT_USER_IDS is not set — no bootstrap root. Set comma-separated MongoDB user \
-                 ObjectIds so a root can assign panel roles (admin, moderator, support) at dash.klovy.chat"
-            );
-        }
-
-        if !admin_ip_allowlist_configured() {
-            log::warn!(
-                "ADMIN_ALLOWED_IPS is not set — the admin panel accepts requests from any IP. \
-                 Set comma-separated IPs or CIDR ranges (e.g. ADMIN_ALLOWED_IPS=203.0.113.10,198.51.100.0/24)"
+                "SECURITY_REPORT_SECRET is not set or too short (min 16 chars) — \
+                 the /api/security/report endpoint will be disabled"
             );
         }
 

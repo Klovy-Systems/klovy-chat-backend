@@ -8,13 +8,12 @@ use actix_web_lab::middleware::from_fn;
 use std::env;
 
 use crate::routes::{
-    admin_routes, auth_routes, channel_routes, contact_routes, e2e_routes, emoji_routes,
+    auth_routes, channel_routes, contact_routes, emoji_routes,
     friend_routes, gif_routes, integration_routes, invite_routes, message_routes, status_routes,
-    sticker_routes, user_routes, voice_routes, whitelist_routes,
+    sticker_routes, user_routes, voice_routes,
 };
 
 use crate::middlewares::{
-    admin_auth_middleware::check_admin_ip_allowlist,
     client_guard::client_guard_middleware,
     csrf::csrf_middleware,
     internal_proxy_guard::{internal_proxy_guard, internal_proxy_secret, INTERNAL_PROXY_HEADER},
@@ -181,11 +180,11 @@ pub async fn security_report_handler(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
-    let admin_secret = env::var("ADMIN_SECRET").unwrap_or_default();
-    if admin_secret.trim().is_empty() {
+    let secret = env::var("SECURITY_REPORT_SECRET").unwrap_or_default();
+    if secret.trim().is_empty() {
         return HttpResponse::NotFound().json(serde_json::json!({ "error": "Not found" }));
     }
-    let expected = format!("Bearer {}", admin_secret);
+    let expected = format!("Bearer {}", secret);
 
     match auth_header {
         Some(h) if constant_time_eq_str(h, &expected) => {
@@ -249,23 +248,6 @@ pub fn create_app(
                 .configure(auth_routes::configure),
         )
         .service(
-            web::scope("/api/admin")
-                .wrap(from_fn(check_admin_ip_allowlist))
-                .configure(admin_routes::configure),
-        )
-        .service(
-            web::scope("/whitelist")
-                .wrap(from_fn(check_admin_ip_allowlist))
-                .wrap(from_fn(auth_rate_limiter))
-                .configure(whitelist_routes::configure),
-        )
-        .service(
-            web::scope("/api/whitelist")
-                .wrap(from_fn(check_admin_ip_allowlist))
-                .wrap(from_fn(auth_rate_limiter))
-                .configure(whitelist_routes::configure),
-        )
-        .service(
             web::scope("/api/channel")
                 .wrap(from_fn(send_limiter))
                 .wrap(from_fn(whitelist_check))
@@ -298,11 +280,6 @@ pub fn create_app(
                 .wrap(from_fn(send_limiter))
                 .wrap(from_fn(whitelist_check))
                 .configure(message_routes::configure),
-        )
-        .service(
-            web::scope("/api/e2e")
-                .wrap(from_fn(whitelist_check))
-                .configure(e2e_routes::configure),
         )
         .service(
             web::scope("/api/friends")

@@ -1,8 +1,6 @@
 use serde_json::{json, Value};
 
 use crate::model::user_model::{AvailabilityStatus, ConnectedAccount, User};
-use crate::utils::auth::admin_session::user_is_panel_admin;
-use crate::utils::auth::panel_permissions::panel_role_label;
 use crate::utils::listening::serialize::listening_for_viewer;
 
 pub const BIO_MAX_LENGTH: usize = 500;
@@ -81,11 +79,6 @@ pub fn serialize_user_for_viewer(
 
     if is_self {
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert("isPanelAdmin".to_string(), json!(user_is_panel_admin(user)));
-            obj.insert(
-                "panelRole".to_string(),
-                json!(panel_role_label(user)),
-            );
             obj.insert("shareListening".to_string(), json!(user.share_listening));
             obj.insert("language".to_string(), json!(user.language));
             obj.insert("isDisabled".to_string(), json!(user.is_disabled));
@@ -93,7 +86,6 @@ pub fn serialize_user_for_viewer(
                 "deletionScheduledAt".to_string(),
                 json!(user.deletion_scheduled_at.as_ref().and_then(iso)),
             );
-            obj.insert("e2eEnabled".to_string(), json!(user.e2e_enabled));
             if let Some(listening) = listening_for_viewer(user, true) {
                 obj.insert("listeningActivity".to_string(), listening);
             }

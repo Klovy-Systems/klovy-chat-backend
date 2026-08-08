@@ -1,5 +1,3 @@
-pub mod e2e_controller;
-pub mod admin_controller;
 pub mod announcement_controller;
 pub mod api_info_controller;
 pub mod auth_controller;
@@ -15,4 +13,3 @@ pub mod status_controller;
 pub mod sticker_controller;
 pub mod user_controller;
 pub mod voice_controller;
-pub mod whitelist_controller;

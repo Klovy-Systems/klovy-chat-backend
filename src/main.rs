@@ -3,7 +3,7 @@ use klovy_chat_server::utils::app_env::is_production;
 use klovy_chat_server::model::{
     announcement_model::Announcement, audit_log_model::AuditLog, channel_model::Channel,
     channel_read_state_model::ChannelReadState, channel_report_model::ChannelReport,
-    e2e_keys_model::E2eKeyBundle, friend_request_model::FriendRequest, invite_model::Invite,
+    friend_request_model::FriendRequest, invite_model::Invite,
     messages_model::Message, oauth_token_model::OauthToken, pending_upload_model::PendingUpload,
     push_token_model::PushToken, refresh_token_model::RefreshToken, user_model::User, user_storage_usage_model::UserStorageUsage,
     warning_model::Warning,
@@ -24,11 +24,6 @@ async fn main() -> std::io::Result<()> {
         .expect("Failed to connect to MongoDB");
 
     db::sync_user_indexes().await.ok();
-    if let Ok(count) = User::migrate_legacy_is_admin(&db::get_db()).await {
-        if count > 0 {
-            log::info!("Migrated {count} legacy isAdmin users to role=admin");
-        }
-    }
 
     klovy_chat_server::utils::config_validate::validate_startup_config();
 
@@ -58,10 +53,27 @@ async fn main() -> std::io::Result<()> {
         _ => {}
     }
 
-    match klovy_chat_server::utils::admin::reconcile_whitelist_fields(&mongodb_db).await {
-        Ok((legacy, admins)) if legacy > 0 || admins > 0 => {
+    match klovy_chat_server::utils::admin::purge_removed_schema_fields(&mongodb_db).await {
+        Ok(report)
+            if report.users_modified > 0
+                || report.messages_modified > 0
+                || report.e2e_keys_dropped =>
+        {
             log::info!(
-                "Startup whitelist reconcile: approved {legacy} legacy account(s), {admins} admin account(s)"
+                "Startup schema purge: unset fields on {} user(s), {} message(s); e2e_keys dropped={}",
+                report.users_modified,
+                report.messages_modified,
+                report.e2e_keys_dropped
+            );
+        }
+        Err(e) => log::warn!("Startup schema purge failed: {e}"),
+        _ => {}
+    }
+
+    match klovy_chat_server::utils::admin::reconcile_whitelist_fields(&mongodb_db).await {
+        Ok(legacy) if legacy > 0 => {
+            log::info!(
+                "Startup whitelist reconcile: approved {legacy} legacy account(s)"
             );
         }
         Err(e) => log::warn!("Startup whitelist reconcile failed: {e}"),
@@ -154,12 +166,11 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn ensure_indexes(db: &mongodb::Database) {
-    let tasks: [(&str, mongodb::error::Result<()>); 17] = [
+    let tasks: [(&str, mongodb::error::Result<()>); 16] = [
         ("users", User::create_indexes(db).await),
         ("signup_quotas", klovy_chat_server::utils::registration::create_indexes(db).await),
         ("channels", Channel::create_indexes(db).await),
         ("messages", Message::create_indexes(db).await),
-        ("e2e_keys", E2eKeyBundle::create_indexes(db).await),
         ("friend_requests", FriendRequest::create_indexes(db).await),
         ("invites", Invite::create_indexes(db).await),
         ("channel_read_states", ChannelReadState::create_indexes(db).await),

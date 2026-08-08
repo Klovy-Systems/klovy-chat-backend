@@ -96,7 +96,7 @@ async fn main() {
     log::info!("  scanned: {}", report.scanned);
     log::info!("  migrated: {}", report.migrated);
     log::info!("  skipped (already sealed): {}", report.skipped_already_sealed);
-    log::info!("  skipped (e2e / signal-like): {}", report.skipped_e2e);
+    log::info!("  skipped (not needed): {}", report.skipped_not_needed);
     log::info!("  skipped (empty): {}", report.skipped_empty);
     log::info!("  skipped (unchanged): {}", report.skipped_unchanged);
     log::info!(

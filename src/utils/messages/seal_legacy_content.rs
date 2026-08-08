@@ -3,17 +3,16 @@ use mongodb::bson::{doc, DateTime};
 use mongodb::Database;
 
 use crate::model::messages_model::Message;
-use crate::utils::e2e::{is_valid_e2e_ciphertext, rejects_plaintext_storage};
 use crate::utils::messages::content_storage::{
     inbound_plaintext_for_processing, is_client_opaque, is_content_server_sealed,
-    prepare_content_for_storage, reveal_content_internal, unwrap_client_opaque,
+    prepare_content_for_storage, reveal_content_internal,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MigrateContentSealReport {
     pub scanned: u64,
     pub skipped_already_sealed: u64,
-    pub skipped_e2e: u64,
+    pub skipped_not_needed: u64,
     pub skipped_empty: u64,
     pub skipped_unchanged: u64,
     pub skipped_concurrent_update: u64,
@@ -38,41 +37,31 @@ impl Default for MigrateContentSealOptions {
     }
 }
 
-/// Whether a non-E2E message body should be sealed in MongoDB.
-pub fn message_content_needs_seal_migration(stored: &str, e2e_encrypted: bool) -> bool {
-    if e2e_encrypted || stored.trim().is_empty() {
+/// Whether a message body should be sealed in MongoDB.
+pub fn message_content_needs_seal_migration(stored: &str) -> bool {
+    if stored.trim().is_empty() {
         return false;
     }
     if is_content_server_sealed(stored) {
         return false;
     }
     if is_client_opaque(stored) {
-        if is_valid_e2e_ciphertext(stored) && !rejects_plaintext_storage(stored) {
-            let inner = unwrap_client_opaque(stored);
-            // Signal blobs can decode as UTF-8 control bytes — do not re-seal those.
-            if inner.chars().any(|c| c.is_control() && !c.is_whitespace()) {
-                return false;
-            }
-        }
         return true;
-    } else if is_valid_e2e_ciphertext(stored) && !rejects_plaintext_storage(stored) {
-        return false;
     }
-    !is_valid_e2e_ciphertext(stored) || rejects_plaintext_storage(stored)
+    true
 }
 
 /// Seal legacy plaintext / client-opaque content for DB storage. Returns `None` when unchanged.
 pub fn seal_legacy_message_content(
     stored: &str,
-    e2e_encrypted: bool,
 ) -> Result<Option<String>, String> {
-    if !message_content_needs_seal_migration(stored, e2e_encrypted) {
+    if !message_content_needs_seal_migration(stored) {
         return Ok(None);
     }
 
     let before = inbound_plaintext_for_processing(stored, false);
-    let sealed = prepare_content_for_storage(stored, false)?;
-    let after = reveal_content_internal(&sealed, false);
+    let sealed = prepare_content_for_storage(stored)?;
+    let after = reveal_content_internal(&sealed);
     if before != after {
         return Err("content roundtrip mismatch after seal".to_string());
     }
@@ -88,15 +77,7 @@ pub async fn migrate_message_content_seal(
 ) -> Result<MigrateContentSealReport, mongodb::error::Error> {
     let mut report = MigrateContentSealReport::default();
     let filter = doc! {
-        "$and": [
-            {
-                "$or": [
-                    { "e2eEncrypted": { "$exists": false } },
-                    { "e2eEncrypted": false },
-                ]
-            },
-            { "content": { "$exists": true, "$type": "string", "$ne": "" } },
-        ]
+        "content": { "$exists": true, "$type": "string", "$ne": "" },
     };
 
     let batch_size = options.batch_size.max(1) as u64;
@@ -119,11 +100,6 @@ pub async fn migrate_message_content_seal(
             continue;
         };
 
-        if msg.e2e_encrypted {
-            report.skipped_e2e += 1;
-            continue;
-        }
-
         if msg.content.trim().is_empty() {
             report.skipped_empty += 1;
             continue;
@@ -134,13 +110,13 @@ pub async fn migrate_message_content_seal(
             continue;
         }
 
-        if !message_content_needs_seal_migration(&msg.content, false) {
-            report.skipped_e2e += 1;
+        if !message_content_needs_seal_migration(&msg.content) {
+            report.skipped_not_needed += 1;
             continue;
         }
 
         let original = msg.content.clone();
-        let sealed = match seal_legacy_message_content(&original, false) {
+        let sealed = match seal_legacy_message_content(&original) {
             Ok(Some(value)) => value,
             Ok(None) => {
                 report.skipped_unchanged += 1;
@@ -190,108 +166,4 @@ pub async fn migrate_message_content_seal(
     }
 
     Ok(report)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use base64::Engine;
-
-    use super::*;
-
-    static TEST_KEY: Mutex<()> = Mutex::new(());
-
-    fn with_test_key<F: FnOnce()>(f: F) {
-        let _guard = TEST_KEY.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("JWT_KEY", "test-jwt-key-seal-legacy-migration-suite");
-        f();
-    }
-
-    #[test]
-    fn migrates_legacy_plaintext() {
-        assert!(message_content_needs_seal_migration("cześć", false));
-    }
-
-    #[test]
-    fn skips_already_sealed() {
-        with_test_key(|| {
-            let stored =
-                prepare_content_for_storage("hello", false).expect("seal");
-            assert!(!message_content_needs_seal_migration(&stored, false));
-        });
-    }
-
-    #[test]
-    fn skips_e2e_flagged() {
-        assert!(!message_content_needs_seal_migration("anything", true));
-    }
-
-    #[test]
-    fn skips_signal_like_without_flag() {
-        let fake_signal_blob = base64::engine::general_purpose::STANDARD.encode([0x08_u8; 64]);
-        assert!(!message_content_needs_seal_migration(&fake_signal_blob, false));
-    }
-
-    #[test]
-    fn migrates_client_opaque_not_sealed() {
-        let opaque = crate::utils::messages::content_storage::wrap_client_opaque("witaj");
-        assert!(message_content_needs_seal_migration(&opaque, false));
-    }
-
-    #[test]
-    fn migrates_long_client_opaque_chat_text() {
-        let long_text = "A".repeat(120);
-        let opaque = crate::utils::messages::content_storage::wrap_client_opaque(&long_text);
-        assert!(message_content_needs_seal_migration(&opaque, false));
-    }
-
-    #[test]
-    fn migrates_emoji_client_opaque() {
-        let opaque =
-            crate::utils::messages::content_storage::wrap_client_opaque("👍🎉🔥💯✨");
-        assert!(message_content_needs_seal_migration(&opaque, false));
-    }
-
-    #[test]
-    fn migration_preserves_api_opaque_for_legacy_plaintext() {
-        with_test_key(|| {
-            let plain = "cześć, jak leci?";
-            let api_before = crate::utils::messages::content_storage::content_for_api(plain, false);
-            let sealed = seal_legacy_message_content(plain, false)
-                .expect("ok")
-                .expect("some");
-            let api_after =
-                crate::utils::messages::content_storage::content_for_api(&sealed, false);
-            assert_eq!(api_before, api_after);
-            assert_ne!(api_after, plain);
-        });
-    }
-
-    #[test]
-    fn post_deploy_sealed_messages_are_skipped() {
-        with_test_key(|| {
-            let opaque =
-                crate::utils::messages::content_storage::wrap_client_opaque("nowa wiadomość");
-            let stored =
-                prepare_content_for_storage(&opaque, false).expect("store like live server");
-            assert!(!message_content_needs_seal_migration(&stored, false));
-            assert!(seal_legacy_message_content(&stored, false)
-                .expect("ok")
-                .is_none());
-        });
-    }
-
-    #[test]
-    fn seal_roundtrip_preserves_plaintext() {
-        with_test_key(|| {
-            let sealed = seal_legacy_message_content("test wiadomość", false)
-                .expect("ok")
-                .expect("some");
-            assert_eq!(
-                reveal_content_internal(&sealed, false),
-                "test wiadomość"
-            );
-        });
-    }
 }

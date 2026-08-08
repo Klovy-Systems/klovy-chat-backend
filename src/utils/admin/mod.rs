@@ -12,18 +12,16 @@ use crate::model::pending_upload_model::PendingUpload;
 use crate::model::refresh_token_model::RefreshToken;
 use crate::model::user_model::User;
 use crate::model::warning_model::Warning;
-use crate::utils::auth::admin_session::get_admin_user_ids;
 use crate::utils::storage::{avatar_key_owned_by_channel, storage};
 use crate::utils::whitelist::is_whitelist_enabled;
 use crate::ws::registry::disconnect_user;
 
 pub const DELETION_GRACE_DAYS: i64 = 7;
 
-/// Naprawia konta oznaczone do usunięcia starszą wersją API, która zapisywała `isDisabled: null`.
-/// Przy włączonej whitelistcie: zatwierdza konta sprzed wprowadzenia pola oraz operatorów panelu admina.
-pub async fn reconcile_whitelist_fields(db: &Database) -> Result<(u64, u64), mongodb::error::Error> {
+/// Przy włączonej whitelistcie: zatwierdza konta sprzed wprowadzenia pola isWhitelisted.
+pub async fn reconcile_whitelist_fields(db: &Database) -> Result<u64, mongodb::error::Error> {
     if !is_whitelist_enabled() {
-        return Ok((0, 0));
+        return Ok(0);
     }
 
     let legacy = User::collection(db)
@@ -33,21 +31,7 @@ pub async fn reconcile_whitelist_fields(db: &Database) -> Result<(u64, u64), mon
         )
         .await?;
 
-    let mut admins = 0u64;
-    for admin_id in get_admin_user_ids() {
-        let Ok(oid) = ObjectId::parse_str(&admin_id) else {
-            continue;
-        };
-        let result = User::collection(db)
-            .update_one(
-                doc! { "_id": oid, "isWhitelisted": false },
-                doc! { "$set": { "isWhitelisted": true } },
-            )
-            .await?;
-        admins += result.modified_count;
-    }
-
-    Ok((legacy.modified_count, admins))
+    Ok(legacy.modified_count)
 }
 
 pub async fn repair_broken_account_status_fields(db: &Database) -> Result<u64, mongodb::error::Error> {
@@ -61,6 +45,72 @@ pub async fn repair_broken_account_status_fields(db: &Database) -> Result<u64, m
         )
         .await?;
     Ok(result.modified_count)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PurgeRemovedSchemaReport {
+    pub users_modified: u64,
+    pub messages_modified: u64,
+    pub e2e_keys_dropped: bool,
+}
+
+/// Strip obsolete E2E / panel-admin fields left in Mongo after those features were removed.
+pub async fn purge_removed_schema_fields(
+    db: &Database,
+) -> Result<PurgeRemovedSchemaReport, mongodb::error::Error> {
+    let mut report = PurgeRemovedSchemaReport::default();
+
+    let users = User::collection(db)
+        .update_many(
+            doc! {
+                "$or": [
+                    { "e2eEnabled": { "$exists": true } },
+                    { "role": { "$exists": true } },
+                    { "isAdmin": { "$exists": true } },
+                ]
+            },
+            doc! {
+                "$unset": {
+                    "e2eEnabled": "",
+                    "role": "",
+                    "isAdmin": "",
+                }
+            },
+        )
+        .await?;
+    report.users_modified = users.modified_count;
+
+    let messages = Message::collection(db)
+        .update_many(
+            doc! {
+                "$or": [
+                    { "e2eEncrypted": { "$exists": true } },
+                    { "e2eVersion": { "$exists": true } },
+                ]
+            },
+            doc! {
+                "$unset": {
+                    "e2eEncrypted": "",
+                    "e2eVersion": "",
+                }
+            },
+        )
+        .await?;
+    report.messages_modified = messages.modified_count;
+
+    let e2e_keys = db.collection::<mongodb::bson::Document>("e2e_keys");
+    match e2e_keys.drop().await {
+        Ok(()) => report.e2e_keys_dropped = true,
+        Err(e) => {
+            // NamespaceNotFound is fine when the collection was never created / already gone.
+            let msg = e.to_string();
+            if !msg.contains("NamespaceNotFound") && !msg.contains("ns not found") {
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(report)
 }
 
 async fn delete_message_attachment(storage: &crate::utils::storage::R2Storage, path: &str) {

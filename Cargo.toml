@@ -15,10 +15,6 @@ name = "klovy-chat-server"
 path = "src/main.rs"
 
 [[bin]]
-name = "hash-admin-password"
-path = "src/bin/hash_admin_password.rs"
-
-[[bin]]
 name = "oauth-diag"
 path = "src/bin/oauth_diag.rs"
 

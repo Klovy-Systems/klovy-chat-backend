@@ -204,7 +204,6 @@ async fn dm_last_message(
         msg.timestamp,
         crate::utils::messages::content_storage::content_for_api(
             &msg.content,
-            msg.e2e_encrypted,
         ),
     ))
 }

@@ -40,16 +40,17 @@ pub fn get_db() -> Database {
         .clone()
 }
 
-pub async fn sync_user_indexes() -> mongodb::error::Result<()> {
-    const STALE_USER_INDEXES: &[&str] = &["email_1"];
-
+async fn drop_stale_indexes(
+    collection_name: &str,
+    stale: &[&str],
+) -> mongodb::error::Result<()> {
     let db = get_db();
-    let collection = db.collection::<mongodb::bson::Document>("users");
+    let collection = db.collection::<mongodb::bson::Document>(collection_name);
 
     let mut cursor = match collection.list_indexes().await {
         Ok(c) => c,
         Err(_) => {
-            log::info!("Users collection does not exist yet — skipping index cleanup");
+            log::info!("{collection_name} collection does not exist yet — skipping index cleanup");
             return Ok(());
         }
     };
@@ -64,15 +65,25 @@ pub async fn sync_user_indexes() -> mongodb::error::Result<()> {
         }
     }
 
-    for stale in STALE_USER_INDEXES {
-        if existing.iter().any(|n| n == stale) {
-            if let Err(e) = collection.drop_index((*stale).to_string()).await {
-                log::error!("Error dropping stale index {}: {}", stale, e);
+    for name in stale {
+        if existing.iter().any(|n| n == name) {
+            if let Err(e) = collection.drop_index((*name).to_string()).await {
+                log::error!("Error dropping stale {collection_name} index {name}: {e}");
             } else {
-                log::info!("Dropped stale users index: {}", stale);
+                log::info!("Dropped stale {collection_name} index: {name}");
             }
         }
     }
 
+    Ok(())
+}
+
+pub async fn sync_user_indexes() -> mongodb::error::Result<()> {
+    drop_stale_indexes("users", &["email_1", "role_1", "e2eEnabled_1"]).await?;
+    drop_stale_indexes(
+        "messages",
+        &["e2eEncrypted_1", "e2eVersion_1", "e2eEncrypted_1_e2eVersion_1"],
+    )
+    .await?;
     Ok(())
 }

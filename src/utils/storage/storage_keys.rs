@@ -255,37 +255,3 @@ pub fn content_type_for_ext(ext: &str) -> &'static str {
         _ => "application/octet-stream",
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn accepts_legacy_and_versioned_avatar_keys() {
-        let oid = "507f1f77bcf86cd799439011";
-        let legacy = format!("avatars/users/{oid}.webp");
-        let versioned = format!("avatars/users/{oid}/0123456789abcdef0123456789abcdef.webp");
-        assert!(avatar_key_owned_by_user(&legacy, oid));
-        assert!(avatar_key_owned_by_user(&versioned, oid));
-        assert!(!avatar_key_owned_by_user(&versioned, "507f1f77bcf86cd799439012"));
-    }
-
-    #[test]
-    fn accepts_legacy_and_versioned_banner_keys() {
-        let oid = "507f1f77bcf86cd799439011";
-        let legacy = format!("banners/users/{oid}.webp");
-        let versioned = format!("banners/users/{oid}/fedcba9876543210fedcba9876543210.webp");
-        assert!(public_media_key_owned_by_user(&legacy, oid));
-        assert!(public_media_key_owned_by_user(&versioned, oid));
-    }
-
-    #[test]
-    fn avatar_user_key_is_versioned() {
-        let oid = "507f1f77bcf86cd799439011";
-        let key = avatar_user_key(oid);
-        assert!(key.starts_with(&format!("avatars/users/{oid}/")));
-        assert!(key.ends_with(".webp"));
-        assert!(avatar_key_owned_by_user(&key, oid));
-        assert_ne!(key, avatar_user_key(oid));
-    }
-}

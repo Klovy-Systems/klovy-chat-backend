@@ -23,9 +23,6 @@ use crate::utils::voice::call_sessions::{
 use crate::utils::voice::channel_voice::{
     join_channel_voice, leave_channel_voice, participants_in_channel,
 };
-use crate::utils::e2e::message_content::prepare_inbound_content;
-use crate::utils::e2e::E2E_VERSION_CHANNEL;
-use crate::utils::e2e::E2E_VERSION_DM;
 use crate::utils::messages::access::{
     can_mark_message_as_read, can_react_to_message, claim_pending_upload,
     cleanup_attachment_if_unreferenced, validate_message_attachment, AttachmentSendContext,
@@ -33,6 +30,7 @@ use crate::utils::messages::access::{
 };
 use crate::utils::messages::mentions::{has_everyone_mention, resolve_mentions};
 use crate::utils::messages::{dm_only_or_clause, serialize_message};
+use crate::utils::messages::content_storage::inbound_plaintext_for_processing;
 use crate::utils::unread::{
     emit_channel_unread_updated, emit_dm_unread_updated, mark_channel_as_read_for_user,
 };
@@ -180,8 +178,6 @@ struct SendMessagePayload {
     file_name: Option<String>,
     duration_ms: Option<u32>,
     quoted_message: Option<String>,
-    e2e_encrypted: Option<bool>,
-    e2e_version: Option<u8>,
 }
 
 async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
@@ -257,46 +253,23 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
     };
 
     let msg_type = parse_message_type(payload.message_type.as_deref().unwrap_or("TEXT"));
-    let e2e_encrypted = payload.e2e_encrypted.unwrap_or(false);
-    let prepared = match prepare_inbound_content(
-        payload.content.as_deref(),
-        e2e_encrypted,
-        payload.e2e_version.or(if e2e_encrypted {
-            Some(E2E_VERSION_DM)
-        } else {
-            None
-        }),
-    ) {
-        Ok(p) => p,
-        Err(code) => {
-            registry::emit_to_user(
-                &payload.sender,
-                "dm-error",
-                json!({
-                    "code": code,
-                    "message": "Invalid encrypted message payload.",
-                }),
-            );
-            return;
-        }
-    };
+    let content = crate::utils::validators::sanitize_input::sanitize_message_content(
+        payload.content.as_deref().unwrap_or(""),
+    );
+    let content = inbound_plaintext_for_processing(&content, false);
 
-    let mentions = if prepared.skip_mentions {
-        vec![]
-    } else {
-        resolve_mentions(
-            &db,
-            &prepared.content,
-            &[payload.sender.clone(), payload.recipient.clone()],
-        )
-        .await
-    };
+    let mentions = resolve_mentions(
+        &db,
+        &content,
+        &[payload.sender.clone(), payload.recipient.clone()],
+    )
+    .await;
 
     let input = CreateMessageInput {
         sender,
         recipient: Some(recipient),
         channel: None,
-        content: prepared.content,
+        content,
         message_type: Some(msg_type),
         file_url: payload.file_url,
         file_type: payload.file_type,
@@ -306,8 +279,6 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         quoted_message: quoted,
         mentions: Some(mentions.clone()),
         mentions_everyone: Some(false),
-        e2e_encrypted: Some(prepared.e2e_encrypted),
-        e2e_version: prepared.e2e_version,
     };
 
     let created = match Message::create(&db, input).await {
@@ -330,7 +301,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
     registry::emit_to_user(&payload.recipient, "receiveMessage", populated.clone());
     registry::emit_to_user(&payload.sender, "receiveMessage", populated.clone());
 
-    if payload.sender != payload.recipient && !recipient_muted && !prepared.e2e_encrypted {
+    if payload.sender != payload.recipient && !recipient_muted {
         emit_dm_unread_updated(&db, &payload.recipient, &payload.sender).await;
         if mentions.iter().any(|m| m.to_hex() == payload.recipient) {
             emit_mention(
@@ -343,8 +314,6 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
                 created.content.as_str(),
             );
         }
-    } else if payload.sender != payload.recipient && !recipient_muted {
-        emit_dm_unread_updated(&db, &payload.recipient, &payload.sender).await;
     }
 
     if payload.sender != payload.recipient && !recipient_muted {
@@ -357,11 +326,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
             .and_then(|v| v.as_str())
             .unwrap_or("Klovy Chat")
             .to_string();
-        let body_preview = if prepared.e2e_encrypted {
-            "Nowa wiadomość".to_string()
-        } else {
-            created.content.clone()
-        };
+        let body_preview = created.content.clone();
         let db_for_push = get_db();
         tokio::spawn(async move {
             if registry::user_is_connected(&recipient_id).await {
@@ -401,8 +366,6 @@ struct ChannelMessagePayload {
     file_name: Option<String>,
     duration_ms: Option<u32>,
     quoted_message: Option<String>,
-    e2e_encrypted: Option<bool>,
-    e2e_version: Option<u8>,
 }
 
 async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePayload) {
@@ -516,12 +479,6 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
             file_name: payload.file_name,
             duration_ms: payload.duration_ms,
             quoted_message: quoted,
-            e2e_encrypted: payload.e2e_encrypted.unwrap_or(false),
-            e2e_version: payload.e2e_version.or(if payload.e2e_encrypted.unwrap_or(false) {
-                Some(E2E_VERSION_CHANNEL)
-            } else {
-                None
-            }),
         },
     )
     .await
@@ -531,8 +488,8 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
             connected,
             "error",
             json!({
-                "message": "Invalid encrypted message payload.",
-                "code": "INVALID_E2E_CIPHERTEXT",
+                "message": "Failed to send message.",
+                "code": "SEND_FAILED",
             }),
         );
     }
@@ -543,7 +500,7 @@ pub struct ChannelBroadcastInput {
     pub channel: Channel,
     pub channel_oid: ObjectId,
     pub sender: ObjectId,
-    /// Surowa treść — zostanie zsanityzowana wewnątrz funkcji (lub traktowana jako ciphertext).
+    /// Surowa treść — zostanie zsanityzowana wewnątrz funkcji.
     pub content: String,
     pub message_type: MessageType,
     pub file_url: Option<String>,
@@ -552,8 +509,6 @@ pub struct ChannelBroadcastInput {
     pub file_name: Option<String>,
     pub duration_ms: Option<u32>,
     pub quoted_message: Option<ObjectId>,
-    pub e2e_encrypted: bool,
-    pub e2e_version: Option<u8>,
 }
 
 /// Rdzeń tworzenia i rozgłaszania wiadomości kanałowej — współdzielony przez
@@ -576,8 +531,6 @@ pub async fn create_and_broadcast_channel_message(
         file_name,
         duration_ms,
         quoted_message,
-        e2e_encrypted,
-        e2e_version,
     } = input;
 
     let channel_id_str = channel_oid.to_hex();
@@ -586,35 +539,17 @@ pub async fn create_and_broadcast_channel_message(
     let mut member_ids: Vec<String> = channel.members.iter().map(|m| m.to_hex()).collect();
     member_ids.push(channel.admin.to_hex());
 
-    let prepared = match prepare_inbound_content(
-        Some(content.as_str()),
-        e2e_encrypted,
-        e2e_version.or(if e2e_encrypted {
-            Some(E2E_VERSION_CHANNEL)
-        } else {
-            None
-        }),
-    ) {
-        Ok(p) => p,
-        Err(_) => return None,
-    };
+    let sanitized = crate::utils::validators::sanitize_input::sanitize_message_content(&content);
+    let prepared_content = inbound_plaintext_for_processing(&sanitized, false);
 
-    let mentions = if prepared.skip_mentions {
-        vec![]
-    } else {
-        resolve_mentions(db, &prepared.content, &member_ids).await
-    };
-    let mentions_everyone = if prepared.skip_mentions {
-        false
-    } else {
-        has_everyone_mention(&prepared.content)
-    };
+    let mentions = resolve_mentions(db, &prepared_content, &member_ids).await;
+    let mentions_everyone = has_everyone_mention(&prepared_content);
 
     let create_input = CreateMessageInput {
         sender,
         recipient: None,
         channel: Some(channel_oid),
-        content: prepared.content,
+        content: prepared_content,
         message_type: Some(message_type),
         file_url,
         file_type,
@@ -624,8 +559,6 @@ pub async fn create_and_broadcast_channel_message(
         quoted_message,
         mentions: Some(mentions.clone()),
         mentions_everyone: Some(mentions_everyone),
-        e2e_encrypted: Some(prepared.e2e_encrypted),
-        e2e_version: prepared.e2e_version,
     };
 
     let created = match Message::create(db, create_input).await {
@@ -675,7 +608,7 @@ pub async fn create_and_broadcast_channel_message(
         registry::emit_to_user(&member_id, "receive-channel-message", populated.clone());
         if member_id != sender_hex && !muted_ids.contains(&member_id) {
             emit_channel_unread_updated(db, &member_id, &channel_id_str).await;
-            if !prepared.e2e_encrypted && (mentioned.contains(&member_id) || mentions_everyone) {
+            if mentioned.contains(&member_id) || mentions_everyone {
                 emit_mention(
                     &member_id,
                     "channel",
@@ -949,8 +882,6 @@ struct EditMessagePayload {
     message_id: Option<String>,
     content: Option<String>,
     user_id: Option<String>,
-    e2e_encrypted: Option<bool>,
-    e2e_version: Option<u8>,
 }
 
 async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
@@ -975,42 +906,12 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
         return;
     }
 
-    let e2e_encrypted = payload.e2e_encrypted.unwrap_or(false);
-    let default_e2e_version = if msg.channel.is_some() {
-        E2E_VERSION_CHANNEL
-    } else {
-        E2E_VERSION_DM
-    };
-    let prepared = match prepare_inbound_content(
-        Some(content_raw.as_str()),
-        e2e_encrypted,
-        payload
-            .e2e_version
-            .or(msg.e2e_version)
-            .or(if e2e_encrypted {
-                Some(default_e2e_version)
-            } else {
-                None
-            }),
-    ) {
-        Ok(p) => p,
-        Err(code) => {
-            registry::emit_to_user(
-                connected,
-                "error",
-                json!({
-                    "message": "Invalid encrypted message payload.",
-                    "code": code,
-                }),
-            );
-            return;
-        }
-    };
-    if prepared.content.is_empty() {
+    let sanitized = crate::utils::validators::sanitize_input::sanitize_message_content(&content_raw);
+    let prepared_content = inbound_plaintext_for_processing(&sanitized, false);
+    if prepared_content.is_empty() {
         return;
     }
-    if !prepared.e2e_encrypted
-        && !crate::model::messages_model::is_message_content_within_limit(&prepared.content)
+    if !crate::model::messages_model::is_message_content_within_limit(&prepared_content)
     {
         registry::emit_to_user(
             connected,
@@ -1028,21 +929,13 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
     let mentions;
     let mentions_everyone;
     let channel_doc;
-    if prepared.skip_mentions {
-        mentions = vec![];
-        mentions_everyone = false;
-        channel_doc = if let Some(channel_id) = msg.channel {
-            Channel::find_by_id(&db, channel_id).await.ok().flatten()
-        } else {
-            None
-        };
-    } else if let Some(channel_id) = msg.channel {
+    if let Some(channel_id) = msg.channel {
         channel_doc = Channel::find_by_id(&db, channel_id).await.ok().flatten();
         if let Some(ref channel) = channel_doc {
             let mut ids: Vec<String> = channel.members.iter().map(|m| m.to_hex()).collect();
             ids.push(channel.admin.to_hex());
-            mentions = resolve_mentions(&db, &prepared.content, &ids).await;
-            mentions_everyone = has_everyone_mention(&prepared.content);
+            mentions = resolve_mentions(&db, &prepared_content, &ids).await;
+            mentions_everyone = has_everyone_mention(&prepared_content);
         } else {
             return;
         }
@@ -1050,7 +943,7 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
         channel_doc = None;
         mentions = resolve_mentions(
             &db,
-            &prepared.content,
+            &prepared_content,
             &[msg.sender.to_hex(), msg.recipient.unwrap().to_hex()],
         )
         .await;
@@ -1061,8 +954,7 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
 
     let mentions_bson = mongodb::bson::to_bson(&mentions).unwrap_or(Bson::Array(vec![]));
     let stored_content = match crate::utils::messages::content_storage::prepare_content_for_storage(
-        prepared.content.trim(),
-        prepared.e2e_encrypted,
+        prepared_content.trim(),
     ) {
         Ok(c) => c,
         Err(_) => return,
@@ -1077,8 +969,6 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
                 "edited": true,
                 "editedAt": DateTime::now(),
                 "updatedAt": DateTime::now(),
-                "e2eEncrypted": prepared.e2e_encrypted,
-                "e2eVersion": prepared.e2e_version.map(|v| v as i32),
             }},
         )
         .await;
@@ -1485,8 +1375,6 @@ async fn persist_call_log(
         quoted_message: None,
         mentions: None,
         mentions_everyone: Some(false),
-        e2e_encrypted: Some(false),
-        e2e_version: None,
     };
 
     let created = match Message::create(db, input).await {
@@ -1523,101 +1411,6 @@ pub async fn on_user_connected(user_id: &str) {
         }),
     )
     .await;
-}
-
-async fn handle_e2e_sender_key(connected: &str, payload: E2eSenderKeyPayload) {
-    if !is_connected_user(connected, &payload.sender) || payload.recipient_id.is_empty() {
-        return;
-    }
-    if !crate::utils::e2e::is_valid_e2e_ciphertext(&payload.distribution_message) {
-        return;
-    }
-    let db = get_db();
-    if !are_friends(&db, &payload.sender, &payload.recipient_id).await
-        && payload.sender != payload.recipient_id
-    {
-        if !payload.channel_id.is_empty() {
-            if require_channel_access(&db, &payload.channel_id, &payload.sender).await.is_err() {
-                return;
-            }
-            if require_channel_access(&db, &payload.channel_id, &payload.recipient_id).await.is_err()
-            {
-                return;
-            }
-        } else {
-            return;
-        }
-    } else if !payload.channel_id.is_empty() {
-        if require_channel_access(&db, &payload.channel_id, &payload.sender).await.is_err() {
-            return;
-        }
-        if require_channel_access(&db, &payload.channel_id, &payload.recipient_id).await.is_err() {
-            return;
-        }
-    }
-
-    registry::emit_to_user(
-        &payload.recipient_id,
-        "e2e-sender-key",
-        json!({
-            "senderId": payload.sender,
-            "channelId": payload.channel_id,
-            "distributionMessage": payload.distribution_message,
-        }),
-    );
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct E2eSenderKeyRequestPayload {
-    requester_id: String,
-    channel_id: String,
-    target_user_ids: Vec<String>,
-}
-
-async fn handle_e2e_sender_key_request(connected: &str, payload: E2eSenderKeyRequestPayload) {
-    if !is_connected_user(connected, &payload.requester_id) || payload.channel_id.is_empty() {
-        return;
-    }
-    if payload.target_user_ids.is_empty() {
-        return;
-    }
-    let db = get_db();
-    if require_channel_access(&db, &payload.channel_id, &payload.requester_id)
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    for target_id in payload.target_user_ids {
-        if target_id.is_empty() || target_id == payload.requester_id {
-            continue;
-        }
-        if require_channel_access(&db, &payload.channel_id, &target_id)
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        registry::emit_to_user(
-            &target_id,
-            "e2e-sender-key-request",
-            json!({
-                "channelId": payload.channel_id,
-                "requesterId": payload.requester_id,
-            }),
-        );
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct E2eSenderKeyPayload {
-    sender: String,
-    recipient_id: String,
-    channel_id: String,
-    distribution_message: String,
 }
 
 pub async fn on_user_disconnected(user_id: &str) {
@@ -1742,30 +1535,6 @@ pub async fn dispatch_message(connected: &str, msg_type: &str, payload: Value, s
             }
             if let Ok(p) = serde_json::from_value::<DeleteMessagePayload>(payload) {
                 handle_delete_message(connected, p).await;
-            }
-        }
-        "e2e-sender-key" => {
-            if !state
-                .check_rate_limit(connected, "e2e-sender-key", 120, 60_000)
-                .await
-            {
-                emit_rate_limit_error(connected);
-                return;
-            }
-            if let Ok(p) = serde_json::from_value::<E2eSenderKeyPayload>(payload) {
-                handle_e2e_sender_key(connected, p).await;
-            }
-        }
-        "e2e-sender-key-request" => {
-            if !state
-                .check_rate_limit(connected, "e2e-sender-key-request", 30, 60_000)
-                .await
-            {
-                emit_rate_limit_error(connected);
-                return;
-            }
-            if let Ok(p) = serde_json::from_value::<E2eSenderKeyRequestPayload>(payload) {
-                handle_e2e_sender_key_request(connected, p).await;
             }
         }
         "set-online" => {

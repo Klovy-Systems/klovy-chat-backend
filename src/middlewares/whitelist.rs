@@ -6,7 +6,6 @@ use actix_web::{
 use actix_web_lab::middleware::Next;
 
 use crate::middlewares::auth_middleware::resolve_authenticated_user;
-use crate::utils::auth::admin_session::user_is_panel_admin;
 use crate::utils::whitelist::is_whitelist_enabled;
 
 /// OAuth browser redirects (Spotify) land here without session cookies —
@@ -33,7 +32,7 @@ pub async fn whitelist_check(
         }
     };
 
-    if user.is_whitelisted || user_is_panel_admin(&user) {
+    if user.is_whitelisted {
         Ok(next.call(req).await?.map_into_boxed_body())
     } else {
         let (req, _) = req.into_parts();

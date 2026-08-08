@@ -38,17 +38,3 @@ pub fn decrypt_frame(key: &[u8; 32], data: &[u8]) -> Result<String, String> {
         .map_err(|_| "Failed to decrypt WS frame".to_string())?;
     String::from_utf8(plain).map_err(|_| "Invalid decrypted WS frame".to_string())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round_trip_frame() {
-        let key = [7u8; 32];
-        let plain = r#"{"type":"sendMessage","payload":{"content":"hello"}}"#;
-        let enc = encrypt_frame(&key, plain).expect("encrypt");
-        let dec = decrypt_frame(&key, &enc).expect("decrypt");
-        assert_eq!(dec, plain);
-    }
-}

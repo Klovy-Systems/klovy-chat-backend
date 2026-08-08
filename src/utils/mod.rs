@@ -1,6 +1,5 @@
 pub mod access;
 pub mod admin;
-pub mod admin_audit;
 pub mod client_ip;
 pub mod database_url;
 pub mod attachment_audit;
@@ -12,7 +11,6 @@ pub mod auth;
 pub mod channel;
 pub mod config_validate;
 pub mod crypto;
-pub mod e2e;
 pub mod db;
 pub mod friends;
 pub mod image_reencode;

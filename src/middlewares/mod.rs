@@ -1,4 +1,3 @@
-pub mod admin_auth_middleware;
 pub mod auth_fallback_guard;
 pub mod auth_middleware;
 pub mod client_guard;

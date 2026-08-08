@@ -172,8 +172,8 @@ fn trusted_ips() -> Vec<String> {
 }
 
 // NOTE on tuning: limits that gate normal real-time usage (browsing, loading
-// media, uploading, discovery, admin panels) are set generously so production
-// feels responsive. Security-sensitive limits (login/2FA/signup/password/
+// media, uploading, discovery) are set generously so production feels
+// responsive. Security-sensitive limits (login/2FA/signup/password/
 // username brute-force) stay strict.
 static GLOBAL: Lazy<Store> = Lazy::new(|| Store::new(1500, Duration::from_secs(15 * 60)));
 static SEND: Lazy<Store> = Lazy::new(|| Store::new(900, Duration::from_secs(60)));
@@ -186,11 +186,6 @@ static SIGNUP: Lazy<Store> = Lazy::new(|| {
         Duration::from_secs(60 * 60),
     )
 });
-static ADMIN_READ: Lazy<Store> = Lazy::new(|| Store::new(200, Duration::from_secs(5 * 60)));
-static ADMIN_WRITE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(5 * 60)));
-static ADMIN_SESSION_PROBE: Lazy<Store> =
-    Lazy::new(|| Store::new(40, Duration::from_secs(15 * 60)));
-static ADMIN_ELEVATE: Lazy<Store> = Lazy::new(|| Store::new(8, Duration::from_secs(15 * 60)));
 static DISCOVERY: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
 static REFRESH: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(15 * 60)));
 static UPLOAD: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
@@ -200,7 +195,6 @@ static CHANNEL_REPORT: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_
 static TWO_FACTOR_MUTATION: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
 static INVITE_PREVIEW: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(15 * 60)));
 static WS_HANDSHAKE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
-static E2E_KEY_FETCH: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(15 * 60)));
 static CHANGE_PASSWORD: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static CHANGE_USERNAME: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static FRIEND_ACTION: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(5 * 60)));
@@ -311,60 +305,6 @@ pub async fn signup_limiter(
         "signup",
         "Too many signup attempts. Try again in 1 hour.",
         3600,
-        None,
-        req,
-        next,
-    )
-    .await
-}
-
-pub async fn admin_action_limiter(
-    req: ServiceRequest,
-    next: Next<impl MessageBody + 'static>,
-) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
-    let is_read = matches!(req.method().as_str(), "GET" | "HEAD");
-    let (store, error, retry_after) = if is_read {
-        (
-            &ADMIN_READ,
-            "Too many admin requests. Slow down.",
-            300,
-        )
-    } else {
-        (
-            &ADMIN_WRITE,
-            "Too many admin actions. Slow down.",
-            300,
-        )
-    };
-
-    limit_all(store, "admin", error, retry_after, None, req, next).await
-}
-
-pub async fn admin_session_probe_limiter(
-    req: ServiceRequest,
-    next: Next<impl MessageBody + 'static>,
-) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
-    limit_all(
-        &ADMIN_SESSION_PROBE,
-        "admin-session",
-        "Too many admin session checks. Slow down.",
-        900,
-        None,
-        req,
-        next,
-    )
-    .await
-}
-
-pub async fn admin_elevate_limiter(
-    req: ServiceRequest,
-    next: Next<impl MessageBody + 'static>,
-) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
-    limit_all(
-        &ADMIN_ELEVATE,
-        "admin-elevate",
-        "Too many admin elevation attempts. Slow down.",
-        900,
         None,
         req,
         next,
@@ -568,22 +508,6 @@ pub async fn change_username_limiter(
         "change-username",
         "Too many username change attempts. Try again in 15 minutes.",
         15 * 60 * 1000,
-        req,
-        next,
-    )
-    .await
-}
-
-pub async fn e2e_key_fetch_limiter(
-    req: ServiceRequest,
-    next: Next<impl MessageBody + 'static>,
-) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
-    limit_all(
-        &E2E_KEY_FETCH,
-        "e2e-key-fetch",
-        "Too many key bundle requests. Try again later.",
-        15 * 60 * 1000,
-        None,
         req,
         next,
     )

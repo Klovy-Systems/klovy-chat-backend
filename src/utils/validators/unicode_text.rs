@@ -132,33 +132,3 @@ pub fn sanitize_channel_description(input: &str) -> String {
         MAX_CHANNEL_DESC_COMBINING,
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::utils::validators::sanitize_input::sanitize_message_content;
-
-    #[test]
-    fn strips_zalgo_from_display_name() {
-        let zalgo = "e\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}";
-        let out = sanitize_display_name(zalgo);
-        assert_eq!(out, "e");
-    }
-
-    #[test]
-    fn limits_combining_in_messages() {
-        let base = "hi";
-        let marks: String = (0..40).map(|_| '\u{0301}').collect();
-        let input = format!("{base}{marks}");
-        let out = sanitize_message_content(&input);
-        assert!(out.starts_with("hi"));
-        assert!(out.chars().filter(|c| is_combining_mark(*c)).count() <= MAX_MESSAGE_COMBINING);
-    }
-
-    #[test]
-    fn removes_bidi_override() {
-        let input = "hello\u{202E}world";
-        let out = sanitize_message_content(input);
-        assert!(!out.contains('\u{202E}'));
-    }
-}

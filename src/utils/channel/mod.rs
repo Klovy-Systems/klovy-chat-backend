@@ -128,7 +128,6 @@ pub async fn enrich_channel_unread(
                 m.timestamp,
                 crate::utils::messages::content_storage::content_for_api(
                     &m.content,
-                    m.e2e_encrypted,
                 ),
             )),
             None => None,
