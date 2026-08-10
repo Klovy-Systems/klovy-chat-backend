@@ -243,6 +243,8 @@ pub fn create_app(
         .wrap(from_fn(validate_json_payload_middleware))  
         .wrap(from_fn(internal_proxy_guard))
         .service(web::resource("/").route(web::get().to(get_api_info)))
+        .service(web::resource("/api").route(web::get().to(get_api_info)))
+        .service(web::resource("/api/").route(web::get().to(get_api_info)))
         .service(
             web::scope("/api/auth")
                 .configure(auth_routes::configure),
@@ -372,7 +374,7 @@ pub fn create_app(
 }
 
 pub async fn run_server() -> std::io::Result<()> {
-    use axum::{body::Body, extract::ConnectInfo, middleware, response::Response, routing::get, Router};
+    use axum::{body::Body, extract::ConnectInfo, middleware, response::Response, Router};
     use http::Request;
     use std::convert::Infallible;
     use std::net::SocketAddr;
@@ -605,6 +607,7 @@ pub async fn run_server() -> std::io::Result<()> {
                     | "upgrade"
                     | "x-real-ip"
                     | "x-forwarded-for"
+                    | "x-forwarded-proto"
                     | "cf-connecting-ip"
                     | "true-client-ip"
             )
@@ -618,7 +621,23 @@ pub async fn run_server() -> std::io::Result<()> {
             }
             rb = rb.header(name, value);
         }
-        rb = rb.header("X-Real-IP", client_ip);
+        // Resolve client IP / scheme at the public edge (CF/Caddy), then give Actix
+        // a single trusted hop. Avoids empty XFF when Caddy overwrites with a missing
+        // CF-Connecting-IP, and fixes X-Forwarded-Proto=http on the cleartext tunnel hop.
+        rb = rb.header("X-Real-IP", &client_ip);
+        rb = rb.header("X-Forwarded-For", &client_ip);
+        if crate::utils::security::transport::proxy_headers_indicate_https(&parts.headers) {
+            rb = rb.header("X-Forwarded-Proto", "https");
+        } else if let Some(proto) = parts
+            .headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            rb = rb.header("X-Forwarded-Proto", proto);
+        }
         if let Some(secret) = internal_proxy_secret() {
             rb = rb.header(INTERNAL_PROXY_HEADER, secret);
         }
@@ -658,7 +677,8 @@ pub async fn run_server() -> std::io::Result<()> {
     }
 
     let app = Router::new()
-        .route("/ws", get(crate::ws::ws_handler))
+        // `any`: HTTP/1.1 GET upgrade + ewentualny HTTP/2 CONNECT (RFC 8441).
+        .route("/ws", axum::routing::any(crate::ws::ws_handler))
         .fallback(move |req: Request<Body>| {
             let c = client2.clone();
             let b = base2.clone();

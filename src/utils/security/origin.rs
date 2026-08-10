@@ -3,22 +3,26 @@ use std::env;
 use actix_web::http::Method;
 use http::HeaderMap;
 
+fn normalize_origin(origin: &str) -> String {
+    // Browser `Origin` never includes a trailing slash; strip so env typos don't
+    // silently break CORS / WS origin checks in production.
+    origin.trim().trim_end_matches('/').to_string()
+}
+
 fn push_origin(origins: &mut Vec<String>, origin: &str) {
-    let origin = origin.trim();
-    if origin.is_empty() || origins.iter().any(|value| value == origin) {
+    let origin = normalize_origin(origin);
+    if origin.is_empty() || origins.iter().any(|value| value == &origin) {
         return;
     }
-    origins.push(origin.to_string());
+    origins.push(origin);
 }
 
 pub fn allowed_origins() -> Vec<String> {
     let configured = env::var("ORIGIN").unwrap_or_else(|_| "http://127.0.0.1:5173".to_string());
-    let mut origins: Vec<String> = configured
-        .split(',')
-        .map(str::trim)
-        .filter(|origin| !origin.is_empty())
-        .map(str::to_string)
-        .collect();
+    let mut origins: Vec<String> = Vec::new();
+    for origin in configured.split(',') {
+        push_origin(&mut origins, origin);
+    }
 
     if let Ok(frontend_url) = env::var("FRONTEND_URL") {
         for origin in frontend_url.split(',') {

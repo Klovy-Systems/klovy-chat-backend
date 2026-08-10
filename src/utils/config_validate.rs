@@ -67,6 +67,15 @@ pub fn validate_startup_config() {
         if origin.trim().is_empty() {
             panic!("ORIGIN must be set in production");
         }
+        for part in origin.split(',') {
+            let part = part.trim().trim_end_matches('/');
+            if part.is_empty() {
+                continue;
+            }
+            if !part.starts_with("https://") {
+                panic!("ORIGIN entries must use HTTPS in production (got {part})");
+            }
+        }
         let turnstile = env::var("TURNSTILE_SECRET_KEY").unwrap_or_default();
         if turnstile.trim().is_empty() {
             panic!("TURNSTILE_SECRET_KEY must be set in production");
@@ -123,6 +132,14 @@ pub fn validate_startup_config() {
             panic!(
                 "INTERNAL_HTTP_PORT ({internal_port}) must differ from PORT ({public_port}) — \
                  the public server and the internal actix server cannot share a port"
+            );
+        }
+        // Prod layout: Cloudflare Tunnel → Caddy :6701 → Axum :PORT → Actix :INTERNAL.
+        // Default PORT+1 is 6701 and collides with Caddy — require an explicit free port.
+        if internal_port == 6701 {
+            panic!(
+                "INTERNAL_HTTP_PORT=6701 conflicts with Caddy on :6701 \
+                 (tunnel → Caddy:6701 → Axum:{public_port}). Set INTERNAL_HTTP_PORT=6702"
             );
         }
 
