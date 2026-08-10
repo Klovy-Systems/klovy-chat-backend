@@ -69,11 +69,13 @@ fn public_app_url() -> String {
 }
 
 fn captcha_feature() -> Value {
-    let key = env_nonempty("TURNSTILE_SITE_KEY").unwrap_or_default();
-    let enabled = !key.is_empty();
+    // Public root query must not leak the real Turnstile site key.
+    // Frontend loads the real key from its own build env (VITE_TURNSTILE_SITE_KEY).
+    let enabled = env_nonempty("TURNSTILE_SECRET_KEY").is_some()
+        || env_nonempty("TURNSTILE_SITE_KEY").is_some();
     json!({
         "enabled": enabled,
-        "key": key,
+        "key": "0x4AAAAAAD1AzKc9mY7pQ2vR8wL5nF0tH3xB6jU",
         "service": "turnstile",
     })
 }
@@ -191,17 +193,19 @@ fn legal_links() -> Value {
 }
 
 fn build_info() -> Value {
-    json!({
-        "commit_sha": env_nonempty("GIT_COMMIT_SHA")
-            .or_else(|| env_nonempty("COMMIT_SHA"))
-            .unwrap_or_else(|| option_env!("GIT_COMMIT_SHA").unwrap_or("unknown").to_string()),
-        "commit_timestamp": env_nonempty("GIT_COMMIT_TIMESTAMP")
-            .unwrap_or_else(|| option_env!("GIT_COMMIT_TIMESTAMP").unwrap_or("unknown").to_string()),
+    // Tylko wartości, które zawsze mamy — bez pustych "unknown" z CI.
+    // Opcjonalny commit_sha tylko gdy ustawisz GIT_COMMIT_SHA / COMMIT_SHA przy deployu.
+    let mut build = json!({
         "semver": env!("CARGO_PKG_VERSION"),
-        "origin_url": env_nonempty("GIT_ORIGIN_URL")
-            .unwrap_or_else(|| "https://github.com/KlovyChat".to_string()),
         "timestamp": chrono::Utc::now().to_rfc3339(),
-    })
+    });
+    if let Some(sha) = env_nonempty("GIT_COMMIT_SHA").or_else(|| env_nonempty("COMMIT_SHA")) {
+        build["commit_sha"] = json!(sha);
+    }
+    if let Some(ts) = env_nonempty("GIT_COMMIT_TIMESTAMP") {
+        build["commit_timestamp"] = json!(ts);
+    }
+    build
 }
 
 /// Publiczny dokument konfiguracji API (odpowiednik root query Stoat/Revolt).
