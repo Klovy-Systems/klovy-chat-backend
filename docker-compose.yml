@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: klovy-chat-backend
+    restart: always
+    env_file:
+      - .env
+    network_mode: "host"  # Umożliwia łatwy dostęp do bazy i tunelu na VPS
