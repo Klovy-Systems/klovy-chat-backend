@@ -1,5 +1,6 @@
 use actix_multipart::form::{tempfile::TempFile, MultipartForm};
 use actix_web::{web, HttpRequest, HttpResponse};
+use futures::future::join_all;
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use serde::Deserialize;
@@ -69,7 +70,8 @@ async fn serialize_channel_for_client(db: &mongodb::Database, c: &Channel, viewe
         "bannedMembers": moderation::active_moderation_user_ids(&c.banned_members),
         "mutedMembers": moderation::active_moderation_user_ids(&c.muted_members),
         "isMutedHere": is_channel_muted_member(c, Some(&viewer_id.to_hex())),
-        "messages": c.messages.iter().map(|m| m.to_hex()).collect::<Vec<_>>(),
+        // History is loaded via channel field queries; do not ship unbounded ID lists.
+        "messages": Vec::<String>::new(),
         "isPrivate": c.is_private,
         "rateLimitPerUser": c.rate_limit_per_user,
         "chatLocked": c.chat_locked,
@@ -177,42 +179,47 @@ pub async fn get_user_channels(req: HttpRequest) -> HttpResponse {
         .map(|u| u.muted_channels.iter().map(|o| o.to_hex()).collect())
         .unwrap_or_default();
 
-    let mut enriched: Vec<(i64, Value)> = Vec::new();
-    for ch in &channels {
-        let (unread, last) = enrich_channel_unread(&db, uid, ch).await;
-        let admin = populate_channel_user(&db, ch.admin).await;
-        let members = fetch_users_by_refs(&db, &ch.members).await;
-        let ch_id = ch.id.map(|o| o.to_hex()).unwrap_or_default();
-        let is_muted = muted.contains(&ch_id);
+    let muted_set: std::collections::HashSet<String> = muted.into_iter().collect();
+    let tasks = channels.into_iter().map(|ch| {
+        let db = db.clone();
+        let muted_set = muted_set.clone();
+        async move {
+            let (unread, last) = enrich_channel_unread(&db, uid, &ch).await;
+            let admin = populate_channel_user(&db, ch.admin).await;
+            let members = fetch_users_by_refs(&db, &ch.members).await;
+            let ch_id = ch.id.map(|o| o.to_hex()).unwrap_or_default();
+            let is_muted = muted_set.contains(&ch_id);
 
-        let sort_key = last
-            .as_ref()
-            .map(|(t, _)| t.timestamp_millis())
-            .unwrap_or_else(|| ch.updated_at.timestamp_millis());
+            let sort_key = last
+                .as_ref()
+                .map(|(t, _)| t.timestamp_millis())
+                .unwrap_or_else(|| ch.updated_at.timestamp_millis());
 
-        enriched.push((
-            sort_key,
-            json!({
-                "_id": ch_id,
-                "name": ch.name,
-                "description": ch.description,
-                "image": ch.image,
-                "admin": admin,
-                "members": members,
-                "bannedMembers": moderation::active_moderation_user_ids(&ch.banned_members),
-                "mutedMembers": moderation::active_moderation_user_ids(&ch.muted_members),
-                "messages": ch.messages.iter().map(|m| m.to_hex()).collect::<Vec<_>>(),
-                "isPrivate": ch.is_private,
-                "createdAt": iso(&ch.created_at),
-                "updatedAt": iso(&ch.updated_at),
-                "unreadCount": unread,
-                "lastMessage": last.as_ref().map(|(_, c)| c.clone()),
-                "lastMessageTime": last.as_ref().and_then(|(t, _)| iso(t)),
-                "isMuted": is_muted,
-            }),
-        ));
-    }
+            (
+                sort_key,
+                json!({
+                    "_id": ch_id,
+                    "name": ch.name,
+                    "description": ch.description,
+                    "image": ch.image,
+                    "admin": admin,
+                    "members": members,
+                    "bannedMembers": moderation::active_moderation_user_ids(&ch.banned_members),
+                    "mutedMembers": moderation::active_moderation_user_ids(&ch.muted_members),
+                    "messages": Vec::<String>::new(),
+                    "isPrivate": ch.is_private,
+                    "createdAt": iso(&ch.created_at),
+                    "updatedAt": iso(&ch.updated_at),
+                    "unreadCount": unread,
+                    "lastMessage": last.as_ref().map(|(_, c)| c.clone()),
+                    "lastMessageTime": last.as_ref().and_then(|(t, _)| iso(t)),
+                    "isMuted": is_muted,
+                }),
+            )
+        }
+    });
 
+    let mut enriched = join_all(tasks).await;
     enriched.sort_by(|a, b| b.0.cmp(&a.0));
     let channels: Vec<Value> = enriched.into_iter().map(|(_, c)| c).collect();
 
@@ -224,14 +231,11 @@ pub async fn get_channel_messages(req: HttpRequest) -> HttpResponse {
     let channel_id = param(&req, "channelId");
 
     let db = get_db();
-    let channel = match require_channel_access(&db, channel_id, &user_id).await {
-        Ok(channel) => channel,
-        Err(reason) => {
-            return HttpResponse::NotFound().json(json!({
-                "message": reason.as_str(),
-            }));
-        }
-    };
+    if let Err(reason) = require_channel_access(&db, channel_id, &user_id).await {
+        return HttpResponse::NotFound().json(json!({
+            "message": reason.as_str(),
+        }));
+    }
 
     let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
         return HttpResponse::BadRequest().json(json!({ "message": "Invalid channel id" }));
@@ -246,8 +250,10 @@ pub async fn get_channel_messages(req: HttpRequest) -> HttpResponse {
         .unwrap_or(DEFAULT_CHANNEL_MESSAGE_LIMIT)
         .clamp(1, MAX_CHANNEL_MESSAGE_LIMIT);
 
+    // Query by message.channel (+ _id cursor). Avoids loading the unbounded
+    // channel.messages ObjectId array into every history request.
     let mut and_clauses = vec![
-        doc! { "_id": { "$in": &channel.messages } },
+        doc! { "channel": channel_oid },
         doc! { "deleted": { "$ne": true } },
     ];
     if let Some(before_id) = query.get("before").map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -274,7 +280,6 @@ pub async fn get_channel_messages(req: HttpRequest) -> HttpResponse {
     if has_more {
         messages.truncate(limit as usize);
     }
-    messages.retain(|m| m.channel == Some(channel_oid));
     messages.reverse();
 
     let out = serialize_messages_batch(&db, &messages).await;

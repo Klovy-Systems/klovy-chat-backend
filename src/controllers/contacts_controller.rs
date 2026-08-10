@@ -1,8 +1,10 @@
 use actix_web::{web, HttpRequest, HttpResponse};
+use futures::future::join_all;
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 
 use crate::middlewares::auth_middleware::request_user_id;
 use crate::model::friend_request_model::FriendRequest;
@@ -15,7 +17,9 @@ use crate::utils::messages::{
     dm_only_or_clause,
 };
 use crate::utils::messages::escape_regex;
-use crate::utils::user::badges::{populate_user_badges, BadgeVisibility};
+use crate::utils::user::badges::{
+    load_badges_by_ids, populate_user_badges, populate_user_badges_from_map, BadgeVisibility,
+};
 use crate::utils::user::serialize_user::resolve_display_name;
 use crate::utils::whitelist::is_whitelist_enabled;
 
@@ -82,8 +86,10 @@ pub struct SearchBody {
     pub search_term: Option<String>,
 }
 
-async fn friend_profile_json(db: &mongodb::Database, friend: &User) -> serde_json::Value {
-    let badges = populate_user_badges(db, friend, BadgeVisibility::All).await;
+fn friend_profile_json_with_badges(
+    friend: &User,
+    badges: Vec<serde_json::Value>,
+) -> serde_json::Value {
     json!({
         "_id": friend.id.map(|o| o.to_hex()).unwrap_or_default(),
         "username": friend.username,
@@ -98,6 +104,11 @@ async fn friend_profile_json(db: &mongodb::Database, friend: &User) -> serde_jso
         "badges": badges,
         "createdAt": friend.created_at.try_to_rfc3339_string().ok(),
     })
+}
+
+async fn friend_profile_json(db: &mongodb::Database, friend: &User) -> serde_json::Value {
+    let badges = populate_user_badges(db, friend, BadgeVisibility::All).await;
+    friend_profile_json_with_badges(friend, badges)
 }
 
 pub async fn get_contact_profile(req: HttpRequest) -> HttpResponse {
@@ -265,48 +276,53 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
         }
     }
 
-    let mut contacts = Vec::new();
-    for f in &friendships {
+    let badge_ids = friend_map
+        .values()
+        .flat_map(|u| u.badges.iter().map(|b| b.badge_id));
+    let badge_map = load_badges_by_ids(&db, badge_ids).await;
+
+    let blocked_set: HashSet<String> = blocked.into_iter().collect();
+    let muted_set: HashSet<String> = muted.into_iter().collect();
+
+    let tasks = friendships.iter().filter_map(|f| {
         let other_id = if f.from == uid { f.to } else { f.from };
-        let Some(friend) = friend_map.get(&other_id) else {
-            continue;
-        };
-        let fid = other_id;
-        let fid_hex = fid.to_hex();
+        let friend = friend_map.get(&other_id)?.clone();
+        let badges = populate_user_badges_from_map(&friend, BadgeVisibility::All, &badge_map);
+        let db = db.clone();
+        let blocked_set = blocked_set.clone();
+        let muted_set = muted_set.clone();
+        Some(async move {
+            let fid = other_id;
+            let fid_hex = fid.to_hex();
+            let (last, unread) = if blocked_set.contains(&fid_hex) {
+                (None, 0)
+            } else {
+                tokio::join!(dm_last_message(&db, uid, fid), dm_unread_count(&db, uid, fid))
+            };
 
-        let last = if blocked.contains(&fid_hex) {
-            None
-        } else {
-            dm_last_message(&db, uid, fid).await
-        };
-        let unread = if blocked.contains(&fid_hex) {
-            0
-        } else {
-            dm_unread_count(&db, uid, fid).await
-        };
+            let last_time_ms = last.as_ref().map(|(t, _)| t.timestamp_millis()).unwrap_or(0);
+            let mut profile = friend_profile_json_with_badges(&friend, badges);
+            if let Some(obj) = profile.as_object_mut() {
+                obj.insert(
+                    "lastMessageTime".to_string(),
+                    json!(last.as_ref().and_then(|(t, _)| t.try_to_rfc3339_string().ok())),
+                );
+                obj.insert(
+                    "lastMessage".to_string(),
+                    json!(last.as_ref().map(|(_, c)| c.clone())),
+                );
+                obj.insert("unreadCount".to_string(), json!(unread));
+                obj.insert("isMuted".to_string(), json!(muted_set.contains(&fid_hex)));
+                obj.insert(
+                    "isBlockedByMe".to_string(),
+                    json!(blocked_set.contains(&fid_hex)),
+                );
+            }
+            (last_time_ms, profile)
+        })
+    });
 
-        let last_time_ms = last.as_ref().map(|(t, _)| t.timestamp_millis()).unwrap_or(0);
-        let mut profile = friend_profile_json(&db, friend).await;
-        if let Some(obj) = profile.as_object_mut() {
-            obj.insert(
-                "lastMessageTime".to_string(),
-                json!(last.as_ref().and_then(|(t, _)| t.try_to_rfc3339_string().ok())),
-            );
-            obj.insert(
-                "lastMessage".to_string(),
-                json!(last.as_ref().map(|(_, c)| c.clone())),
-            );
-            obj.insert("unreadCount".to_string(), json!(unread));
-            obj.insert("isMuted".to_string(), json!(muted.contains(&fid_hex)));
-            obj.insert(
-                "isBlockedByMe".to_string(),
-                json!(blocked.contains(&fid_hex)),
-            );
-        }
-
-        contacts.push((last_time_ms, profile));
-    }
-
+    let mut contacts = join_all(tasks).await;
     contacts.sort_by(|a, b| b.0.cmp(&a.0));
     let contacts: Vec<_> = contacts.into_iter().map(|(_, c)| c).collect();
 

@@ -136,6 +136,12 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
 }
 
 pub async fn serialize_message(db: &Database, msg: &Message) -> Value {
+    // Prefer the batched path even for a single message so WS send/edit avoids
+    // per-field User::find_by_id N+1 lookups.
+    let mut batch = serialize_messages_batch(db, std::slice::from_ref(msg)).await;
+    if let Some(value) = batch.pop() {
+        return value;
+    }
     serialize_message_inner(db, msg, true).await
 }
 

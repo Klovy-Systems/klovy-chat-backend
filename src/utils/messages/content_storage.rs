@@ -66,33 +66,37 @@ pub fn prepare_content_for_storage(incoming: &str) -> Result<String, String> {
 }
 
 /// API / WS payload: never human-readable plaintext.
+///
+/// Hot path for history/list responses: try a single decrypt first (common after
+/// server-seal migration). Avoids the previous double-decrypt via `is_server_sealed`
+/// followed by `decrypt_field` again.
 pub fn content_for_api(stored: &str) -> String {
-    if is_client_opaque(stored) {
-        return stored.to_string();
-    }
-    if is_server_sealed(stored) {
-        if let Ok(plain) = decrypt_field(stored.trim()) {
-            if is_client_opaque(&plain) {
-                return plain;
-            }
-            return wrap_client_opaque(&plain);
+    let trimmed = stored.trim();
+    if let Ok(plain) = decrypt_field(trimmed) {
+        if is_client_opaque(&plain) {
+            return plain;
         }
+        return wrap_client_opaque(&plain);
     }
-    wrap_client_opaque(stored)
+    if is_client_opaque(trimmed) {
+        return trimmed.to_string();
+    }
+    wrap_client_opaque(trimmed)
 }
 
 /// Plaintext for mentions/search/internal use (server-side only).
 pub fn reveal_content_internal(stored: &str) -> String {
-    if let Ok(plain) = decrypt_field(stored.trim()) {
+    let trimmed = stored.trim();
+    if let Ok(plain) = decrypt_field(trimmed) {
         if is_client_opaque(&plain) {
             return unwrap_client_opaque(&plain);
         }
         return plain;
     }
-    if is_client_opaque(stored) {
-        return unwrap_client_opaque(stored);
+    if is_client_opaque(trimmed) {
+        return unwrap_client_opaque(trimmed);
     }
-    stored.to_string()
+    trimmed.to_string()
 }
 
 pub fn unwrap_client_opaque(stored: &str) -> String {

@@ -208,22 +208,14 @@ pub async fn ws_handler(
 
 async fn process_incoming_text(
     text: &str,
-    jwt_token: &str,
-    refresh_token: Option<&str>,
     connected: &str,
     state: &SocketState,
     tx: &mpsc::Sender<String>,
     last_pong_at: &mut std::time::Instant,
-    user_id: &str,
 ) -> bool {
-    if user_from_jwt_with_refresh(jwt_token, refresh_token)
-        .await
-        .is_none()
-    {
-        log::info!("WebSocket auth failed mid-session for user {}", user_id);
-        return false;
-    }
-
+    // Auth is validated on connect and re-checked on AUTH_RECHECK_INTERVAL.
+    // Re-running JWT+DB lookup on every frame (typing, ping, send) added a full
+    // Mongo round-trip before the handler could run and stalled the socket loop.
     if let Ok(parsed) = serde_json::from_str::<IncomingFrame>(text) {
         if parsed.msg_type == "pong" {
             *last_pong_at = std::time::Instant::now();
@@ -372,13 +364,10 @@ async fn handle_socket(
                         };
                         if !process_incoming_text(
                             &text,
-                            &jwt_token,
-                            refresh_token.as_deref(),
                             &connected,
                             &state,
                             &tx,
                             &mut last_pong_at,
-                            &user_id,
                         )
                         .await
                         {
@@ -396,13 +385,10 @@ async fn handle_socket(
                         }
                         if !process_incoming_text(
                             &text,
-                            &jwt_token,
-                            refresh_token.as_deref(),
                             &connected,
                             &state,
                             &tx,
                             &mut last_pong_at,
-                            &user_id,
                         )
                         .await
                         {

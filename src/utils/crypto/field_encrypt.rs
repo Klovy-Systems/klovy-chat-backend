@@ -4,6 +4,7 @@ use aes_gcm::{
 };
 use sha2::{Digest, Sha256};
 use std::env;
+use std::sync::OnceLock;
 
 use super::keyed_hash::derive_subkey;
 
@@ -18,7 +19,7 @@ fn legacy_key_from_jwt() -> Result<[u8; 32], String> {
     Ok(key)
 }
 
-fn encryption_key() -> Result<[u8; 32], String> {
+fn encryption_key_uncached() -> Result<[u8; 32], String> {
     if let Ok(raw) = env::var("FIELD_ENCRYPTION_KEY") {
         let raw = raw.trim();
         if !raw.is_empty() {
@@ -29,6 +30,45 @@ fn encryption_key() -> Result<[u8; 32], String> {
         }
     }
     legacy_key_from_jwt()
+}
+
+fn encryption_key() -> Result<[u8; 32], String> {
+    static PRIMARY: OnceLock<[u8; 32]> = OnceLock::new();
+    if let Some(key) = PRIMARY.get() {
+        return Ok(*key);
+    }
+    let key = encryption_key_uncached()?;
+    Ok(*PRIMARY.get_or_init(|| key))
+}
+
+/// All keys that may decrypt historical ciphertext (primary + legacy fallbacks).
+/// Cached so hot read paths do not re-read env / re-derive on every message.
+fn decrypt_candidate_keys() -> &'static [[u8; 32]] {
+    static KEYS: OnceLock<Vec<[u8; 32]>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        let mut keys = Vec::with_capacity(3);
+        if let Ok(primary) = encryption_key_uncached() {
+            keys.push(primary);
+        }
+        if let Ok(raw) = env::var("FIELD_ENCRYPTION_KEY") {
+            let raw = raw.trim();
+            if raw.len() >= 32 {
+                let digest = Sha256::digest(raw.as_bytes());
+                let mut legacy_derived = [0u8; 32];
+                legacy_derived.copy_from_slice(&digest);
+                if !keys.iter().any(|k| k == &legacy_derived) {
+                    keys.push(legacy_derived);
+                }
+            }
+        }
+        if let Ok(legacy) = legacy_key_from_jwt() {
+            if !keys.iter().any(|k| k == &legacy) {
+                keys.push(legacy);
+            }
+        }
+        keys
+    })
+    .as_slice()
 }
 
 fn decrypt_with_key(key: &[u8; 32], encoded: &str) -> Result<String, String> {
@@ -62,35 +102,16 @@ pub fn encrypt_field(plain: &str) -> Result<String, String> {
 }
 
 pub fn decrypt_field(encoded: &str) -> Result<String, String> {
-    let key = encryption_key()?;
-    match decrypt_with_key(&key, encoded) {
-        Ok(value) => Ok(value),
-        Err(primary_err) => {
-            if env::var("FIELD_ENCRYPTION_KEY")
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false)
-            {
-                if let Ok(raw) = env::var("FIELD_ENCRYPTION_KEY") {
-                    let raw = raw.trim();
-                    if raw.len() >= 32 {
-                        let legacy_derived = {
-                            let digest = Sha256::digest(raw.as_bytes());
-                            let mut k = [0u8; 32];
-                            k.copy_from_slice(&digest);
-                            k
-                        };
-                        if let Ok(value) = decrypt_with_key(&legacy_derived, encoded) {
-                            return Ok(value);
-                        }
-                    }
-                }
-                if let Ok(legacy) = legacy_key_from_jwt() {
-                    if let Ok(value) = decrypt_with_key(&legacy, encoded) {
-                        return Ok(value);
-                    }
-                }
-            }
-            Err(primary_err)
+    let keys = decrypt_candidate_keys();
+    if keys.is_empty() {
+        return Err("No encryption key configured".to_string());
+    }
+    let mut last_err = None;
+    for key in keys {
+        match decrypt_with_key(key, encoded) {
+            Ok(value) => return Ok(value),
+            Err(err) => last_err = Some(err),
         }
     }
+    Err(last_err.unwrap_or_else(|| "Failed to decrypt field".to_string()))
 }

@@ -213,7 +213,18 @@ impl Message {
 
         let indexes = vec![
             IndexModel::builder().keys(doc! { "sender": 1, "recipient": 1 }).build(),
+            // DM history pagination: filter sender/recipient + sort/cursor on _id.
+            IndexModel::builder()
+                .keys(doc! { "sender": 1, "recipient": 1, "_id": -1 })
+                .build(),
+            IndexModel::builder()
+                .keys(doc! { "recipient": 1, "sender": 1, "_id": -1 })
+                .build(),
             IndexModel::builder().keys(doc! { "channel": 1 }).build(),
+            // Channel history pagination by channel field (not channel.messages $in).
+            IndexModel::builder()
+                .keys(doc! { "channel": 1, "_id": -1 })
+                .build(),
             IndexModel::builder().keys(doc! { "channel": 1, "pinned": 1 }).build(),
             IndexModel::builder().keys(doc! { "sender": 1, "recipient": 1, "pinned": 1 }).build(),
             IndexModel::builder().keys(doc! { "timestamp": -1 }).build(),

@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use mongodb::bson::oid::ObjectId;
+use futures_util::TryStreamExt;
+use mongodb::bson::{doc, oid::ObjectId};
 use mongodb::Database;
 use serde_json::{json, Value};
 
@@ -85,18 +86,56 @@ pub async fn populate_user_badge_entry(db: &Database, user_badge: &UserBadge) ->
     Some(user_badge_to_json(user_badge, &badge))
 }
 
+/// Batch-load badge documents for many users (contact list / channel member enrichment).
+pub async fn load_badges_by_ids(
+    db: &Database,
+    ids: impl IntoIterator<Item = ObjectId>,
+) -> HashMap<ObjectId, Badge> {
+    let ids: Vec<ObjectId> = {
+        let mut seen = HashSet::new();
+        ids.into_iter().filter(|id| seen.insert(*id)).collect()
+    };
+    let mut map = HashMap::new();
+    if ids.is_empty() {
+        return map;
+    }
+    if let Ok(cursor) = Badge::collection(db).find(doc! { "_id": { "$in": &ids } }).await {
+        let badges: Vec<Badge> = cursor.try_collect().await.unwrap_or_default();
+        for badge in badges {
+            if let Some(id) = badge.id {
+                map.insert(id, badge);
+            }
+        }
+    }
+    map
+}
+
+pub fn populate_user_badges_from_map(
+    user: &User,
+    visibility: BadgeVisibility,
+    badges: &HashMap<ObjectId, Badge>,
+) -> Vec<Value> {
+    badges_for_visibility(user, visibility)
+        .into_iter()
+        .filter_map(|user_badge| {
+            badges
+                .get(&user_badge.badge_id)
+                .map(|badge| user_badge_to_json(user_badge, badge))
+        })
+        .collect()
+}
+
 pub async fn populate_user_badges(
     db: &Database,
     user: &User,
     visibility: BadgeVisibility,
 ) -> Vec<Value> {
-    let mut result = Vec::new();
-    for user_badge in badges_for_visibility(user, visibility) {
-        if let Some(entry) = populate_user_badge_entry(db, user_badge).await {
-            result.push(entry);
-        }
-    }
-    result
+    let ids: Vec<ObjectId> = badges_for_visibility(user, visibility)
+        .into_iter()
+        .map(|b| b.badge_id)
+        .collect();
+    let map = load_badges_by_ids(db, ids).await;
+    populate_user_badges_from_map(user, visibility, &map)
 }
 
 pub fn featured_badge_ids_for_response(user: &User) -> Vec<String> {
