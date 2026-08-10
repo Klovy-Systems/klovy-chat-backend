@@ -18,47 +18,35 @@ on:
 permissions:
   contents: read
 
-
 jobs:
-
   deploy:
-
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
-
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-
       - name: Build Rust backend
         run: cargo build --release
-
 
       - name: Verify binaries
         run: |
           ls -lh target/release/
-          test -f target/release/klovy-chat-server
+          test -f target/release/klovy-chat-serv
           test -f target/release/migrate-message-content-seal
           echo "Binaries OK"
-
 
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-
           chmod 600 ~/.ssh/id_ed25519
-
           ssh-keyscan \
             -p ${{ secrets.SSH_PORT }} \
             ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
-
 
       - name: Test SSH
         run: |
@@ -68,15 +56,14 @@ jobs:
             ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
             "whoami && echo SSH_OK"
 
-
       - name: Upload binaries
         run: |
           rsync \
             -avz \
             --timeout=30 \
             -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }}" \
-            target/release/klovy-chat-server \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/klovychat.new
+            target/release/klovy-chat-serv \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/klovy-chat-server.new
 
           rsync \
             -avz \
@@ -84,7 +71,6 @@ jobs:
             -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }}" \
             target/release/migrate-message-content-seal \
             ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/migrate-message-content-seal.new
-
 
       - name: Deploy backend
         run: |
@@ -95,19 +81,16 @@ jobs:
 
           set -euo pipefail
 
-
-          APP_DIR="/opt/klovy/backend"
-          APP="$APP_DIR/klovychat"
+          APP_DIR="/home/dupa/backend"
+          APP="$APP_DIR/klovy-chat-server"
           MIGRATE="$APP_DIR/migrate-message-content-seal"
-          NEW="/tmp/klovychat.new"
+          NEW="/tmp/klovy-chat-server.new"
           MIGRATE_NEW="/tmp/migrate-message-content-seal.new"
-          BACKUP="$APP_DIR/klovychat.backup.$(date +%Y%m%d_%H%M%S)"
-
+          BACKUP="$APP_DIR/klovy-chat-server.backup.$(date +%Y%m%d_%H%M%S)"
 
           echo "=== Check new binaries ==="
-
           if [ ! -f "$NEW" ]; then
-              echo "Missing uploaded klovychat binary"
+              echo "Missing uploaded klovy-chat-server binary"
               exit 1
           fi
 
@@ -116,97 +99,55 @@ jobs:
               exit 1
           fi
 
-
           echo "=== Install migration binary ==="
-
           install -m755 "$MIGRATE_NEW" "$MIGRATE"
 
-
           echo "=== Backup current binary ==="
-
-          cp "$APP" "$BACKUP"
-
-          echo "Backup created:"
-          echo "$BACKUP"
-
+          if [ -f "$APP" ]; then
+              cp "$APP" "$BACKUP"
+              echo "Backup created: $BACKUP"
+          fi
 
           echo "=== Stop service ==="
-
-          sudo /usr/bin/systemctl stop klovychat
-
+          sudo /usr/bin/systemctl stop rust-backend.service
 
           echo "=== Replace binary ==="
-
           install -m755 "$NEW" "$APP"
 
-
           echo "=== Start service ==="
-
-          sudo /usr/bin/systemctl start klovychat
-
+          sudo /usr/bin/systemctl start rust-backend.service
 
           echo "Waiting..."
-
           sleep 5
 
-
           echo "=== Health check ==="
-
-
-          if ! sudo /usr/bin/systemctl is-active --quiet klovychat
-          then
-
+          if ! sudo /usr/bin/systemctl is-active --quiet rust-backend.service; then
               echo "SERVICE FAILED"
-
               echo "=== Rollback ==="
+              sudo /usr/bin/systemctl stop rust-backend.service
+              if [ -f "$BACKUP" ]; then
+                  install -m755 "$BACKUP" "$APP"
+                  sudo /usr/bin/systemctl start rust-backend.service
+                  sleep 5
+              fi
 
-
-              sudo /usr/bin/systemctl stop klovychat
-
-
-              install -m755 "$BACKUP" "$APP"
-
-
-              sudo /usr/bin/systemctl start klovychat
-
-
-              sleep 5
-
-
-              if ! sudo /usr/bin/systemctl is-active --quiet klovychat
-              then
+              if ! sudo /usr/bin/systemctl is-active --quiet rust-backend.service; then
                   echo "ROLLBACK FAILED"
                   exit 1
               fi
 
-
               echo "Rollback OK"
-
               exit 1
-
           fi
 
-
           echo "=== Service running ==="
-
-
-          sudo /usr/bin/systemctl status klovychat --no-pager
-
+          sudo /usr/bin/systemctl status rust-backend.service --no-pager
 
           echo "=== Logs ==="
-
-
-          sudo journalctl \
-            -u klovychat \
-            -n 20 \
-            --no-pager
-
+          sudo journalctl -u rust-backend.service -n 20 --no-pager
 
           echo "DEPLOY SUCCESS"
-
-
           EOF
-
 
       - name: Run message content migration (dry-run)
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.migration == 'dry-run'
@@ -218,18 +159,15 @@ jobs:
 
           set -euo pipefail
 
-          APP_DIR="/opt/klovy/backend"
+          APP_DIR="/home/dupa/backend"
           MIGRATE="$APP_DIR/migrate-message-content-seal"
 
           echo "=== Message content migration (dry-run) ==="
-
           cd "$APP_DIR"
-          sudo -u klovychat "$MIGRATE" --dry-run
+          "$MIGRATE" --dry-run
 
           echo "MIGRATION DRY-RUN SUCCESS"
-
           EOF
-
 
       - name: Run message content migration (apply)
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.migration == 'apply'
@@ -241,14 +179,12 @@ jobs:
 
           set -euo pipefail
 
-          APP_DIR="/opt/klovy/backend"
+          APP_DIR="/home/dupa/backend"
           MIGRATE="$APP_DIR/migrate-message-content-seal"
 
           echo "=== Message content migration (apply) ==="
-
           cd "$APP_DIR"
-          sudo -u klovychat "$MIGRATE" --apply
+          "$MIGRATE" --apply
 
           echo "MIGRATION APPLY SUCCESS"
-
           EOF
