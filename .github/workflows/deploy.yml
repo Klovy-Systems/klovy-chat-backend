@@ -35,7 +35,7 @@ jobs:
       - name: Verify binaries
         run: |
           ls -lh target/release/
-          test -f target/release/klovy-chat-serv
+          test -f target/release/klovy-chat-server
           test -f target/release/migrate-message-content-seal
           echo "Binaries OK"
 
@@ -62,7 +62,7 @@ jobs:
             -avz \
             --timeout=30 \
             -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }}" \
-            target/release/klovy-chat-serv \
+            target/release/klovy-chat-server \
             ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/klovy-chat-server.new
 
           rsync \
