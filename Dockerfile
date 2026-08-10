@@ -1,4 +1,11 @@
-FROM rust:1.94-slim as builder
+# Stage 1: Kompilacja (Builder)
+FROM rust:1-slim as builder
+
+# Instalacja pakietów systemowych wymaganych do kompilacji paczek Rust z podrzędnymi zależnością C (np. OpenSSL)
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
 
@@ -6,6 +13,7 @@ COPY . .
 
 RUN cargo build --release
 
+# Stage 2: Lekki obraz uruchomieniowy (Debian Slim)
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
