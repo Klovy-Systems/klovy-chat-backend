@@ -15,9 +15,8 @@ use crate::utils::messages::{
     dm_only_or_clause,
 };
 use crate::utils::messages::escape_regex;
-use crate::utils::listening::serialize::{effective_listening, listening_activity_json};
 use crate::utils::user::badges::{populate_user_badges, BadgeVisibility};
-use crate::utils::user::serialize_user::{connected_accounts_json, resolve_display_name};
+use crate::utils::user::serialize_user::resolve_display_name;
 use crate::utils::whitelist::is_whitelist_enabled;
 
 const MIN_SEARCH_LENGTH: usize = 3;
@@ -85,7 +84,6 @@ pub struct SearchBody {
 
 async fn friend_profile_json(db: &mongodb::Database, friend: &User) -> serde_json::Value {
     let badges = populate_user_badges(db, friend, BadgeVisibility::All).await;
-    let listening_activity = effective_listening(friend).map(listening_activity_json);
     json!({
         "_id": friend.id.map(|o| o.to_hex()).unwrap_or_default(),
         "username": friend.username,
@@ -97,8 +95,6 @@ async fn friend_profile_json(db: &mongodb::Database, friend: &User) -> serde_jso
         "isOnline": friend.is_online,
         "lastSeen": friend.last_seen.as_ref().and_then(|d| d.try_to_rfc3339_string().ok()),
         "availabilityStatus": crate::utils::user::serialize_user::availability_status_str(&friend.availability_status),
-        "listeningActivity": listening_activity,
-        "connectedAccounts": connected_accounts_json(&friend.connected_accounts),
         "badges": badges,
         "createdAt": friend.created_at.try_to_rfc3339_string().ok(),
     })

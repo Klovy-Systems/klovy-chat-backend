@@ -15,10 +15,6 @@ name = "klovy-chat-server"
 path = "src/main.rs"
 
 [[bin]]
-name = "oauth-diag"
-path = "src/bin/oauth_diag.rs"
-
-[[bin]]
 name = "migrate-message-content-seal"
 path = "src/bin/migrate_message_content_seal.rs"
 

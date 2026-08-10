@@ -67,6 +67,9 @@ pub async fn purge_removed_schema_fields(
                     { "e2eEnabled": { "$exists": true } },
                     { "role": { "$exists": true } },
                     { "isAdmin": { "$exists": true } },
+                    { "listeningActivity": { "$exists": true } },
+                    { "shareListening": { "$exists": true } },
+                    { "connectedAccounts": { "$exists": true } },
                 ]
             },
             doc! {
@@ -74,6 +77,9 @@ pub async fn purge_removed_schema_fields(
                     "e2eEnabled": "",
                     "role": "",
                     "isAdmin": "",
+                    "listeningActivity": "",
+                    "shareListening": "",
+                    "connectedAccounts": "",
                 }
             },
         )
@@ -98,14 +104,20 @@ pub async fn purge_removed_schema_fields(
         .await?;
     report.messages_modified = messages.modified_count;
 
-    let e2e_keys = db.collection::<mongodb::bson::Document>("e2e_keys");
-    match e2e_keys.drop().await {
-        Ok(()) => report.e2e_keys_dropped = true,
-        Err(e) => {
-            // NamespaceNotFound is fine when the collection was never created / already gone.
-            let msg = e.to_string();
-            if !msg.contains("NamespaceNotFound") && !msg.contains("ns not found") {
-                return Err(e);
+    for collection_name in ["e2e_keys", "oauth_tokens", "push_tokens"] {
+        let collection = db.collection::<mongodb::bson::Document>(collection_name);
+        match collection.drop().await {
+            Ok(()) => {
+                if collection_name == "e2e_keys" {
+                    report.e2e_keys_dropped = true;
+                }
+            }
+            Err(e) => {
+                // NamespaceNotFound is fine when the collection was never created / already gone.
+                let msg = e.to_string();
+                if !msg.contains("NamespaceNotFound") && !msg.contains("ns not found") {
+                    return Err(e);
+                }
             }
         }
     }
@@ -191,10 +203,6 @@ async fn delete_user_storage_files(user: &User, user_id: ObjectId, db: &Database
 async fn purge_user_related_records(db: &Database, user_id: ObjectId) {
     let _ = RefreshToken::revoke_all_for_user(db, user_id).await;
     let _ = Warning::collection(db)
-        .delete_many(doc! { "userId": user_id })
-        .await;
-    let _ = db
-        .collection::<mongodb::bson::Document>("oauth_tokens")
         .delete_many(doc! { "userId": user_id })
         .await;
     let _ = PendingUpload::collection(db)

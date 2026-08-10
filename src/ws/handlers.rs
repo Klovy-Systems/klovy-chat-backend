@@ -315,42 +315,6 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
             );
         }
     }
-
-    if payload.sender != payload.recipient && !recipient_muted {
-        let recipient_id = payload.recipient.clone();
-        let sender_id = payload.sender.clone();
-        let message_id = created.id.map(|o| o.to_hex()).unwrap_or_default();
-        let sender_name = populated
-            .get("sender")
-            .and_then(|s| s.get("displayName").or_else(|| s.get("username")))
-            .and_then(|v| v.as_str())
-            .unwrap_or("Klovy Chat")
-            .to_string();
-        let body_preview = created.content.clone();
-        let db_for_push = get_db();
-        tokio::spawn(async move {
-            if registry::user_is_connected(&recipient_id).await {
-                return;
-            }
-            let Ok(recipient_oid) = ObjectId::parse_str(&recipient_id) else {
-                return;
-            };
-            if let Ok(Some(user)) = User::find_by_id(&db_for_push, recipient_oid).await {
-                if user.availability_status == AvailabilityStatus::Dnd {
-                    return;
-                }
-            }
-            crate::utils::push::send_dm_notification(
-                &db_for_push,
-                recipient_oid,
-                &sender_name,
-                &body_preview,
-                &sender_id,
-                &message_id,
-            )
-            .await;
-        });
-    }
 }
 
 #[derive(Debug, Deserialize)]

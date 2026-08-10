@@ -22,13 +22,9 @@ use crate::utils::security::client_id::{
 
 /// Ścieżki zwolnione z wymogu identyfikatora klienta:
 /// - publiczny endpoint informacyjny / health-check (`/api`, `/api/`),
-/// - webhook bezpieczeństwa server-to-server (`/api/security/*`, chroniony Bearer),
-/// - OAuth callbacks (`/api/integrations/*/callback`).
+/// - webhook bezpieczeństwa server-to-server (`/api/security/*`, chroniony Bearer).
 fn is_exempt(path: &str) -> bool {
-    path == "/api"
-        || path == "/api/"
-        || path.starts_with("/api/security")
-        || (path.starts_with("/api/integrations/") && path.ends_with("/callback"))
+    path == "/api" || path == "/api/" || path.starts_with("/api/security")
 }
 
 pub async fn client_guard_middleware(

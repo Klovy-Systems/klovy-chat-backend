@@ -1,7 +1,6 @@
 use serde_json::{json, Value};
 
-use crate::model::user_model::{AvailabilityStatus, ConnectedAccount, User};
-use crate::utils::listening::serialize::listening_for_viewer;
+use crate::model::user_model::{AvailabilityStatus, User};
 
 pub const BIO_MAX_LENGTH: usize = 500;
 pub const DISPLAY_NAME_MAX_LENGTH: usize = 32;
@@ -25,22 +24,6 @@ pub fn resolve_display_name(user: &User) -> Option<String> {
 
 fn iso(dt: &mongodb::bson::DateTime) -> Option<String> {
     dt.try_to_rfc3339_string().ok()
-}
-
-pub fn connected_accounts_json(accounts: &[ConnectedAccount]) -> Value {
-    if accounts.is_empty() {
-        return json!([]);
-    }
-    json!(accounts
-        .iter()
-        .map(|account| {
-            json!({
-                "provider": account.provider,
-                "accountName": account.account_name,
-                "profileUrl": account.profile_url,
-            })
-        })
-        .collect::<Vec<_>>())
 }
 
 pub fn serialize_user(user: &User, is_whitelist_enabled: Option<bool>) -> Value {
@@ -74,25 +57,16 @@ pub fn serialize_user_for_viewer(
         "isWhitelisted": user.is_whitelisted,
         "isWhitelistEnabled": is_whitelist_enabled,
         "twoFactorEnabled": user.two_factor_enabled,
-        "connectedAccounts": connected_accounts_json(&user.connected_accounts),
     });
 
     if is_self {
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert("shareListening".to_string(), json!(user.share_listening));
             obj.insert("language".to_string(), json!(user.language));
             obj.insert("isDisabled".to_string(), json!(user.is_disabled));
             obj.insert(
                 "deletionScheduledAt".to_string(),
                 json!(user.deletion_scheduled_at.as_ref().and_then(iso)),
             );
-            if let Some(listening) = listening_for_viewer(user, true) {
-                obj.insert("listeningActivity".to_string(), listening);
-            }
-        }
-    } else if let Some(listening) = listening_for_viewer(user, false) {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("listeningActivity".to_string(), listening);
         }
     }
 

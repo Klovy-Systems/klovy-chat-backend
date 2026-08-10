@@ -32,15 +32,6 @@ pub fn allowed_origins() -> Vec<String> {
         }
     }
 
-    if let Ok(mobile_origins) = env::var("MOBILE_ORIGIN") {
-        for origin in mobile_origins.split(',') {
-            push_origin(&mut origins, origin);
-        }
-    }
-
-    // Official React Native app (EXPO_PUBLIC_ORIGIN=klovychat://).
-    push_origin(&mut origins, "klovychat://");
-
     origins
 }
 
@@ -64,12 +55,9 @@ pub fn origin_allowed(value: &str, allowed: &[String]) -> bool {
         .any(|origin| value == origin || value.starts_with(&format!("{origin}/")))
 }
 
-/// Ścieżki zwolnione z kontroli Origin (OAuth redirect).
+/// Ścieżki zwolnione z kontroli Origin.
 pub fn is_origin_guard_exempt(path: &str) -> bool {
-    path == "/api"
-        || path == "/api/"
-        || path.starts_with("/api/security")
-        || path.starts_with("/api/integrations/") && path.ends_with("/callback")
+    path == "/api" || path == "/api/" || path.starts_with("/api/security")
 }
 
 pub fn requires_origin_guard(method: &Method, path: &str) -> bool {

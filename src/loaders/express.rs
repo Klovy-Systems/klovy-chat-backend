@@ -9,7 +9,7 @@ use std::env;
 
 use crate::routes::{
     auth_routes, channel_routes, contact_routes, emoji_routes,
-    friend_routes, gif_routes, integration_routes, invite_routes, message_routes, status_routes,
+    friend_routes, gif_routes, invite_routes, message_routes, status_routes,
     sticker_routes, user_routes, voice_routes,
 };
 
@@ -357,11 +357,6 @@ pub fn create_app(
                 .service(web::resource("").route(web::get().to(security_report_handler)))
                 .service(web::resource("/").route(web::get().to(security_report_handler)))
                 .route("/report", web::get().to(security_report_handler)),
-        )
-        .service(
-            web::scope("/api/integrations")
-                .wrap(from_fn(whitelist_check))
-                .configure(integration_routes::configure),
         )
         .service(
             web::scope("/api/invite")

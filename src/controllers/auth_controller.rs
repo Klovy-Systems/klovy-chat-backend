@@ -6,7 +6,6 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::middlewares::auth_middleware::RequestUserId;
-use crate::model::push_token_model::PushToken;
 use crate::model::refresh_token_model::RefreshToken;
 use crate::model::user_model::{CreateUserInput, User, normalize_language};
 use crate::model::warning_model::{severity_str, Warning};
@@ -1425,85 +1424,6 @@ pub async fn update_language(req: HttpRequest, body: web::Json<UpdateLanguageBod
         Ok(Some(user)) => HttpResponse::Ok().json(serialize_user(&user, whitelist_flag())),
         Ok(None) => HttpResponse::NotFound().body("User not found."),
         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error."),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PushTokenBody {
-    token: Option<String>,
-    platform: Option<String>,
-}
-
-fn normalize_push_platform(raw: &str) -> Option<&'static str> {
-    match raw.trim().to_lowercase().as_str() {
-        "ios" => Some("ios"),
-        "android" => Some("android"),
-        _ => None,
-    }
-}
-
-fn is_valid_expo_push_token(token: &str) -> bool {
-    let trimmed = token.trim();
-    trimmed.starts_with("ExponentPushToken[") || trimmed.starts_with("ExpoPushToken[")
-}
-
-pub async fn register_push_token(
-    req: HttpRequest,
-    body: web::Json<PushTokenBody>,
-) -> HttpResponse {
-    let Some(user_id) = req_user_id(&req) else {
-        return HttpResponse::Unauthorized().json(json!({ "message": "User not authenticated." }));
-    };
-    let Ok(oid) = ObjectId::parse_str(&user_id) else {
-        return HttpResponse::NotFound().json(json!({ "message": "User not found." }));
-    };
-
-    let Some(token) = body.token.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
-        return HttpResponse::BadRequest().json(json!({ "message": "Push token is required." }));
-    };
-    if token.len() > 512 || !is_valid_expo_push_token(token) {
-        return HttpResponse::BadRequest().json(json!({ "message": "Invalid push token." }));
-    }
-    let Some(platform_raw) = body.platform.as_deref() else {
-        return HttpResponse::BadRequest().json(json!({ "message": "Platform is required." }));
-    };
-    let Some(platform) = normalize_push_platform(platform_raw) else {
-        return HttpResponse::BadRequest().json(json!({ "message": "Platform must be ios or android." }));
-    };
-
-    match PushToken::upsert_for_user(&get_db(), oid, token, platform).await {
-        Ok(()) => HttpResponse::Ok().json(json!({ "ok": true })),
-        Err(e) => {
-            log::error!("register_push_token failed: {e}");
-            HttpResponse::InternalServerError().json(json!({ "message": "Failed to register push token." }))
-        }
-    }
-}
-
-pub async fn unregister_push_token(
-    req: HttpRequest,
-    body: web::Json<PushTokenBody>,
-) -> HttpResponse {
-    let Some(user_id) = req_user_id(&req) else {
-        return HttpResponse::Unauthorized().json(json!({ "message": "User not authenticated." }));
-    };
-    let Ok(oid) = ObjectId::parse_str(&user_id) else {
-        return HttpResponse::NotFound().json(json!({ "message": "User not found." }));
-    };
-
-    let db = get_db();
-    let result = if let Some(token) = body.token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-        PushToken::delete_token(&db, oid, token).await.map(|_| ())
-    } else {
-        PushToken::delete_all_for_user(&db, oid).await.map(|_| ())
-    };
-
-    match result {
-        Ok(()) => HttpResponse::Ok().json(json!({ "ok": true })),
-        Err(e) => {
-            log::error!("unregister_push_token failed: {e}");
-            HttpResponse::InternalServerError().json(json!({ "message": "Failed to unregister push token." }))
-        }
     }
 }
 

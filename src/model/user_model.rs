@@ -26,10 +26,6 @@ impl Default for AvailabilityStatus {
     }
 }
 
-fn default_share_listening() -> bool {
-    true
-}
-
 fn default_language() -> String {
     "pl".to_string()
 }
@@ -66,37 +62,6 @@ pub struct UserBadge {
     pub badge_id: ObjectId,
     #[serde(rename = "assignedAt")]
     pub assigned_at: DateTime,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectedAccount {
-    pub provider: String,
-    #[serde(rename = "accountName")]
-    pub account_name: String,
-    #[serde(rename = "profileUrl")]
-    pub profile_url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListeningActivity {
-    pub platform: String,
-    #[serde(rename = "trackTitle")]
-    pub track_title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub artist: Option<String>,
-    #[serde(rename = "albumArt", skip_serializing_if = "Option::is_none")]
-    pub album_art: Option<String>,
-    #[serde(rename = "externalUrl", skip_serializing_if = "Option::is_none")]
-    pub external_url: Option<String>,
-    #[serde(rename = "isPlaying")]
-    pub is_playing: bool,
-    #[serde(rename = "updatedAt")]
-    pub updated_at: DateTime,
-    pub source: String,
-    #[serde(rename = "clientType")]
-    pub client_type: String,
-    #[serde(rename = "clientInstanceId")]
-    pub client_instance_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,15 +133,6 @@ pub struct User {
 
     #[serde(rename = "lastSeen", skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<DateTime>,
-
-    #[serde(rename = "listeningActivity", skip_serializing_if = "Option::is_none", default)]
-    pub listening_activity: Option<ListeningActivity>,
-
-    #[serde(rename = "shareListening", default = "default_share_listening")]
-    pub share_listening: bool,
-
-    #[serde(rename = "connectedAccounts", default)]
-    pub connected_accounts: Vec<ConnectedAccount>,
 
     #[serde(default = "default_language")]
     pub language: String,
@@ -339,9 +295,6 @@ impl User {
             is_online: false,
             availability_status: AvailabilityStatus::Online,
             last_seen: None,
-            listening_activity: None,
-            share_listening: true,
-            connected_accounts: vec![],
             language: input
                 .language
                 .as_deref()

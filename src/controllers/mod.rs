@@ -8,7 +8,6 @@ pub mod friends_controller;
 pub mod gif_controller;
 pub mod invite_controller;
 pub mod messages_controller;
-pub mod oauth_integration_controller;
 pub mod status_controller;
 pub mod sticker_controller;
 pub mod user_controller;
