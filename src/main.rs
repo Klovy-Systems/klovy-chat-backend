@@ -37,6 +37,19 @@ async fn main() -> std::io::Result<()> {
     let mongodb_db = db::get_db();
     ensure_indexes(&mongodb_db).await;
 
+    {
+        let db = mongodb_db.clone();
+        tokio::spawn(async move {
+            match klovy_chat_server::utils::messages::search_text::backfill_message_search_text(&db)
+                .await
+            {
+                Ok(n) if n > 0 => log::info!("Startup: backfilled searchText on {n} message(s)"),
+                Err(e) => log::warn!("Startup searchText backfill failed: {e}"),
+                _ => {}
+            }
+        });
+    }
+
     match PendingUpload::cleanup_orphans(&mongodb_db).await {
         Ok(removed) if removed > 0 => {
             log::info!("Cleaned up {removed} orphaned pending uploads at startup");

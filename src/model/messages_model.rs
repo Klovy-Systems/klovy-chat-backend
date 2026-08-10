@@ -55,6 +55,10 @@ pub struct Message {
 
     pub content: String,
 
+    /// Normalized lowercase plaintext for server-side search only (never exposed via API).
+    #[serde(rename = "searchText", default, skip_serializing_if = "String::is_empty")]
+    pub search_text: String,
+
     #[serde(rename = "messageType", default)]
     pub message_type: MessageType,
 
@@ -231,6 +235,13 @@ impl Message {
             IndexModel::builder().keys(doc! { "recipient": 1, "read": 1, "channel": 1, "deleted": 1 }).build(),
             IndexModel::builder().keys(doc! { "channel": 1, "timestamp": -1, "sender": 1, "deleted": 1 }).build(),
             IndexModel::builder().keys(doc! { "mentions": 1, "read": 1 }).build(),
+            // Server-side search index (searchText is never returned to clients).
+            IndexModel::builder()
+                .keys(doc! { "channel": 1, "messageType": 1, "searchText": 1 })
+                .build(),
+            IndexModel::builder()
+                .keys(doc! { "sender": 1, "recipient": 1, "messageType": 1, "searchText": 1 })
+                .build(),
         ];
 
         col.create_indexes(indexes).await?;
@@ -243,10 +254,17 @@ impl Message {
     ) -> Result<Message, Box<dyn std::error::Error>> {
         validate_message(&input)?;
 
+        let trimmed = input.content.trim();
         let stored_content = crate::utils::messages::content_storage::prepare_content_for_storage(
-            input.content.trim(),
+            trimmed,
         )
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let msg_type = input.message_type.clone().unwrap_or_default();
+        let search_text = if msg_type == MessageType::Text {
+            crate::utils::messages::search_text::search_text_from_incoming(trimmed)
+        } else {
+            String::new()
+        };
 
         let now = DateTime::now();
         let msg = Message {
@@ -255,7 +273,8 @@ impl Message {
             recipient: input.recipient,
             channel: input.channel,
             content: stored_content,
-            message_type: input.message_type.unwrap_or_default(),
+            search_text,
+            message_type: msg_type,
             file_url: input.file_url,
             file_type: input.file_type,
             file_size: input.file_size,
@@ -303,6 +322,7 @@ impl Message {
                     "deleted": true,
                     "deletedAt": DateTime::now(),
                     "updatedAt": DateTime::now(),
+                    "searchText": "",
                 }},
             )
             .await?;

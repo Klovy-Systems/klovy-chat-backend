@@ -779,28 +779,28 @@ async fn handle_mark_conversation_read(connected: &str, payload: MarkConversatio
         return;
     };
 
-    let unread: Vec<Message> = match Message::collection(&db)
-        .find(doc! {
-            "sender": cid,
-            "recipient": uid,
-            "read": false,
-            "deleted": { "$ne": true },
-            "$or": dm_only_or_clause(),
-        })
-        .await
+    // Projection `_id` only — do not load sealed content for every unread message.
+    const MAX_EMIT_IDS: usize = 500;
+    let filter = doc! {
+        "sender": cid,
+        "recipient": uid,
+        "read": false,
+        "deleted": { "$ne": true },
+        "$or": dm_only_or_clause(),
+    };
+    let ids = match crate::utils::messages::search_text::collect_message_ids(&db, filter.clone()).await
     {
-        Ok(c) => futures_util::TryStreamExt::try_collect(c).await.unwrap_or_default(),
+        Ok(ids) => ids,
         Err(_) => return,
     };
-    if unread.is_empty() {
+    if ids.is_empty() {
         return;
     }
-    let ids: Vec<ObjectId> = unread.iter().filter_map(|m| m.id).collect();
-    let message_ids: Vec<String> = ids.iter().map(|i| i.to_hex()).collect();
+
     let now = DateTime::now();
     let _ = Message::collection(&db)
         .update_many(
-            doc! { "_id": { "$in": &ids } },
+            filter,
             doc! {
                 "$set": { "read": true },
                 "$push": { "readBy": { "user": uid, "readAt": now } },
@@ -808,10 +808,22 @@ async fn handle_mark_conversation_read(connected: &str, payload: MarkConversatio
         )
         .await;
 
+    let conversation_read = ids.len() > MAX_EMIT_IDS;
+    let message_ids: Vec<String> = if conversation_read {
+        Vec::new()
+    } else {
+        ids.iter().map(|i| i.to_hex()).collect()
+    };
+
     registry::emit_to_user(
         &contact_id,
         "messages-read",
-        json!({ "messageIds": message_ids, "read": true, "readerId": user_id }),
+        json!({
+            "messageIds": message_ids,
+            "read": true,
+            "readerId": user_id,
+            "conversationRead": conversation_read,
+        }),
     );
     emit_dm_unread_updated(&db, &user_id, &contact_id).await;
 }
@@ -923,11 +935,14 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
         Ok(c) => c,
         Err(_) => return,
     };
+    let search_text =
+        crate::utils::messages::search_text::search_text_from_incoming(prepared_content.trim());
     let _ = Message::collection(&db)
         .update_one(
             doc! { "_id": mid },
             doc! { "$set": {
                 "content": stored_content,
+                "searchText": search_text,
                 "mentions": mentions_bson,
                 "mentionsEveryone": mentions_everyone,
                 "edited": true,

@@ -2,6 +2,7 @@ pub mod access;
 pub mod content_storage;
 pub mod mentions;
 pub mod seal_legacy_content;
+pub mod search_text;
 
 use futures::stream::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime};
