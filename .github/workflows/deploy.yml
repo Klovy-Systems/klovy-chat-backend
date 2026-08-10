@@ -46,6 +46,9 @@ jobs:
           echo "=== Building Docker Image & Starting Container ==="
           docker compose up -d --build
 
+          echo "=== Cleaning up old Docker images ==="
+          docker image prune -af
+
           echo "=== Docker Status ==="
           docker compose ps
 
