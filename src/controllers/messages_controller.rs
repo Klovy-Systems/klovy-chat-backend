@@ -22,10 +22,12 @@ use crate::utils::image_reencode::{
 use crate::utils::messages::{
     access::cleanup_attachment_if_unreferenced,
     can_access_channel_messages, can_access_dm_messages, can_pin_message, dm_conversation_base_clauses,
-    escape_regex, serialize_message, serialize_messages_batch, validate_dm_history_before_cursor,
+    serialize_message, serialize_messages_batch, validate_dm_history_before_cursor,
     message_belongs_to_dm_conversation,
 };
-use crate::utils::messages::content_storage::inbound_plaintext_for_processing;
+use crate::utils::messages::content_storage::{
+    inbound_plaintext_for_processing, reveal_content_internal,
+};
 use crate::utils::storage::{
     attachment_dm_key, attachment_group_key, attachment_thumb_key, storage,
 };
@@ -43,8 +45,32 @@ use std::time::Duration;
 
 static LINK_PREVIEW_LIMIT: Lazy<Store> = Lazy::new(|| Store::new(40, Duration::from_secs(60)));
 
-const SEARCH_LIMIT: i64 = 50;
+const SEARCH_LIMIT: usize = 50;
+/// How many recent TEXT messages to scan when matching sealed content in memory.
+const SEARCH_SCAN_LIMIT: i64 = 2_000;
 const MIN_QUERY_LENGTH: usize = 2;
+
+fn message_matches_search_query(message: &Message, query_lower: &str) -> bool {
+    let plain = reveal_content_internal(&message.content);
+    plain.to_lowercase().contains(query_lower)
+}
+
+async fn collect_search_matches(
+    cursor: mongodb::Cursor<Message>,
+    query_lower: &str,
+) -> Result<Vec<Message>, mongodb::error::Error> {
+    let mut matches = Vec::with_capacity(SEARCH_LIMIT.min(32));
+    let mut stream = cursor;
+    while let Some(message) = stream.try_next().await? {
+        if message_matches_search_query(&message, query_lower) {
+            matches.push(message);
+            if matches.len() >= SEARCH_LIMIT {
+                break;
+            }
+        }
+    }
+    Ok(matches)
+}
 
 /// Domyślna i maksymalna liczba wiadomości zwracanych na jedną stronę historii DM.
 const DEFAULT_MESSAGE_LIMIT: i64 = 30;
@@ -677,7 +703,9 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
         }));
     }
 
-    let pattern = escape_regex(&trimmed);
+    // Content is sealed at rest — Mongo $regex cannot match plaintext. Scan recent
+    // TEXT messages and match against reveal_content_internal (server-only plaintext).
+    let query_lower = trimmed.to_lowercase();
     let db = get_db();
 
     if let Some(channel_id) = body.channel_id.as_deref().filter(|s| !s.is_empty()) {
@@ -691,16 +719,25 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
             "channel": channel_oid,
             "deleted": { "$ne": true },
             "messageType": "TEXT",
-            "content": { "$regex": &pattern, "$options": "i" },
         };
-        let messages: Vec<Message> = match Message::collection(&db)
+        let cursor = match Message::collection(&db)
             .find(filter)
             .sort(doc! { "timestamp": -1 })
-            .limit(SEARCH_LIMIT)
+            .limit(SEARCH_SCAN_LIMIT)
             .await
         {
-            Ok(c) => c.try_collect().await.unwrap_or_default(),
-            Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+            Ok(c) => c,
+            Err(_) => {
+                return HttpResponse::InternalServerError()
+                    .json(json!({ "error": "Internal Server Error" }))
+            }
+        };
+        let messages = match collect_search_matches(cursor, &query_lower).await {
+            Ok(m) => m,
+            Err(_) => {
+                return HttpResponse::InternalServerError()
+                    .json(json!({ "error": "Internal Server Error" }))
+            }
         };
         let out = serialize_all(&db, &messages).await;
         return HttpResponse::Ok().json(json!({ "messages": out }));
@@ -721,17 +758,26 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
                 ]},
                 { "deleted": { "$ne": true } },
                 { "messageType": "TEXT" },
-                { "content": { "$regex": &pattern, "$options": "i" } },
             ]
         };
-        let messages: Vec<Message> = match Message::collection(&db)
+        let cursor = match Message::collection(&db)
             .find(filter)
             .sort(doc! { "timestamp": -1 })
-            .limit(SEARCH_LIMIT)
+            .limit(SEARCH_SCAN_LIMIT)
             .await
         {
-            Ok(c) => c.try_collect().await.unwrap_or_default(),
-            Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+            Ok(c) => c,
+            Err(_) => {
+                return HttpResponse::InternalServerError()
+                    .json(json!({ "error": "Internal Server Error" }))
+            }
+        };
+        let messages = match collect_search_matches(cursor, &query_lower).await {
+            Ok(m) => m,
+            Err(_) => {
+                return HttpResponse::InternalServerError()
+                    .json(json!({ "error": "Internal Server Error" }))
+            }
         };
         let mut messages = messages;
         messages.retain(|m| message_belongs_to_dm_conversation(m, uid, cid));
