@@ -82,7 +82,10 @@ fn user_badge_to_json(user_badge: &UserBadge, badge: &Badge) -> Value {
 }
 
 pub async fn populate_user_badge_entry(db: &Database, user_badge: &UserBadge) -> Option<Value> {
-    let badge = Badge::find_by_id(db, user_badge.badge_id).await.ok()??;
+    let badge = match Badge::find_by_id(db, user_badge.badge_id).await {
+        Ok(Some(b)) => b,
+        Ok(None) | Err(_) => return None,
+    };
     Some(user_badge_to_json(user_badge, &badge))
 }
 
@@ -99,13 +102,19 @@ pub async fn load_badges_by_ids(
     if ids.is_empty() {
         return map;
     }
-    if let Ok(cursor) = Badge::collection(db).find(doc! { "_id": { "$in": &ids } }).await {
-        let badges: Vec<Badge> = cursor.try_collect().await.unwrap_or_default();
-        for badge in badges {
-            if let Some(id) = badge.id {
-                map.insert(id, badge);
+    match Badge::collection(db).find(doc! { "_id": { "$in": &ids } }).await {
+        Ok(cursor) => match cursor.try_collect::<Vec<Badge>>().await {
+            Ok(badges) => {
+                for badge in badges {
+                    if let Some(id) = badge.id {
+                        map.insert(id, badge);
+                    }
+                }
             }
-        }
+            // Fail soft for display-only badges — log so ops can see hydrate pressure.
+            Err(e) => log::warn!("load_badges_by_ids try_collect: {e}"),
+        },
+        Err(e) => log::warn!("load_badges_by_ids find: {e}"),
     }
     map
 }

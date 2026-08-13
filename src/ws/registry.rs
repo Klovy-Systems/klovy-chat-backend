@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use once_cell::sync::OnceCell;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::model::channel_model::Channel;
 
@@ -30,6 +32,51 @@ struct Connection {
 #[derive(Clone, Default)]
 pub struct ConnectionRegistry {
     connections: Arc<Mutex<HashMap<String, Vec<Connection>>>>,
+}
+
+fn is_critical_event(msg_type: &str) -> bool {
+    matches!(
+        msg_type,
+        "unread-updated"
+            | "message-read"
+            | "messages-read"
+            | "message-deleted"
+            | "message-edited"
+            | "message-reaction"
+            | "message-mention"
+            | "receiveMessage"
+            | "receive-channel-message"
+            | "error"
+            | "dm-error"
+            | "friendship-removed"
+            | "friendship-added"
+            | "contact-block-updated"
+            | "channel-added"
+            | "channel-left"
+            | "channel-deleted"
+            | "channel-member-joined"
+            | "channel-member-left"
+            | "channel-avatar-updated"
+            | "channel-name-updated"
+            | "channel-slowmode-updated"
+            | "channel-chat-locked-updated"
+            | "channel-moderation-updated"
+            | "conversation-deleted"
+            | "session:revoked"
+            | "user-status-changed"
+    ) || msg_type.starts_with("call:")
+        || msg_type.starts_with("channel-voice:")
+}
+
+/// Fast-path try_send; on Full for critical events briefly await send (~50ms).
+async fn enqueue_frame(tx: &WsSender, msg: String, critical: bool) {
+    match tx.try_send(msg) {
+        Ok(()) => {}
+        Err(TrySendError::Full(msg)) if critical => {
+            let _ = tokio::time::timeout(Duration::from_millis(50), tx.send(msg)).await;
+        }
+        Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {}
+    }
 }
 
 impl ConnectionRegistry {
@@ -74,6 +121,7 @@ impl ConnectionRegistry {
             Ok(s) => s,
             Err(_) => return,
         };
+        let critical = is_critical_event(msg_type);
         let senders: Vec<WsSender> = self
             .connections
             .lock()
@@ -88,7 +136,7 @@ impl ConnectionRegistry {
             })
             .unwrap_or_default();
         for tx in senders {
-            let _ = tx.try_send(msg.clone());
+            enqueue_frame(&tx, msg.clone(), critical).await;
         }
     }
 
@@ -97,6 +145,11 @@ impl ConnectionRegistry {
             Ok(s) => s,
             Err(_) => return,
         };
+        self.send_prebuilt_to_user(user_id, &msg, is_critical_event(msg_type))
+            .await;
+    }
+
+    async fn send_prebuilt_to_user(&self, user_id: &str, msg: &str, critical: bool) {
         let senders: Vec<WsSender> = self
             .connections
             .lock()
@@ -105,7 +158,24 @@ impl ConnectionRegistry {
             .map(|conns| conns.iter().map(|c| c.tx.clone()).collect())
             .unwrap_or_default();
         for tx in senders {
-            let _ = tx.try_send(msg.clone());
+            enqueue_frame(&tx, msg.to_string(), critical).await;
+        }
+    }
+
+    /// One lock snapshot + shared frame string for N recipients.
+    async fn send_prebuilt_to_users(&self, user_ids: &[String], msg: Arc<String>, critical: bool) {
+        let senders: Vec<WsSender> = {
+            let map = self.connections.lock().await;
+            let mut out = Vec::new();
+            for uid in user_ids {
+                if let Some(conns) = map.get(uid) {
+                    out.extend(conns.iter().map(|c| c.tx.clone()));
+                }
+            }
+            out
+        };
+        for tx in senders {
+            enqueue_frame(&tx, (*msg).clone(), critical).await;
         }
     }
 
@@ -188,11 +258,13 @@ pub fn emit_to_user(user_id: &str, event: &str, data: impl Serialize + Send + Sy
         return;
     };
     let uid = user_id.to_string();
-    let ev = event.to_string();
-    let data = serde_json::to_value(data).unwrap_or(Value::Null);
+    let Ok(msg) = serde_json::to_string(&json!({ "type": event, "payload": data })) else {
+        return;
+    };
+    let critical = is_critical_event(event);
     let reg = reg.clone();
     tokio::spawn(async move {
-        reg.send_to_user(&uid, &ev, data).await;
+        reg.send_prebuilt_to_user(&uid, &msg, critical).await;
     });
 }
 
@@ -204,21 +276,39 @@ pub async fn user_is_connected(user_id: &str) -> bool {
     map.get(user_id).is_some_and(|entries| !entries.is_empty())
 }
 
+/// Serialize once, fan out to many users (channel broadcast hot path).
 pub fn emit_to_users(user_ids: &[String], event: &str, data: Value) {
-    for uid in user_ids {
-        emit_to_user(uid, event, data.clone());
+    if user_ids.is_empty() {
+        return;
     }
+    let Some(reg) = registry() else {
+        return;
+    };
+    let Ok(msg) = serde_json::to_string(&json!({ "type": event, "payload": data })) else {
+        return;
+    };
+    let msg = Arc::new(msg);
+    let critical = is_critical_event(event);
+    let ids = user_ids.to_vec();
+    let reg = reg.clone();
+    tokio::spawn(async move {
+        reg.send_prebuilt_to_users(&ids, msg, critical).await;
+    });
 }
 
 pub fn emit_to_all_connected(event: &str, data: impl Serialize + Send + Sync + 'static) {
     let Some(reg) = registry() else {
         return;
     };
-    let ev = event.to_string();
-    let data = serde_json::to_value(data).unwrap_or(Value::Null);
+    let Ok(msg) = serde_json::to_string(&json!({ "type": event, "payload": data })) else {
+        return;
+    };
+    let msg = Arc::new(msg);
+    let critical = is_critical_event(event);
     let reg = reg.clone();
     tokio::spawn(async move {
-        reg.broadcast_to_all(&ev, data).await;
+        let user_ids: Vec<String> = reg.connections.lock().await.keys().cloned().collect();
+        reg.send_prebuilt_to_users(&user_ids, msg, critical).await;
     });
 }
 

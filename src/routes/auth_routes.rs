@@ -16,7 +16,7 @@ use crate::middlewares::auth_middleware::{
 };
 use crate::middlewares::turnstile_middleware::verify_turnstile_token;
 use crate::middlewares::validation_middleware::validate_password;
-use crate::utils::ratelimit::{change_password_limiter, change_username_limiter, login_limiter, refresh_limiter, signup_limiter, two_factor_login_limiter, two_factor_mutation_limiter, upload_limiter};
+use crate::utils::ratelimit::{change_password_limiter, change_username_limiter, login_limiter, refresh_limiter, signup_limiter, status_update_limiter, two_factor_login_limiter, two_factor_mutation_limiter, upload_limiter};
 
 #[derive(MultipartForm)]
 pub struct ProfileImageForm {
@@ -205,12 +205,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::resource("/availability-status")
             .wrap(from_fn(require_active_account))
             .wrap(from_fn(verify_token))
+            .wrap(from_fn(status_update_limiter))
             .route(web::post().to(update_availability_status)),
     );
     cfg.service(
         web::resource("/status")
             .wrap(from_fn(require_active_account))
             .wrap(from_fn(verify_token))
+            .wrap(from_fn(status_update_limiter))
             .route(web::post().to(update_availability_status)),
     );
 

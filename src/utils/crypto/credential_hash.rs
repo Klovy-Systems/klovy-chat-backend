@@ -49,23 +49,30 @@ pub async fn hash_reset_token(plain: &str) -> Result<String, argon2::password_ha
     }
 }
 
-fn verify_with(plain: String, stored_hash: String) -> bool {
+/// `Ok(bool)` verify · `Err(())` parse/crypto failure (callers → 503, not Denied).
+fn verify_with(plain: String, stored_hash: String) -> Result<bool, ()> {
     match PasswordHash::new(&stored_hash) {
-        Ok(parsed) => Argon2::default()
+        Ok(parsed) => Ok(Argon2::default()
             .verify_password(plain.as_bytes(), &parsed)
-            .is_ok(),
-        Err(_) => false,
+            .is_ok()),
+        // Corrupt/unparseable hash ≠ wrong password.
+        Err(_) => Err(()),
     }
 }
 
-pub async fn verify_user_password(plain: &str, stored_hash: &str) -> bool {
+/// `Ok(bool)` verify result · `Err(())` join/runtime/parse failure (callers → 503, not "bad password").
+pub async fn verify_user_password(plain: &str, stored_hash: &str) -> Result<bool, ()> {
     let plain = plain.to_string();
     let stored_hash = stored_hash.to_string();
-    tokio::task::spawn_blocking(move || verify_with(plain, stored_hash))
-        .await
-        .unwrap_or(false)
+    match tokio::task::spawn_blocking(move || verify_with(plain, stored_hash)).await {
+        Ok(inner) => inner,
+        Err(e) => {
+            log::error!("password verify join failed: {e}");
+            Err(())
+        }
+    }
 }
 
-pub async fn verify_reset_token(plain: &str, stored_hash: &str) -> bool {
+pub async fn verify_reset_token(plain: &str, stored_hash: &str) -> Result<bool, ()> {
     verify_user_password(plain, stored_hash).await
 }

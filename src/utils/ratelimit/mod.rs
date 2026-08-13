@@ -49,6 +49,32 @@ impl Store {
     }
 
     pub fn check_and_increment_with_window(&self, key: &str, max: u32, window: Duration) -> bool {
+        if self.would_block_with_window(key, max, window) {
+            return false;
+        }
+        self.increment_with_window(key, window);
+        true
+    }
+
+    /// Peek without consuming a slot (e.g. slowmode before create).
+    pub fn would_block_with_window(&self, key: &str, max: u32, window: Duration) -> bool {
+        let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        match map.get_mut(key) {
+            Some(bucket) if now < bucket.reset => bucket.count >= max,
+            Some(_) => {
+                map.remove(key);
+                let _ = window;
+                false
+            }
+            None => {
+                let _ = window;
+                false
+            }
+        }
+    }
+
+    pub fn increment_with_window(&self, key: &str, window: Duration) {
         let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let bucket = map.entry(key.to_string()).or_insert(Bucket {
@@ -59,11 +85,7 @@ impl Store {
             bucket.count = 0;
             bucket.reset = now + window;
         }
-        if bucket.count >= max {
-            return false;
-        }
         bucket.count += 1;
-        true
     }
 
     pub fn increment(&self, key: &str) {
@@ -198,6 +220,8 @@ static WS_HANDSHAKE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_se
 static CHANGE_PASSWORD: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static CHANGE_USERNAME: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static FRIEND_ACTION: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(5 * 60)));
+static STATUS_UPDATE: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(60)));
+static PIN_MESSAGE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
 static CHAT_ATTACHMENT: Lazy<Store> = Lazy::new(|| {
     Store::new(
         crate::utils::upload_limits::MAX_CHAT_ATTACHMENTS_PER_WINDOW,
@@ -477,6 +501,38 @@ pub async fn friend_action_limiter(
         "friend-action",
         "Too many friend actions. Slow down.",
         5 * 60 * 1000,
+        None,
+        req,
+        next,
+    )
+    .await
+}
+
+pub async fn status_update_limiter(
+    req: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
+    limit_all(
+        &STATUS_UPDATE,
+        "status-update",
+        "Too many status updates. Slow down.",
+        60 * 1000,
+        None,
+        req,
+        next,
+    )
+    .await
+}
+
+pub async fn pin_message_limiter(
+    req: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
+    limit_all(
+        &PIN_MESSAGE,
+        "pin-message",
+        "Too many pin actions. Slow down.",
+        60 * 1000,
         None,
         req,
         next,

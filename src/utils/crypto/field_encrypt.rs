@@ -42,7 +42,6 @@ fn encryption_key() -> Result<[u8; 32], String> {
 }
 
 /// All keys that may decrypt historical ciphertext (primary + legacy fallbacks).
-/// Cached so hot read paths do not re-read env / re-derive on every message.
 fn decrypt_candidate_keys() -> &'static [[u8; 32]] {
     static KEYS: OnceLock<Vec<[u8; 32]>> = OnceLock::new();
     KEYS.get_or_init(|| {
@@ -71,14 +70,35 @@ fn decrypt_candidate_keys() -> &'static [[u8; 32]] {
     .as_slice()
 }
 
-fn decrypt_with_key(key: &[u8; 32], encoded: &str) -> Result<String, String> {
+fn encrypt_cipher() -> Result<&'static Aes256Gcm, String> {
+    static CIPHER: OnceLock<Aes256Gcm> = OnceLock::new();
+    if let Some(c) = CIPHER.get() {
+        return Ok(c);
+    }
+    let key = encryption_key()?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
+    Ok(CIPHER.get_or_init(|| cipher))
+}
+
+fn decrypt_ciphers() -> &'static [Aes256Gcm] {
+    static CIPHERS: OnceLock<Vec<Aes256Gcm>> = OnceLock::new();
+    CIPHERS
+        .get_or_init(|| {
+            decrypt_candidate_keys()
+                .iter()
+                .filter_map(|key| Aes256Gcm::new_from_slice(key).ok())
+                .collect()
+        })
+        .as_slice()
+}
+
+fn decrypt_with_cipher(cipher: &Aes256Gcm, encoded: &str) -> Result<String, String> {
     let data = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, encoded)
         .ok_or_else(|| "Invalid encrypted field".to_string())?;
     if data.len() <= NONCE_LEN {
         return Err("Invalid encrypted field".to_string());
     }
     let (nonce_bytes, ciphertext) = data.split_at(NONCE_LEN);
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
     let nonce = Nonce::from_slice(nonce_bytes);
     let plain = cipher
         .decrypt(nonce, ciphertext)
@@ -87,8 +107,7 @@ fn decrypt_with_key(key: &[u8; 32], encoded: &str) -> Result<String, String> {
 }
 
 pub fn encrypt_field(plain: &str) -> Result<String, String> {
-    let key = encryption_key()?;
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let cipher = encrypt_cipher()?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
     aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut OsRng, &mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -102,13 +121,13 @@ pub fn encrypt_field(plain: &str) -> Result<String, String> {
 }
 
 pub fn decrypt_field(encoded: &str) -> Result<String, String> {
-    let keys = decrypt_candidate_keys();
-    if keys.is_empty() {
+    let ciphers = decrypt_ciphers();
+    if ciphers.is_empty() {
         return Err("No encryption key configured".to_string());
     }
     let mut last_err = None;
-    for key in keys {
-        match decrypt_with_key(key, encoded) {
+    for cipher in ciphers {
+        match decrypt_with_cipher(cipher, encoded) {
             Ok(value) => return Ok(value),
             Err(err) => last_err = Some(err),
         }

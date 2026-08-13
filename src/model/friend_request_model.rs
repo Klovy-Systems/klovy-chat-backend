@@ -49,6 +49,18 @@ impl FriendRequest {
         col.create_index(IndexModel::builder().keys(doc! { "from": 1 }).build()).await?;
         col.create_index(IndexModel::builder().keys(doc! { "to": 1 }).build()).await?;
         col.create_index(IndexModel::builder().keys(doc! { "status": 1 }).build()).await?;
+        col.create_index(
+            IndexModel::builder()
+                .keys(doc! { "status": 1, "from": 1 })
+                .build(),
+        )
+        .await?;
+        col.create_index(
+            IndexModel::builder()
+                .keys(doc! { "status": 1, "to": 1 })
+                .build(),
+        )
+        .await?;
 
         col.create_index(
             IndexModel::builder()

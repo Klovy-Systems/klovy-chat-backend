@@ -174,4 +174,18 @@ impl Invite {
             .with_options(options)
             .await
     }
+
+    /// Refund a previously claimed join slot (e.g. banned after consume, before join).
+    pub async fn release_use(db: &Database, invite_id: &str) -> mongodb::error::Result<()> {
+        Self::collection(db)
+            .update_one(
+                doc! {
+                    "inviteId": invite_id,
+                    "useCount": { "$gt": 0 },
+                },
+                doc! { "$inc": { "useCount": -1 } },
+            )
+            .await?;
+        Ok(())
+    }
 }

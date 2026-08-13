@@ -1,0 +1,97 @@
+//! Short-TTL channel membership cache for send / mark-read / react hot paths.
+//! Invalidated alongside typing_access_cache when membership/moderation changes.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use once_cell::sync::Lazy;
+
+use crate::model::channel_model::Channel;
+use crate::utils::access::membership_gate::AccessDeniedReason;
+
+const ALLOW_TTL_MS: i64 = 30_000;
+const DENY_TTL_MS: i64 = 3_000;
+
+#[derive(Clone)]
+enum Cached {
+    Allow { at_ms: i64, channel: Channel },
+    Deny { at_ms: i64, reason: AccessDeniedReason },
+}
+
+static CACHE: Lazy<Mutex<HashMap<String, Cached>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn key(channel_id: &str, user_id: &str) -> String {
+    format!("{channel_id}:{user_id}")
+}
+
+pub fn get(
+    channel_id: &str,
+    user_id: &str,
+) -> Option<Result<Channel, AccessDeniedReason>> {
+    let guard = CACHE.lock().ok()?;
+    let entry = guard.get(&key(channel_id, user_id))?;
+    match entry {
+        Cached::Allow { at_ms, channel } => {
+            if now_ms().saturating_sub(*at_ms) > ALLOW_TTL_MS {
+                return None;
+            }
+            Some(Ok(channel.clone()))
+        }
+        Cached::Deny { at_ms, reason } => {
+            if now_ms().saturating_sub(*at_ms) > DENY_TTL_MS {
+                return None;
+            }
+            Some(Err(reason.clone()))
+        }
+    }
+}
+
+pub fn put_ok(channel_id: &str, user_id: &str, channel: Channel) {
+    if let Ok(mut guard) = CACHE.lock() {
+        guard.insert(
+            key(channel_id, user_id),
+            Cached::Allow {
+                at_ms: now_ms(),
+                channel,
+            },
+        );
+    }
+}
+
+pub fn put_err(channel_id: &str, user_id: &str, reason: AccessDeniedReason) {
+    if let Ok(mut guard) = CACHE.lock() {
+        guard.insert(
+            key(channel_id, user_id),
+            Cached::Deny {
+                at_ms: now_ms(),
+                reason,
+            },
+        );
+    }
+}
+
+pub fn invalidate_channel(channel_id: &str) {
+    if let Ok(mut guard) = CACHE.lock() {
+        let prefix = format!("{channel_id}:");
+        guard.retain(|k, _| !k.starts_with(&prefix));
+    }
+}
+
+pub fn invalidate_user(user_id: &str) {
+    if let Ok(mut guard) = CACHE.lock() {
+        let suffix = format!(":{user_id}");
+        guard.retain(|k, _| !k.ends_with(&suffix));
+    }
+}
+
+pub fn clear_user(user_id: &str) {
+    invalidate_user(user_id);
+}

@@ -3,6 +3,7 @@ pub mod frame_crypto;
 pub mod handlers;
 pub mod registry;
 pub mod state;
+pub mod typing_access_cache;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,15 +29,18 @@ use crate::utils::security::client_id::{query_client_valid, query_param, WS_CRYP
 use crate::utils::security::origin::is_origin_header_allowed;
 use crate::utils::security::transport::is_secure_client_connection;
 use crate::ws::crypto_store::{consume_ws_crypto_key, ws_frame_encryption_required};
-use crate::ws::frame_crypto::{decrypt_frame, encrypt_frame};
-use crate::ws::handlers::{dispatch_message, on_user_connected, on_user_disconnected};
+use crate::ws::frame_crypto::FrameCipher;
+use crate::ws::handlers::{
+    dispatch_message, finalize_taken_call_sessions, on_user_connected, on_user_disconnected,
+};
+use crate::utils::voice::call_sessions::take_sessions_for_connection;
 use crate::ws::registry::ConnectionRegistry;
 use crate::ws::state::{is_valid_object_id, SocketState};
 use crate::middlewares::auth_middleware::TokenPayload;
 use crate::model::user_model::User;
 use crate::utils::auth::jwt_auth::{
     jwt_decoding_key, parse_jwt_from_cookie_header, parse_refresh_from_cookie_header,
-    resolve_session_family_id, user_from_jwt_with_refresh,
+    resolve_session_family_id, user_from_jwt_with_refresh, JwtUserError,
 };
 use crate::utils::auth::jwt_validation::hs256_validation;
 use crate::utils::db::get_db;
@@ -112,11 +116,15 @@ pub async fn ws_handler(
     let (user_id, jwt_token) =
         if let Some(token) = cookie_header.and_then(|h| parse_jwt_from_cookie_header(h)) {
             match user_from_jwt_with_refresh(&token, refresh_ref).await {
-                Some(user) => (
+                Ok(user) => (
                     user.id.map(|id| id.to_hex()).unwrap_or_default(),
                     token,
                 ),
-                None => (String::new(), String::new()),
+                Err(JwtUserError::Unavailable) => {
+                    log::warn!("WebSocket rejected — JWT user lookup unavailable");
+                    return (StatusCode::SERVICE_UNAVAILABLE, "Temporarily unavailable").into_response();
+                }
+                Err(JwtUserError::Denied) => (String::new(), String::new()),
             }
         } else {
             (String::new(), String::new())
@@ -131,7 +139,12 @@ pub async fn ws_handler(
         let allowed = match ObjectId::parse_str(&user_id) {
             Ok(oid) => match User::find_by_id(&get_db(), oid).await {
                 Ok(Some(u)) => u.is_whitelisted,
-                _ => false,
+                Ok(None) => false,
+                Err(_) => {
+                    log::warn!("WebSocket rejected — whitelist lookup unavailable");
+                    return (StatusCode::SERVICE_UNAVAILABLE, "Temporarily unavailable")
+                        .into_response();
+                }
             },
             Err(_) => false,
         };
@@ -150,7 +163,15 @@ pub async fn ws_handler(
     };
 
     let session_family_id = if let Some(payload) = session_family_id {
-        resolve_session_family_id(&payload, refresh_ref).await
+        match resolve_session_family_id(&payload, refresh_ref).await {
+            Ok(v) => v,
+            Err(JwtUserError::Unavailable) => {
+                log::warn!("WebSocket rejected — session family lookup unavailable");
+                return (StatusCode::SERVICE_UNAVAILABLE, "Temporarily unavailable")
+                    .into_response();
+            }
+            Err(JwtUserError::Denied) => None,
+        }
     } else {
         None
     };
@@ -158,7 +179,6 @@ pub async fn ws_handler(
     if !app_state
         .socket_state
         .register_ip_connection(&client_ip)
-        .await
     {
         log::warn!("WebSocket rejected — too many connections from IP {}", client_ip);
         return (StatusCode::TOO_MANY_REQUESTS, "Too many connections").into_response();
@@ -171,8 +191,7 @@ pub async fn ws_handler(
             log::warn!("WebSocket rejected — missing frame encryption token for user {}", user_id);
             app_state
                 .socket_state
-                .unregister_ip_connection(&client_ip)
-                .await;
+                .unregister_ip_connection(&client_ip);
             return (StatusCode::FORBIDDEN, "Encryption required").into_response();
         };
         match consume_ws_crypto_key(token, &user_id) {
@@ -181,8 +200,7 @@ pub async fn ws_handler(
                 log::warn!("WebSocket rejected — invalid frame encryption token for user {}", user_id);
                 app_state
                     .socket_state
-                    .unregister_ip_connection(&client_ip)
-                    .await;
+                    .unregister_ip_connection(&client_ip);
                 return (StatusCode::FORBIDDEN, "Invalid encryption token").into_response();
             }
         }
@@ -212,6 +230,7 @@ async fn process_incoming_text(
     state: &SocketState,
     tx: &mpsc::Sender<String>,
     last_pong_at: &mut std::time::Instant,
+    conn_id: u64,
 ) -> bool {
     // Auth is validated on connect and re-checked on AUTH_RECHECK_INTERVAL.
     // Re-running JWT+DB lookup on every frame (typing, ping, send) added a full
@@ -226,7 +245,7 @@ async fn process_incoming_text(
             let _ = tx.try_send(json!({"type":"pong","payload":{}}).to_string());
             return true;
         }
-        dispatch_message(connected, &parsed.msg_type, parsed.payload, state).await;
+        dispatch_message(connected, &parsed.msg_type, parsed.payload, state, conn_id).await;
     }
 
     true
@@ -242,14 +261,14 @@ async fn handle_socket(
     frame_key: Option<[u8; 32]>,
     app_state: WsAppState,
 ) {
-    if !app_state.socket_state.register_connection(&user_id).await {
+    let Some(is_first_connection) = app_state.socket_state.register_connection(&user_id)
+    else {
         log::warn!("Too many connections for user {}", user_id);
         app_state
             .socket_state
-            .unregister_ip_connection(&client_ip)
-            .await;
+            .unregister_ip_connection(&client_ip);
         return;
-    }
+    };
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::channel::<String>(registry::WS_SEND_BUFFER);
@@ -259,7 +278,12 @@ async fn handle_socket(
         .register(&user_id, tx.clone(), revoke_tx, session_family_id)
         .await;
 
-    on_user_connected(&user_id).await;
+    if is_first_connection {
+        let user_id_for_presence = user_id.clone();
+        tokio::spawn(async move {
+            on_user_connected(&user_id_for_presence).await;
+        });
+    }
     log::info!("User connected: {}", user_id);
 
     let state = app_state.socket_state.clone();
@@ -272,13 +296,38 @@ async fn handle_socket(
     ping_interval.tick().await;
     let mut last_pong_at = std::time::Instant::now();
 
-    let encryption_required = frame_key.is_some();
+    let frame_cipher = match frame_key {
+        Some(key) => match FrameCipher::new(&key) {
+            Ok(cipher) => Some(cipher),
+            Err(e) => {
+                log::error!("WebSocket frame cipher init failed for {}: {e}", user_id);
+                app_state.registry.unregister(&user_id, conn_id).await;
+                app_state.socket_state.unregister_connection(&user_id);
+                app_state
+                    .socket_state
+                    .unregister_ip_connection(&client_ip);
+                return;
+            }
+        },
+        None => None,
+    };
+    let encryption_required = frame_cipher.is_some();
+
+    // Auth recheck runs off the socket loop; failure closes via this watch.
+    let (auth_fail_tx, mut auth_fail_rx) = watch::channel(false);
 
     loop {
         tokio::select! {
             _ = revoke_rx.changed() => {
                 if *revoke_rx.borrow_and_update() {
                     log::info!("WebSocket session revoked for user {}", user_id);
+                    let _ = ws_sender.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+            _ = auth_fail_rx.changed() => {
+                if *auth_fail_rx.borrow_and_update() {
+                    log::info!("WebSocket session expired for user {}", user_id);
                     let _ = ws_sender.send(Message::Close(None)).await;
                     break;
                 }
@@ -298,37 +347,47 @@ async fn handle_socket(
                 }
             }
             _ = auth_interval.tick() => {
-                if user_from_jwt_with_refresh(
-                    &jwt_token,
-                    refresh_token.as_deref(),
-                )
-                .await
-                .is_none()
-                {
-                    log::info!("WebSocket session expired for user {}", user_id);
-                    let _ = ws_sender.send(Message::Close(None)).await;
-                    break;
-                }
-                if is_whitelist_enabled() {
-                    let still_allowed = match ObjectId::parse_str(&user_id) {
-                        Ok(oid) => match User::find_by_id(&get_db(), oid).await {
-                            Ok(Some(u)) => u.is_whitelisted,
-                            _ => false,
-                        },
-                        Err(_) => false,
-                    };
-                    if !still_allowed {
-                        log::info!("WebSocket closed — whitelist revoked for {}", user_id);
-                        let _ = ws_sender.send(Message::Close(None)).await;
-                        break;
+                let jwt_token = jwt_token.clone();
+                let refresh_token = refresh_token.clone();
+                let user_id = user_id.clone();
+                let auth_fail_tx = auth_fail_tx.clone();
+                tokio::spawn(async move {
+                    match user_from_jwt_with_refresh(
+                        &jwt_token,
+                        refresh_token.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(_) => {}
+                        // Transient Mongo — do not kick a live socket.
+                        Err(JwtUserError::Unavailable) => return,
+                        Err(JwtUserError::Denied) => {
+                            let _ = auth_fail_tx.send(true);
+                            return;
+                        }
                     }
-                }
+                    if is_whitelist_enabled() {
+                        let still_allowed = match ObjectId::parse_str(&user_id) {
+                            Ok(oid) => match User::find_by_id(&get_db(), oid).await {
+                                Ok(Some(u)) => u.is_whitelisted,
+                                Ok(None) => false,
+                                // Transient — keep the socket; next tick retries.
+                                Err(_) => return,
+                            },
+                            Err(_) => false,
+                        };
+                        if !still_allowed {
+                            log::info!("WebSocket closed — whitelist revoked for {}", user_id);
+                            let _ = auth_fail_tx.send(true);
+                        }
+                    }
+                });
             }
             msg = rx.recv() => {
                 match msg {
                     Some(text) => {
-                        let outbound = if let Some(key) = frame_key {
-                            match encrypt_frame(&key, &text) {
+                        let outbound = if let Some(cipher) = &frame_cipher {
+                            match cipher.encrypt(&text) {
                                 Ok(bytes) => Message::Binary(bytes.into()),
                                 Err(e) => {
                                     log::warn!("WebSocket encrypt failed for user {}: {e}", user_id);
@@ -351,8 +410,8 @@ async fn handle_socket(
                         if data.len() > MAX_PAYLOAD {
                             continue;
                         }
-                        let text = if let Some(key) = frame_key {
-                            match decrypt_frame(&key, &data) {
+                        let text = if let Some(cipher) = &frame_cipher {
+                            match cipher.decrypt(&data) {
                                 Ok(value) => value,
                                 Err(e) => {
                                     log::warn!("WebSocket decrypt failed for user {}: {e}", user_id);
@@ -368,6 +427,7 @@ async fn handle_socket(
                             &state,
                             &tx,
                             &mut last_pong_at,
+                            conn_id,
                         )
                         .await
                         {
@@ -389,6 +449,7 @@ async fn handle_socket(
                             &state,
                             &tx,
                             &mut last_pong_at,
+                            conn_id,
                         )
                         .await
                         {
@@ -411,17 +472,102 @@ async fn handle_socket(
         }
     }
     app_state.registry.unregister(&user_id, conn_id).await;
-    app_state.socket_state.unregister_connection(&user_id).await;
+    app_state.socket_state.unregister_connection(&user_id);
     app_state
         .socket_state
-        .unregister_ip_connection(&client_ip)
-        .await;
+        .unregister_ip_connection(&client_ip);
+
+    let last_connection = !app_state.socket_state.is_user_connected(&user_id);
+
+    // Drop channel-voice owned by this connection only when OTHER tabs remain.
+    // Last-tab drop waits for reconnect grace (same as DM calls) so refresh does
+    // not flicker peers with a false leave.
+    if !last_connection {
+        let voice_left =
+            crate::utils::voice::channel_voice::clear_connection(&user_id, conn_id);
+        if !voice_left.is_empty() {
+            let user_id_voice = user_id.clone();
+            tokio::spawn(async move {
+                use crate::model::channel_model::Channel;
+                use crate::utils::db::get_db;
+                use crate::ws::registry::{channel_recipient_ids, emit_to_users};
+                use mongodb::bson::oid::ObjectId;
+                use serde_json::json;
+                let db = get_db();
+                for channel_id in voice_left {
+                    let participants =
+                        crate::utils::voice::channel_voice::participants_in_channel(&channel_id);
+                    let body = json!({ "channelId": channel_id, "participants": participants });
+                    let Ok(oid) = ObjectId::parse_str(&channel_id) else {
+                        let mut recipients = participants.clone();
+                        if !recipients.iter().any(|r| r == &user_id_voice) {
+                            recipients.push(user_id_voice.clone());
+                        }
+                        if !recipients.is_empty() {
+                            emit_to_users(&recipients, "channel-voice:state", body);
+                        }
+                        continue;
+                    };
+                    let channel = match Channel::find_by_id(&db, oid).await {
+                        Ok(Some(ch)) => Some(ch),
+                        // Missing or transient — caller uses read-state / skip fanout.
+                        Ok(None) | Err(_) => None,
+                    };
+                    if let Some(ch) = channel {
+                        let mut recipients = channel_recipient_ids(&ch);
+                        if !recipients.iter().any(|r| r == &user_id_voice) {
+                            recipients.push(user_id_voice.clone());
+                        }
+                        for p in &participants {
+                            if !recipients.iter().any(|r| r == p) {
+                                recipients.push(p.clone());
+                            }
+                        }
+                        emit_to_users(&recipients, "channel-voice:state", body);
+                    } else {
+                        let mut recipients = participants.clone();
+                        if !recipients.iter().any(|r| r == &user_id_voice) {
+                            recipients.push(user_id_voice.clone());
+                        }
+                        if !recipients.is_empty() {
+                            emit_to_users(&recipients, "channel-voice:state", body);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // Drop DM call sessions owned by this connection only when OTHER tabs remain.
+    // Last-tab drop must not bypass the reconnect grace — otherwise caller/accepted
+    // sessions die immediately on refresh and peer gets cancelled/ended.
+    if !last_connection {
+        let call_left = take_sessions_for_connection(&user_id, conn_id);
+        if !call_left.is_empty() {
+            let user_id_call = user_id.clone();
+            tokio::spawn(async move {
+                finalize_taken_call_sessions(&user_id_call, call_left).await;
+            });
+        }
+    }
 
     // Ustaw offline / wyczyść stan tylko gdy to było OSTATNIE aktywne połączenie
     // użytkownika (inaczej zamknięcie jednej karty wyłączałoby go na innych).
-    if !app_state.socket_state.is_user_connected(&user_id).await {
-        app_state.socket_state.clear_user_state(&user_id).await;
-        on_user_disconnected(&user_id).await;
+    // Grace window: a quick reconnect (new tab / refresh) must not tear down
+    // call sessions / presence before the new socket registers.
+    if last_connection {
+        let user_id_for_presence = user_id.clone();
+        let socket_state = app_state.socket_state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if socket_state.is_user_connected(&user_id_for_presence)
+                || socket_state.connection_count(&user_id_for_presence) > 0
+            {
+                return;
+            }
+            socket_state.clear_user_state(&user_id_for_presence);
+            on_user_disconnected(&user_id_for_presence, &socket_state).await;
+        });
     }
     log::info!("User disconnected: {}", user_id);
 }

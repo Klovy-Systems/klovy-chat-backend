@@ -35,14 +35,17 @@ pub fn has_everyone_mention(content: &str) -> bool {
     !content.is_empty() && EVERYONE_REGEX.is_match(content)
 }
 
+/// Resolve @username mentions among allowed users.
+/// `Ok(vec![])` when there are no usernames / no allowed ids.
+/// `Err(())` on Mongo failure — callers must fail closed (never invent empty mentions).
 pub async fn resolve_mentions(
     db: &Database,
     content: &str,
     allowed_user_ids: &[String],
-) -> Vec<ObjectId> {
+) -> Result<Vec<ObjectId>, ()> {
     let usernames = extract_mention_usernames(content);
     if usernames.is_empty() || allowed_user_ids.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
 
     let allowed: Vec<ObjectId> = allowed_user_ids
@@ -50,16 +53,19 @@ pub async fn resolve_mentions(
         .filter_map(|id| ObjectId::parse_str(id).ok())
         .collect();
     if allowed.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
 
     let users: Vec<User> = match User::collection(db)
         .find(doc! { "_id": { "$in": &allowed }, "username": { "$in": &usernames } })
         .await
     {
-        Ok(c) => futures_util::TryStreamExt::try_collect(c).await.unwrap_or_default(),
-        Err(_) => return vec![],
+        Ok(c) => match futures_util::TryStreamExt::try_collect(c).await {
+            Ok(u) => u,
+            Err(_) => return Err(()),
+        },
+        Err(_) => return Err(()),
     };
 
-    users.into_iter().filter_map(|u| u.id).collect()
+    Ok(users.into_iter().filter_map(|u| u.id).collect())
 }

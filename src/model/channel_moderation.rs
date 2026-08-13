@@ -70,8 +70,8 @@ where
                 expires_at: None,
                 created_at: now,
             }),
-            ModerationEntryCompat::Full(entry) if entry.is_active() => Some(entry),
-            ModerationEntryCompat::Full(_) => None,
+            // Keep expired entries so maybe_prune can persist cleanup + notify.
+            ModerationEntryCompat::Full(entry) => Some(entry),
         })
         .collect())
 }

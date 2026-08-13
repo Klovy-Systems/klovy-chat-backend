@@ -91,19 +91,15 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
         match msg.quoted_message {
             Some(q) => match Message::find_by_id(db, q).await {
                 Ok(Some(qm)) => Box::pin(serialize_message_inner(db, &qm, false)).await,
-                _ => Value::Null,
+                Ok(None) => Value::Null,
+                // Do not invent missing quote on Mongo Err.
+                Err(_) => json!({ "_id": q.to_hex(), "unavailable": true }),
             },
             None => Value::Null,
         }
     } else {
         Value::Null
     };
-
-    let read_by: Vec<Value> = msg
-        .read_by
-        .iter()
-        .map(|rb| json!({ "user": rb.user.to_hex(), "readAt": iso(&rb.read_at) }))
-        .collect();
 
     json!({
         "_id": msg.id.map(|o| o.to_hex()),
@@ -117,9 +113,9 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
         "fileSize": msg.file_size,
         "fileName": msg.file_name,
         "durationMs": msg.duration_ms,
+        "clientNonce": msg.client_nonce,
         "timestamp": iso(&msg.timestamp),
         "read": msg.read,
-        "readBy": read_by,
         "reactions": reactions_to_json(msg),
         "quotedMessage": quoted,
         "mentions": mentions,
@@ -174,10 +170,17 @@ fn cached_user(users: &HashMap<ObjectId, Value>, id: ObjectId) -> Value {
     users.get(&id).cloned().unwrap_or(Value::Null)
 }
 
+enum QuotedSer<'a> {
+    None,
+    Present(&'a Message),
+    /// Quote id known but load failed — never invent Null as "no quote".
+    Unavailable(ObjectId),
+}
+
 fn serialize_message_cached(
     msg: &Message,
     users: &HashMap<ObjectId, Value>,
-    quoted: Option<&Message>,
+    quoted: QuotedSer<'_>,
 ) -> Value {
     let sender = cached_user(users, msg.sender);
     let recipient = msg
@@ -191,15 +194,10 @@ fn serialize_message_cached(
     let mentions: Vec<Value> = msg.mentions.iter().map(|m| cached_user(users, *m)).collect();
 
     let quoted = match quoted {
-        Some(qm) => serialize_message_cached(qm, users, None),
-        None => Value::Null,
+        QuotedSer::Present(qm) => serialize_message_cached(qm, users, QuotedSer::None),
+        QuotedSer::None => Value::Null,
+        QuotedSer::Unavailable(id) => json!({ "_id": id.to_hex(), "unavailable": true }),
     };
-
-    let read_by: Vec<Value> = msg
-        .read_by
-        .iter()
-        .map(|rb| json!({ "user": rb.user.to_hex(), "readAt": iso(&rb.read_at) }))
-        .collect();
 
     json!({
         "_id": msg.id.map(|o| o.to_hex()),
@@ -213,9 +211,9 @@ fn serialize_message_cached(
         "fileSize": msg.file_size,
         "fileName": msg.file_name,
         "durationMs": msg.duration_ms,
+        "clientNonce": msg.client_nonce,
         "timestamp": iso(&msg.timestamp),
         "read": msg.read,
-        "readBy": read_by,
         "reactions": reactions_to_json(msg),
         "quotedMessage": quoted,
         "mentions": mentions,
@@ -243,17 +241,23 @@ pub async fn serialize_messages_batch(db: &Database, msgs: &[Message]) -> Vec<Va
     // 1. Fetch all quoted messages in one query.
     let quoted_ids: Vec<ObjectId> = msgs.iter().filter_map(|m| m.quoted_message).collect();
     let mut quoted_map: HashMap<ObjectId, Message> = HashMap::new();
+    let mut quotes_unavailable = false;
     if !quoted_ids.is_empty() {
-        if let Ok(cursor) = Message::collection(db)
+        match Message::collection(db)
             .find(doc! { "_id": { "$in": &quoted_ids } })
             .await
         {
-            let list: Vec<Message> = cursor.try_collect().await.unwrap_or_default();
-            for m in list {
-                if let Some(id) = m.id {
-                    quoted_map.insert(id, m);
+            Ok(cursor) => match cursor.try_collect::<Vec<Message>>().await {
+                Ok(list) => {
+                    for m in list {
+                        if let Some(id) = m.id {
+                            quoted_map.insert(id, m);
+                        }
+                    }
                 }
-            }
+                Err(_) => quotes_unavailable = true,
+            },
+            Err(_) => quotes_unavailable = true,
         }
     }
 
@@ -285,25 +289,43 @@ pub async fn serialize_messages_batch(db: &Database, msgs: &[Message]) -> Vec<Va
 
     msgs.iter()
         .map(|m| {
-            let quoted = m.quoted_message.and_then(|q| quoted_map.get(&q));
+            let quoted = match m.quoted_message {
+                Some(q) => match quoted_map.get(&q) {
+                    Some(qm) => QuotedSer::Present(qm),
+                    None if quotes_unavailable => QuotedSer::Unavailable(q),
+                    None => QuotedSer::None,
+                },
+                None => QuotedSer::None,
+            };
             serialize_message_cached(m, &user_map, quoted)
         })
         .collect()
 }
 
 pub async fn can_pin_message(db: &Database, user_id: &str, msg: &Message) -> bool {
+    matches!(try_can_pin_message(db, user_id, msg).await, Ok(true))
+}
+
+pub async fn try_can_pin_message(
+    db: &Database,
+    user_id: &str,
+    msg: &Message,
+) -> Result<bool, crate::utils::access::membership_gate::AccessDeniedReason> {
+    use crate::utils::access::membership_gate::AccessDeniedReason;
     if msg.deleted {
-        return false;
+        return Ok(false);
     }
 
     if let Some(channel_id) = msg.channel {
-        let Ok(Some(channel)) = Channel::find_by_id(db, channel_id).await else {
-            return false;
+        let channel = match Channel::find_by_id(db, channel_id).await {
+            Ok(Some(ch)) => ch,
+            Ok(None) => return Ok(false),
+            Err(_) => return Err(AccessDeniedReason::Unavailable),
         };
         if !can_access_channel(&channel, Some(user_id)) {
-            return false;
+            return Ok(false);
         }
-        return is_channel_admin(&channel, Some(user_id));
+        return Ok(is_channel_admin(&channel, Some(user_id)));
     }
 
     if let Some(recipient) = msg.recipient {
@@ -311,16 +333,21 @@ pub async fn can_pin_message(db: &Database, user_id: &str, msg: &Message) -> boo
         let recipient_id = recipient.to_hex();
         let is_participant = user_id == sender_id || user_id == recipient_id;
         if !is_participant {
-            return false;
+            return Ok(false);
         }
-        let other_id = if user_id == sender_id { recipient_id } else { sender_id };
-        if require_dm_access(db, user_id, &other_id).await.is_err() {
-            return false;
+        let other_id = if user_id == sender_id {
+            recipient_id
+        } else {
+            sender_id
+        };
+        match require_dm_access(db, user_id, &other_id).await {
+            Ok(()) => return Ok(true),
+            Err(AccessDeniedReason::Unavailable) => return Err(AccessDeniedReason::Unavailable),
+            Err(_) => return Ok(false),
         }
-        return true;
     }
 
-    false
+    Ok(false)
 }
 
 pub fn dm_conversation_base_clauses(user: ObjectId, contact: ObjectId) -> Vec<mongodb::bson::Document> {
@@ -342,23 +369,31 @@ pub fn message_belongs_to_dm_conversation(msg: &Message, user: ObjectId, contact
             || (msg.sender == contact && msg.recipient == Some(user)))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorValidateError {
+    Invalid,
+    Unavailable,
+}
+
 /// Kursor paginacji musi wskazywać wiadomość z tej samej rozmowy DM.
 pub async fn validate_dm_history_before_cursor(
     db: &Database,
     user: ObjectId,
     contact: ObjectId,
     before_id: &str,
-) -> Result<ObjectId, ()> {
+) -> Result<ObjectId, CursorValidateError> {
     let Ok(before_oid) = ObjectId::parse_str(before_id) else {
-        return Err(());
+        return Err(CursorValidateError::Invalid);
     };
-    let Some(msg) = Message::find_by_id(db, before_oid).await.ok().flatten() else {
-        return Err(());
+    let msg = match Message::find_by_id(db, before_oid).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return Err(CursorValidateError::Invalid),
+        Err(_) => return Err(CursorValidateError::Unavailable),
     };
     if message_belongs_to_dm_conversation(&msg, user, contact) {
         Ok(before_oid)
     } else {
-        Err(())
+        Err(CursorValidateError::Invalid)
     }
 }
 

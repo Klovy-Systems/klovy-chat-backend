@@ -29,7 +29,8 @@ pub fn search_text_from_stored(stored: &str) -> String {
     normalize_search_text(&reveal_content_internal(stored))
 }
 
-/// Escape user query for a case-insensitive Mongo `$regex` contains match.
+/// Escape user query for a case-insensitive Mongo `$regex` contains match
+/// against already-lowercased `searchText` (no `$options` needed).
 pub fn search_regex_pattern(query: &str) -> String {
     escape_regex(&query.trim().to_lowercase())
 }
@@ -85,11 +86,21 @@ pub async fn collect_message_ids(
     db: &Database,
     filter: Document,
 ) -> mongodb::error::Result<Vec<ObjectId>> {
-    let mut cursor = db
-        .collection::<Document>("messages")
-        .find(filter)
-        .projection(doc! { "_id": 1 })
-        .await?;
+    collect_message_ids_limited(db, filter, None).await
+}
+
+/// Same as [`collect_message_ids`], optionally capped (e.g. mark-read emit budget).
+pub async fn collect_message_ids_limited(
+    db: &Database,
+    filter: Document,
+    limit: Option<i64>,
+) -> mongodb::error::Result<Vec<ObjectId>> {
+    let coll = db.collection::<Document>("messages");
+    let mut find = coll.find(filter).projection(doc! { "_id": 1 });
+    if let Some(limit) = limit {
+        find = find.limit(limit);
+    }
+    let mut cursor = find.await?;
 
     let mut ids = Vec::new();
     while let Some(doc) = cursor.try_next().await? {

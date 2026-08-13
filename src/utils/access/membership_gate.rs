@@ -5,12 +5,14 @@ use crate::model::channel_model::Channel;
 use crate::utils::channel::{
     can_access_channel, is_channel_admin, is_channel_muted_member,
 };
-use crate::utils::friends::{are_friends, is_dm_blocked};
+use crate::utils::friends::try_is_dm_blocked;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessDeniedReason {
     InvalidId,
     NotFound,
+    /// Transient DB/transport failure — callers must not cache as Denied.
+    Unavailable,
     NotMember,
     Banned,
     Muted,
@@ -23,6 +25,7 @@ impl AccessDeniedReason {
         match self {
             Self::InvalidId => "Invalid ID",
             Self::NotFound => "Resource not found",
+            Self::Unavailable => "Temporarily unavailable",
             Self::NotMember => "Access denied",
             Self::Banned => "You are banned from this channel",
             Self::Muted => "You are muted in this channel",
@@ -37,21 +40,52 @@ pub async fn require_channel_access(
     channel_id: &str,
     user_id: &str,
 ) -> Result<Channel, AccessDeniedReason> {
-    let channel_oid = ObjectId::parse_str(channel_id).map_err(|_| AccessDeniedReason::InvalidId)?;
-    let channel = Channel::find_by_id(db, channel_oid)
-        .await
-        .map_err(|_| AccessDeniedReason::NotFound)?
-        .ok_or(AccessDeniedReason::NotFound)?;
-    let channel = crate::utils::channel::moderation::maybe_prune_channel_moderation(db, &channel).await;
-
-    if !can_access_channel(&channel, Some(user_id)) {
-        if crate::utils::channel::is_channel_banned(&channel, Some(user_id)) {
-            return Err(AccessDeniedReason::Banned);
-        }
-        return Err(AccessDeniedReason::NotMember);
+    if let Some(cached) = crate::utils::access::channel_access_cache::get(channel_id, user_id) {
+        return cached;
     }
 
-    Ok(channel)
+    let channel_oid = ObjectId::parse_str(channel_id).map_err(|_| AccessDeniedReason::InvalidId)?;
+    let result = async {
+        let channel = Channel::find_by_id(db, channel_oid)
+            .await
+            .map_err(|_| AccessDeniedReason::Unavailable)?
+            .ok_or(AccessDeniedReason::NotFound)?;
+        let channel =
+            crate::utils::channel::moderation::maybe_prune_channel_moderation(db, &channel).await;
+
+        if !can_access_channel(&channel, Some(user_id)) {
+            if crate::utils::channel::is_channel_banned(&channel, Some(user_id)) {
+                return Err(AccessDeniedReason::Banned);
+            }
+            return Err(AccessDeniedReason::NotMember);
+        }
+
+        Ok(channel)
+    }
+    .await;
+
+    match &result {
+        Ok(channel) => {
+            crate::utils::access::channel_access_cache::put_ok(
+                channel_id,
+                user_id,
+                channel.clone(),
+            );
+        }
+        Err(reason)
+            if *reason != AccessDeniedReason::InvalidId
+                && *reason != AccessDeniedReason::Unavailable =>
+        {
+            crate::utils::access::channel_access_cache::put_err(
+                channel_id,
+                user_id,
+                reason.clone(),
+            );
+        }
+        Err(_) => {}
+    }
+
+    result
 }
 
 pub async fn require_channel_message_access(
@@ -81,10 +115,18 @@ pub async fn require_dm_access(
     if user_id == contact_id {
         return Err(AccessDeniedReason::InvalidId);
     }
-    if !are_friends(db, user_id, contact_id).await {
+    let friends = match crate::utils::friends::try_are_friends(db, user_id, contact_id).await {
+        Ok(v) => v,
+        Err(()) => return Err(AccessDeniedReason::Unavailable),
+    };
+    let blocked = match try_is_dm_blocked(db, user_id, contact_id).await {
+        Ok(v) => v,
+        Err(()) => return Err(AccessDeniedReason::Unavailable),
+    };
+    if !friends {
         return Err(AccessDeniedReason::NotFriends);
     }
-    if is_dm_blocked(db, user_id, contact_id).await {
+    if blocked {
         return Err(AccessDeniedReason::Blocked);
     }
     Ok(())
@@ -112,7 +154,8 @@ pub async fn require_message_participant(
         return Err(AccessDeniedReason::NotFound);
     }
     if let Some(channel_id) = msg.channel {
-        require_channel_message_access(db, &channel_id.to_hex(), user_id).await?;
+        // Mute must not block edit/delete/react on own/participant messages.
+        require_channel_access(db, &channel_id.to_hex(), user_id).await?;
         return Ok(());
     }
     if let Some(recipient) = msg.recipient {
@@ -127,10 +170,22 @@ pub async fn require_message_participant(
         } else {
             sender_id
         };
-        if !are_friends(db, user_id, &other).await {
+        let (friends, blocked) = tokio::join!(
+            crate::utils::friends::try_are_friends(db, user_id, &other),
+            try_is_dm_blocked(db, user_id, &other),
+        );
+        let friends = match friends {
+            Ok(v) => v,
+            Err(()) => return Err(AccessDeniedReason::Unavailable),
+        };
+        let blocked = match blocked {
+            Ok(v) => v,
+            Err(()) => return Err(AccessDeniedReason::Unavailable),
+        };
+        if !friends {
             return Err(AccessDeniedReason::NotFriends);
         }
-        if is_dm_blocked(db, user_id, &other).await {
+        if blocked {
             return Err(AccessDeniedReason::Blocked);
         }
         return Ok(());

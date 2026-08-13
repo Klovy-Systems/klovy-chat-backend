@@ -6,7 +6,7 @@ use crate::model::messages_model::Message;
 use crate::utils::access::membership_gate::{
     require_channel_message_access, require_dm_access, require_message_participant,
 };
-use crate::utils::friends::are_friends;
+use crate::utils::friends::try_are_friends;
 use crate::utils::storage::{
     attachment_path_matches_channel, attachment_path_matches_dm, is_attachment_key,
     is_logical_message_path, is_safe_key, storage,
@@ -30,14 +30,31 @@ pub async fn validate_quote_target(
     user_id: &str,
     quoted_message_id: &str,
     context: QuoteContext,
-) -> Option<Message> {
+) -> Result<Option<Message>, ()> {
+    validate_quote_target_with_access(db, user_id, quoted_message_id, context, false).await
+}
+
+/// When `access_already_checked`, skip membership/friend gates (caller already gated send).
+/// `Ok(None)` = quote invalid/missing (send without quote). `Err(())` = transient DB —
+/// callers must fail the send, not invent "no quote".
+pub async fn validate_quote_target_with_access(
+    db: &Database,
+    user_id: &str,
+    quoted_message_id: &str,
+    context: QuoteContext,
+    access_already_checked: bool,
+) -> Result<Option<Message>, ()> {
     let Ok(qid) = ObjectId::parse_str(quoted_message_id) else {
-        return None;
+        return Ok(None);
     };
 
-    let quoted = Message::find_by_id(db, qid).await.ok().flatten()?;
+    let quoted = match Message::find_by_id(db, qid).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return Ok(None),
+        Err(_) => return Err(()),
+    };
     if quoted.deleted {
-        return None;
+        return Ok(None);
     }
 
     match context {
@@ -47,19 +64,33 @@ pub async fn validate_quote_target(
             let in_conv = (sender == user_id && recipient == contact_id)
                 || (sender == contact_id && recipient == user_id);
             if !in_conv || quoted.recipient.is_none() {
-                return None;
+                return Ok(None);
             }
-            require_dm_access(db, user_id, &contact_id).await.ok()?;
-            Some(quoted)
+            if !access_already_checked {
+                match require_dm_access(db, user_id, &contact_id).await {
+                    Ok(()) => {}
+                    Err(crate::utils::access::membership_gate::AccessDeniedReason::Unavailable) => {
+                        return Err(());
+                    }
+                    Err(_) => return Ok(None),
+                }
+            }
+            Ok(Some(quoted))
         }
         QuoteContext::Channel { channel_id } => {
             if quoted.channel.map(|c| c.to_hex()) != Some(channel_id.clone()) {
-                return None;
+                return Ok(None);
             }
-            require_channel_message_access(db, &channel_id, user_id)
-                .await
-                .ok()?;
-            Some(quoted)
+            if !access_already_checked {
+                match require_channel_message_access(db, &channel_id, user_id).await {
+                    Ok(_) => {}
+                    Err(crate::utils::access::membership_gate::AccessDeniedReason::Unavailable) => {
+                        return Err(());
+                    }
+                    Err(_) => return Ok(None),
+                }
+            }
+            Ok(Some(quoted))
         }
     }
 }
@@ -69,16 +100,25 @@ pub async fn can_react_to_message(db: &Database, user_id: &str, msg: &Message) -
 }
 
 pub async fn can_mark_message_as_read(db: &Database, user_id: &str, msg: &Message) -> bool {
+    matches!(try_can_mark_message_as_read(db, user_id, msg).await, Ok(true))
+}
+
+/// `Ok(true/false)` when gates resolve; `Err(())` on transient friend lookup failure.
+pub async fn try_can_mark_message_as_read(
+    db: &Database,
+    user_id: &str,
+    msg: &Message,
+) -> Result<bool, ()> {
     if msg.deleted || msg.read || msg.channel.is_some() {
-        return false;
+        return Ok(false);
     }
     let Some(recipient) = msg.recipient else {
-        return false;
+        return Ok(false);
     };
     if recipient.to_hex() != user_id {
-        return false;
+        return Ok(false);
     }
-    are_friends(db, user_id, &msg.sender.to_hex()).await
+    try_are_friends(db, user_id, &msg.sender.to_hex()).await
 }
 
 fn attachment_matches_send_context(
@@ -199,16 +239,29 @@ async fn attachment_stored_size_is_valid(
     claimed_size: Option<u64>,
     pending_size: Option<u64>,
 ) -> bool {
-    let actual = match storage().head_public_content_length(path).await {
-        Ok(Some(len)) => len,
-        _ => return false,
-    };
-
     let ext = path.rsplit('.').next().unwrap_or("");
     let is_image = matches!(
         ext.to_ascii_lowercase().as_str(),
         "jpg" | "jpeg" | "png" | "webp"
     );
+
+    // Non-image: pending size already verified at upload — skip R2 HEAD on send FIFO.
+    if !is_image {
+        if let (Some(claimed), Some(expected)) = (claimed_size, pending_size) {
+            if expected > 0
+                && claimed == expected
+                && expected <= crate::utils::upload_limits::MAX_ATTACHMENT_BYTES
+            {
+                return true;
+            }
+        }
+    }
+
+    let actual = match storage().head_public_content_length(path).await {
+        Ok(Some(len)) => len,
+        _ => return false,
+    };
+
     let max_bytes = if is_image {
         crate::utils::upload_limits::MAX_IMAGE_ATTACHMENT_BYTES
     } else {
@@ -340,10 +393,9 @@ pub async fn validate_message_attachment(
                 return false;
             }
 
-            storage()
-                .verify_public_sha256(&path, &pending.file_hash)
-                .await
-                .unwrap_or(false)
+            // Pending upload already stored SHA at upload time + size matches —
+            // skip full R2 download/hash on the send hot path (holds user FIFO).
+            true
         }
     }
 }

@@ -248,6 +248,13 @@ impl User {
         Self::collection(db)
             .create_index(
                 IndexModel::builder()
+                    .keys(doc! { "displayName": 1 })
+                    .build(),
+            )
+            .await?;
+        Self::collection(db)
+            .create_index(
+                IndexModel::builder()
                     .keys(doc! { "createdAt": -1 })
                     .build(),
             )
@@ -359,12 +366,11 @@ impl User {
             .await?
             .ok_or("Incorrect username or user not found")?;
 
-        let is_match = verify_user_password(password, &user.password).await;
-        if !is_match {
-            return Err("Incorrect password".into());
+        match verify_user_password(password, &user.password).await {
+            Ok(true) => Ok(user),
+            Ok(false) => Err("Incorrect password".into()),
+            Err(()) => Err("Temporarily unavailable".into()),
         }
-
-        Ok(user)
     }
 
     pub async fn update_password(

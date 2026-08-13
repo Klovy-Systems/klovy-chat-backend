@@ -1,6 +1,7 @@
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
+use serde_json::json;
 
 use crate::model::channel_model::Channel;
 use crate::model::channel_read_state_model::ChannelReadState;
@@ -224,6 +225,86 @@ pub async fn purge_user_data(
     db: &Database,
     user_id: ObjectId,
 ) -> Result<u64, mongodb::error::Error> {
+    use crate::utils::conversation_tips::DmConversationTip;
+    use crate::ws::registry::{channel_recipient_ids, emit_to_users};
+
+    let user_hex = user_id.to_hex();
+
+    // Invalidate friend caches + drop DM tips before wiping messages/friendships.
+    let friendships: Vec<FriendRequest> = FriendRequest::collection(db)
+        .find(doc! {
+            "status": "accepted",
+            "$or": [{ "from": user_id }, { "to": user_id }],
+        })
+        .await?
+        .try_collect()
+        .await
+        .unwrap_or_default();
+    for f in &friendships {
+        let peer = if f.from == user_id { f.to } else { f.from };
+        let peer_hex = peer.to_hex();
+        crate::utils::friends::invalidate_friend_ids_pair(&user_hex, &peer_hex);
+        crate::ws::typing_access_cache::invalidate_pair(&user_hex, &peer_hex);
+        crate::utils::conversation_tips::clear_dm_tip(db, user_id, peer).await;
+        // Tear down live DM calls (unfriend path does the same).
+        if let Some(session) =
+            crate::utils::voice::call_sessions::take_session_for_pair(&user_hex, &peer_hex)
+        {
+            let end_payload = json!({ "from": user_hex, "reason": "ACCOUNT_DELETED" });
+            let event = match session.phase {
+                crate::utils::voice::call_sessions::CallPhase::Ringing => "call:cancelled",
+                crate::utils::voice::call_sessions::CallPhase::Accepted => "call:ended",
+            };
+            crate::ws::registry::emit_to_user(&session.callee_id, event, end_payload.clone());
+            crate::ws::registry::emit_to_user(&session.caller_id, event, end_payload);
+        }
+    }
+    // Any leftover sessions involving this user (race / non-friend).
+    for session in crate::utils::voice::call_sessions::take_sessions_for_user(&user_hex) {
+        let end_payload = json!({ "from": user_hex, "reason": "ACCOUNT_DELETED" });
+        let event = match session.phase {
+            crate::utils::voice::call_sessions::CallPhase::Ringing => "call:cancelled",
+            crate::utils::voice::call_sessions::CallPhase::Accepted => "call:ended",
+        };
+        crate::ws::registry::emit_to_user(&session.callee_id, event, end_payload.clone());
+        crate::ws::registry::emit_to_user(&session.caller_id, event, end_payload);
+    }
+    // Drop channel-voice memberships and notify peers.
+    for channel_id in crate::utils::voice::channel_voice::clear_user_from_all_channels(&user_hex) {
+        let participants =
+            crate::utils::voice::channel_voice::participants_in_channel(&channel_id);
+        if let Ok(oid) = ObjectId::parse_str(&channel_id) {
+            if let Ok(Some(ch)) = Channel::find_by_id(db, oid).await {
+                let recipients = channel_recipient_ids(&ch);
+                emit_to_users(
+                    &recipients,
+                    "channel-voice:state",
+                    json!({ "channelId": channel_id, "participants": participants }),
+                );
+            }
+        }
+    }
+    let _ = DmConversationTip::collection(db)
+        .delete_many(doc! {
+            "$or": [{ "userA": user_id }, { "userB": user_id }],
+        })
+        .await;
+
+    // Channels where this user posted — tip may point at a message we are about to wipe.
+    let tip_channel_oids: Vec<ObjectId> = Message::collection(db)
+        .distinct("channel", doc! {
+            "sender": user_id,
+            "channel": { "$type": "objectId" },
+        })
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|b| match b {
+            mongodb::bson::Bson::ObjectId(oid) => Some(oid),
+            _ => None,
+        })
+        .collect();
+
     Message::collection(db)
         .delete_many(doc! {
             "$or": [
@@ -246,6 +327,14 @@ pub async fn purge_user_data(
         .delete_many(doc! { "createdBy": user_id })
         .await?;
 
+    // Member channels: notify peers + invalidate before pull.
+    let member_channels: Vec<Channel> = Channel::collection(db)
+        .find(doc! { "members": user_id })
+        .await?
+        .try_collect()
+        .await
+        .unwrap_or_default();
+
     Channel::collection(db)
         .update_many(
             doc! { "members": user_id },
@@ -253,25 +342,84 @@ pub async fn purge_user_data(
         )
         .await?;
 
-    let owned: Vec<ObjectId> = Channel::collection(db)
+    for ch in &member_channels {
+        let Some(cid) = ch.id else { continue };
+        let channel_id = cid.to_hex();
+        crate::ws::typing_access_cache::invalidate_channel(&channel_id);
+        let mut remaining = channel_recipient_ids(ch);
+        remaining.retain(|r| r != &user_hex);
+        let participants =
+            crate::utils::voice::channel_voice::leave_channel_voice(&channel_id, &user_hex);
+        emit_to_users(
+            &remaining,
+            "channel-voice:state",
+            json!({
+                "channelId": channel_id,
+                "participants": participants,
+            }),
+        );
+        emit_to_users(
+            &remaining,
+            "channel-member-left",
+            json!({
+                "channelId": channel_id,
+                "userId": user_hex,
+                "memberCount": remaining.len(),
+            }),
+        );
+    }
+
+    let owned: Vec<Channel> = Channel::collection(db)
         .find(doc! { "admin": user_id })
         .await?
-        .try_collect::<Vec<Channel>>()
-        .await?
-        .into_iter()
-        .filter_map(|c| c.id)
-        .collect();
+        .try_collect()
+        .await
+        .unwrap_or_default();
 
-    let channels_deleted = owned.len() as u64;
-    if !owned.is_empty() {
+    let owned_ids: Vec<ObjectId> = owned.iter().filter_map(|c| c.id).collect();
+    let owned_set: std::collections::HashSet<ObjectId> = owned_ids.iter().copied().collect();
+
+    // Rebuild tips for remaining member channels after hard-deleting this user's posts.
+    for cid in tip_channel_oids {
+        if owned_set.contains(&cid) {
+            continue;
+        }
+        crate::utils::conversation_tips::recompute_channel_tip(db, cid).await;
+    }
+
+    let channels_deleted = owned_ids.len() as u64;
+    if !owned_ids.is_empty() {
+        for ch in &owned {
+            let Some(cid) = ch.id else { continue };
+            let channel_id = cid.to_hex();
+            crate::ws::typing_access_cache::invalidate_channel(&channel_id);
+            crate::utils::voice::channel_voice::clear_channel_voice(&channel_id);
+            let recipients = channel_recipient_ids(ch);
+            emit_to_users(
+                &recipients,
+                "channel-voice:state",
+                json!({
+                    "channelId": channel_id,
+                    "participants": Vec::<String>::new(),
+                }),
+            );
+            emit_to_users(
+                &recipients,
+                "channel-deleted",
+                json!({ "channelId": channel_id }),
+            );
+        }
         Message::collection(db)
-            .delete_many(doc! { "channel": { "$in": &owned } })
+            .delete_many(doc! { "channel": { "$in": &owned_ids } })
             .await?;
         Invite::collection(db)
-            .delete_many(doc! { "channelId": { "$in": &owned } })
+            .delete_many(doc! { "channelId": { "$in": &owned_ids } })
             .await?;
+        let _ = ChannelReadState::collection(db)
+            .delete_many(doc! { "channelId": { "$in": &owned_ids } })
+            .await;
         Channel::collection(db)
-            .delete_many(doc! { "_id": { "$in": &owned } })
+            .delete_many(doc! { "_id": { "$in": &owned_ids } })
             .await?;
     }
 

@@ -10,6 +10,7 @@ pub mod app_env;
 pub mod auth;
 pub mod channel;
 pub mod config_validate;
+pub mod conversation_tips;
 pub mod crypto;
 pub mod db;
 pub mod friends;

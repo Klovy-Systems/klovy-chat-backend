@@ -15,7 +15,7 @@ pub struct UserStorageUsage {
 }
 
 impl UserStorageUsage {
-    fn collection(db: &Database) -> Collection<Self> {
+    pub fn collection(db: &Database) -> Collection<Self> {
         db.collection("user_storage_usage")
     }
 

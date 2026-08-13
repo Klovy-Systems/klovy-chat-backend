@@ -28,15 +28,37 @@ pub async fn update_user_status(req: HttpRequest, body: web::Json<UpdateStatusBo
     };
 
     let db = get_db();
-    if User::set_fields(
+    let user = match User::find_by_id(&db, oid).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "error": "User not found" }));
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({ "error": "Temporarily unavailable. Retry." }));
+        }
+    };
+    let online = user.is_online;
+    let last_seen = user
+        .last_seen
+        .map(|ts| json!(ts.timestamp_millis()))
+        .unwrap_or(json!(null));
+    // Availability only — do not force online (respect appear-offline).
+    match User::set_fields(
         &db,
         oid,
-        doc! { "availabilityStatus": &status, "isOnline": true },
+        doc! { "availabilityStatus": &status },
     )
     .await
-    .is_err()
     {
-        return HttpResponse::InternalServerError().json(json!({ "error": "Server error" }));
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "error": "User not found" }));
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({ "error": "Temporarily unavailable. Retry." }));
+        }
     }
 
     emit_status_event(
@@ -45,12 +67,13 @@ pub async fn update_user_status(req: HttpRequest, body: web::Json<UpdateStatusBo
         json!({
             "userId": user_id,
             "status": {
-                "isOnline": true,
+                "isOnline": online,
                 "availabilityStatus": status,
-                "lastSeen": null,
+                "lastSeen": if online { json!(null) } else { last_seen },
             },
         }),
     )
     .await;
+    crate::utils::user::availability_cache::put(&user_id, &status);
     HttpResponse::Ok().json(json!({ "success": true, "availabilityStatus": status }))
 }

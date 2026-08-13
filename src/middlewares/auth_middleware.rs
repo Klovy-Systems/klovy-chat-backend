@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::user_model::User;
 use crate::utils::auth::jwt_auth::{
-    jwt_decoding_key, user_from_jwt_with_refresh, user_from_token_payload,
+    jwt_decoding_key, user_from_jwt_with_refresh, user_from_token_payload, JwtUserError,
 };
 use crate::utils::auth::refresh_token::REFRESH_COOKIE;
 use crate::utils::auth::jwt_validation::hs256_validation;
@@ -111,14 +111,21 @@ pub async fn verify_token(
 
     let refresh_token = req.cookie(REFRESH_COOKIE).map(|c| c.value().to_string());
 
-    if user_from_token_payload(&payload, refresh_token.as_deref())
-        .await
-        .is_none()
-    {
-        let (req, _) = req.into_parts();
-        let res = HttpResponse::Forbidden()
-            .json(serde_json::json!({ "message": "User not found or inactive." }));
-        return Ok(ServiceResponse::new(req, res));
+    match user_from_token_payload(&payload, refresh_token.as_deref()).await {
+        Ok(_) => {}
+        Err(JwtUserError::Unavailable) => {
+            let (req, _) = req.into_parts();
+            let res = HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "message": "Temporarily unavailable. Retry."
+            }));
+            return Ok(ServiceResponse::new(req, res));
+        }
+        Err(JwtUserError::Denied) => {
+            let (req, _) = req.into_parts();
+            let res = HttpResponse::Forbidden()
+                .json(serde_json::json!({ "message": "User not found or inactive." }));
+            return Ok(ServiceResponse::new(req, res));
+        }
     }
 
     req.extensions_mut().insert(RequestUserId(payload.user_id.clone()));
@@ -148,18 +155,22 @@ pub async fn verify_token_for_logout(
     Ok(next.call(req).await?.map_into_boxed_body())
 }
 
-pub async fn resolve_authenticated_user(req: &ServiceRequest) -> Option<User> {
+pub async fn resolve_authenticated_user(req: &ServiceRequest) -> Result<User, JwtUserError> {
     if let Some(uid) = req.extensions().get::<RequestUserId>() {
         if let Ok(oid) = ObjectId::parse_str(&uid.0) {
-            if let Ok(Some(user)) = User::find_by_id(&get_db(), oid).await {
-                if user.is_login_allowed() {
-                    return Some(user);
-                }
+            match User::find_by_id(&get_db(), oid).await {
+                Ok(Some(user)) if user.is_login_allowed() => return Ok(user),
+                Ok(Some(_)) | Ok(None) => return Err(JwtUserError::Denied),
+                Err(_) => return Err(JwtUserError::Unavailable),
             }
         }
+        return Err(JwtUserError::Denied);
     }
 
-    let token = req.cookie("jwt")?.value().to_string();
+    let token = req
+        .cookie("jwt")
+        .map(|c| c.value().to_string())
+        .ok_or(JwtUserError::Denied)?;
     let refresh_token = req.cookie(REFRESH_COOKIE).map(|c| c.value().to_string());
     user_from_jwt_with_refresh(&token, refresh_token.as_deref()).await
 }
@@ -186,10 +197,17 @@ pub async fn require_active_account(
     let db = get_db();
     let user = match User::find_by_id(&db, user_id).await {
         Ok(Some(u)) => u,
-        _ => {
+        Ok(None) => {
             let (req, _) = req.into_parts();
             let res = HttpResponse::Unauthorized()
                 .json(serde_json::json!({ "error": "User not found" }));
+            return Ok(ServiceResponse::new(req, res));
+        }
+        Err(_) => {
+            let (req, _) = req.into_parts();
+            let res = HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "Temporarily unavailable. Retry."
+            }));
             return Ok(ServiceResponse::new(req, res));
         }
     };

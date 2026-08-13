@@ -1,13 +1,12 @@
 use actix_multipart::form::{tempfile::TempFile, MultipartForm};
 use actix_web::{web, HttpRequest, HttpResponse};
-use futures::future::join_all;
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::middlewares::auth_middleware::request_user_id;
-use crate::utils::access::membership_gate::require_channel_access;
+use crate::utils::access::membership_gate::{require_channel_access, AccessDeniedReason};
 use crate::utils::image_reencode::{reencode_error_message, reencode_upload_to_webp};
 use crate::utils::storage::{avatar_channel_key, avatar_key_owned_by_channel, storage};
 use crate::utils::upload_limits::{file_bytes_within_limit, local_file_size, MAX_AVATAR_BYTES};
@@ -18,13 +17,15 @@ use crate::model::channel_report_model::{ChannelReport, CreateChannelReportInput
 use crate::model::messages_model::Message;
 use crate::model::user_model::User;
 use crate::utils::channel::{
-    can_access_channel, channel_member_count, enrich_channel_unread, fetch_users_by_refs,
-    get_channel_ban_mute_lists, is_channel_admin, is_channel_member, is_channel_muted_member,
-    populate_channel_user, moderation,
+    can_access_channel, channel_member_count, enrich_channel_unread, enrich_channels_batch,
+    fetch_users_by_refs, fetch_users_map_slim, get_channel_ban_mute_lists, is_channel_admin,
+    is_channel_member, is_channel_muted_member, populate_channel_user, serialize_channel_list_item,
+    moderation,
 };
 use crate::ws::registry::{channel_recipient_ids, emit_to_user, emit_to_users};
+use crate::ws::typing_access_cache;
 use crate::utils::db::get_db;
-use crate::utils::friends::are_friends;
+use crate::utils::friends::try_are_friends;
 use crate::utils::messages::serialize_messages_batch;
 
 const REPORT_REASONS: &[&str] = &[
@@ -48,19 +49,28 @@ fn iso(dt: &DateTime) -> Option<String> {
     dt.try_to_rfc3339_string().ok()
 }
 
-async fn serialize_channel_for_client(db: &mongodb::Database, c: &Channel, viewer_id: ObjectId) -> Value {
-    let (unread, last) = enrich_channel_unread(db, viewer_id, c).await;
-    let admin = populate_channel_user(db, c.admin).await;
-    let members = fetch_users_by_refs(db, &c.members).await;
+async fn serialize_channel_for_client(
+    db: &mongodb::Database,
+    c: &Channel,
+    viewer_id: ObjectId,
+) -> Option<Value> {
+    let unread_fut = enrich_channel_unread(db, viewer_id, c);
+    let admin_fut = populate_channel_user(db, c.admin);
+    let members_fut = fetch_users_by_refs(db, &c.members);
+    let mute_fut = User::find_by_id(db, viewer_id);
+    let (unread_tip, admin, members, mute_user) =
+        tokio::join!(unread_fut, admin_fut, members_fut, mute_fut);
+    let (unread, last) = unread_tip?;
     let ch_id = c.id.map(|o| o.to_hex()).unwrap_or_default();
-    let is_muted = User::find_by_id(db, viewer_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|u| u.muted_channels.iter().any(|id| Some(*id) == c.id))
-        .unwrap_or(false);
+    let is_muted = match mute_user {
+        Ok(Some(u)) => u.muted_channels.iter().any(|id| Some(*id) == c.id),
+        // Missing user — fail closed (do not invent unmuted).
+        Ok(None) => return None,
+        // Fail closed — do not report unmuted on lookup Err.
+        Err(_) => return None,
+    };
 
-    json!({
+    Some(json!({
         "_id": ch_id,
         "name": c.name,
         "description": c.description,
@@ -70,6 +80,7 @@ async fn serialize_channel_for_client(db: &mongodb::Database, c: &Channel, viewe
         "bannedMembers": moderation::active_moderation_user_ids(&c.banned_members),
         "mutedMembers": moderation::active_moderation_user_ids(&c.muted_members),
         "isMutedHere": is_channel_muted_member(c, Some(&viewer_id.to_hex())),
+        "mutedHereExpiresAt": moderation::viewer_mute_expires_at(c, &viewer_id.to_hex()),
         // History is loaded via channel field queries; do not ship unbounded ID lists.
         "messages": Vec::<String>::new(),
         "isPrivate": c.is_private,
@@ -78,10 +89,11 @@ async fn serialize_channel_for_client(db: &mongodb::Database, c: &Channel, viewe
         "createdAt": iso(&c.created_at),
         "updatedAt": iso(&c.updated_at),
         "unreadCount": unread,
-        "lastMessage": last.as_ref().map(|(_, c)| c.clone()),
-        "lastMessageTime": last.as_ref().and_then(|(t, _)| iso(t)),
+        "lastMessage": last.as_ref().map(|(_, c, _)| c.clone()),
+        "lastMessageTime": last.as_ref().and_then(|(t, _, _)| iso(t)),
+        "lastMessageId": last.as_ref().map(|(_, _, id)| id.to_hex()),
         "isMuted": is_muted,
-    })
+    }))
 }
 
 #[derive(Deserialize)]
@@ -97,8 +109,17 @@ pub async fn create_channel(req: HttpRequest, body: web::Json<CreateChannelBody>
     };
 
     let db = get_db();
-    if User::find_by_id(&db, uid).await.ok().flatten().is_none() {
-        return HttpResponse::BadRequest().json(json!({ "message": "Admin user not found." }));
+    match User::find_by_id(&db, uid).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return HttpResponse::BadRequest().json(json!({ "message": "Admin user not found." }));
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     }
 
     let mut valid_member_ids: Vec<ObjectId> = Vec::new();
@@ -108,20 +129,45 @@ pub async fn create_channel(req: HttpRequest, body: web::Json<CreateChannelBody>
             .find(doc! { "_id": { "$in": &oids } })
             .await
         {
-            Ok(c) => c.try_collect().await.unwrap_or_default(),
-            Err(_) => return HttpResponse::InternalServerError().json(json!({ "message": "Internal Server Error" })),
+            Ok(c) => match c.try_collect().await {
+                Ok(u) => u,
+                Err(_) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Temporarily unavailable",
+                        "retryable": true,
+                    }));
+                }
+            },
+            Err(_) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
         };
         if found.len() != members.len() {
             return HttpResponse::BadRequest()
                 .json(json!({ "message": "Some members are not valid users." }));
         }
         valid_member_ids = found.into_iter().filter_map(|u| u.id).collect();
+    }
 
-        // Zgoda: do kanału można dodać tylko znajomych twórcy (bez wymuszania
-        // członkostwa obcym osobom).
+    // Zgoda: do kanału można dodać tylko znajomych twórcy (bez wymuszania
+    // członkostwa obcym osobom).
+    if !valid_member_ids.is_empty() {
+        let friend_set: std::collections::HashSet<String> =
+            match crate::utils::friends::try_friend_ids(&db, &user_id).await {
+                Ok(ids) => ids.into_iter().collect(),
+                Err(()) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Temporarily unavailable",
+                        "retryable": true,
+                    }));
+                }
+            };
         for member_oid in &valid_member_ids {
             let member_hex = member_oid.to_hex();
-            if member_hex != user_id && !are_friends(&db, &user_id, &member_hex).await {
+            if member_hex != user_id && !friend_set.contains(&member_hex) {
                 return HttpResponse::Forbidden().json(json!({
                     "message": "Możesz dodawać do kanału tylko swoich znajomych."
                 }));
@@ -140,15 +186,77 @@ pub async fn create_channel(req: HttpRequest, body: web::Json<CreateChannelBody>
 
     match Channel::create(&db, input).await {
         Ok(channel) => {
-            let serialized = serialize_channel_for_client(&db, &channel, uid).await;
+            let Some(serialized) = serialize_channel_for_client(&db, &channel, uid).await else {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Channels temporarily unavailable. Please retry.",
+                    "retryable": true,
+                }));
+            };
             if let Some(ch_id) = channel.id {
-                let ch_hex = ch_id.to_hex();
-                for member_id in &channel.members {
-                    let mid = member_id.to_hex();
-                    if mid != user_id {
-                        emit_to_user(&mid, "channel-added", json!({ "channelId": ch_hex }));
-                    }
+                // Seed read state for admin + initial members (same as invite/add).
+                let mut seed_ids = channel.members.clone();
+                if !seed_ids.iter().any(|m| *m == uid) {
+                    seed_ids.push(uid);
                 }
+                seed_ids.push(channel.admin);
+                let mut seen = std::collections::HashSet::new();
+                let seed_futs: Vec<_> = seed_ids
+                    .into_iter()
+                    .filter(|oid| seen.insert(*oid))
+                    .map(|member_oid| {
+                        let db = db.clone();
+                        async move {
+                            crate::model::channel_read_state_model::ChannelReadState::seed_if_missing(
+                                &db, member_oid, ch_id,
+                            )
+                            .await
+                            .is_ok()
+                        }
+                    })
+                    .collect();
+                let seed_ok = futures_util::future::join_all(seed_futs)
+                    .await
+                    .into_iter()
+                    .all(|ok| ok);
+                if !seed_ok {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Temporarily unavailable",
+                        "retryable": true,
+                    }));
+                }
+
+                let ch_hex = ch_id.to_hex();
+                let notify_futs: Vec<_> = channel
+                    .members
+                    .iter()
+                    .filter(|member_id| member_id.to_hex() != user_id)
+                    .map(|member_id| {
+                        let db = db.clone();
+                        let channel = channel.clone();
+                        let mid = member_id.to_hex();
+                        let ch_hex = ch_hex.clone();
+                        async move {
+                            match serialize_channel_list_item(&db, &channel, *member_id).await {
+                                Some(slim) => {
+                                    emit_to_user(
+                                        &mid,
+                                        "channel-added",
+                                        json!({ "channelId": ch_hex, "channel": slim }),
+                                    );
+                                }
+                                // Mute/unread failed — id-only so client refreshes.
+                                None => {
+                                    emit_to_user(
+                                        &mid,
+                                        "channel-added",
+                                        json!({ "channelId": ch_hex }),
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .collect();
+                futures_util::future::join_all(notify_futs).await;
             }
             HttpResponse::Created().json(json!({ "channel": serialized }))
         }
@@ -168,31 +276,62 @@ pub async fn get_user_channels(req: HttpRequest) -> HttpResponse {
         .sort(doc! { "updatedAt": -1 })
         .await
     {
-        Ok(c) => c.try_collect().await.unwrap_or_default(),
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "message": "Internal Server Error" })),
+        Ok(c) => match c.try_collect().await {
+            Ok(chs) => chs,
+            Err(_) => {
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({ "message": "Channels temporarily unavailable. Please retry." }));
+            }
+        },
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "message": "Internal Server Error" }));
+        }
     };
 
-    let muted: Vec<String> = User::find_by_id(&db, uid)
-        .await
-        .ok()
-        .flatten()
-        .map(|u| u.muted_channels.iter().map(|o| o.to_hex()).collect())
-        .unwrap_or_default();
+    let muted_set: std::collections::HashSet<String> = match User::find_by_id(&db, uid).await {
+        Ok(Some(u)) => u.muted_channels.iter().map(|o| o.to_hex()).collect(),
+        // Missing user mid-request — do not invent all unmuted.
+        Ok(None) => {
+            return HttpResponse::Unauthorized().json(json!({ "message": "Unauthorized" }));
+        }
+        // Fail closed — do not report all channels as unmuted.
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({ "message": "Channels temporarily unavailable. Please retry." }));
+        }
+    };
 
-    let muted_set: std::collections::HashSet<String> = muted.into_iter().collect();
-    let tasks = channels.into_iter().map(|ch| {
-        let db = db.clone();
-        let muted_set = muted_set.clone();
-        async move {
-            let (unread, last) = enrich_channel_unread(&db, uid, &ch).await;
-            let admin = populate_channel_user(&db, ch.admin).await;
-            let members = fetch_users_by_refs(&db, &ch.members).await;
+    // List payload: admin profiles only — member roster loads via channel details.
+    let mut all_user_ids: Vec<ObjectId> = Vec::new();
+    let mut seen_users = std::collections::HashSet::new();
+    for ch in &channels {
+        if seen_users.insert(ch.admin) {
+            all_user_ids.push(ch.admin);
+        }
+    }
+    let users_map = fetch_users_map_slim(&db, &all_user_ids).await;
+    let Some(enrich_map) = enrich_channels_batch(&db, uid, &channels).await else {
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({ "message": "Channels temporarily unavailable. Please retry." }));
+    };
+
+    let mut enriched: Vec<(i64, Value)> = channels
+        .into_iter()
+        .map(|ch| {
+            let ch_oid = ch.id.unwrap_or_default();
+            let (unread, last) = enrich_map.get(&ch_oid).cloned().unwrap_or((0, None));
+            let admin = users_map
+                .get(&ch.admin)
+                .cloned()
+                .unwrap_or_else(|| json!({ "_id": ch.admin.to_hex() }));
             let ch_id = ch.id.map(|o| o.to_hex()).unwrap_or_default();
             let is_muted = muted_set.contains(&ch_id);
+            let member_count = channel_member_count(&ch);
 
             let sort_key = last
                 .as_ref()
-                .map(|(t, _)| t.timestamp_millis())
+                .map(|(t, _, _)| t.timestamp_millis())
                 .unwrap_or_else(|| ch.updated_at.timestamp_millis());
 
             (
@@ -203,23 +342,26 @@ pub async fn get_user_channels(req: HttpRequest) -> HttpResponse {
                     "description": ch.description,
                     "image": ch.image,
                     "admin": admin,
-                    "members": members,
-                    "bannedMembers": moderation::active_moderation_user_ids(&ch.banned_members),
-                    "mutedMembers": moderation::active_moderation_user_ids(&ch.muted_members),
+                    "members": Vec::<Value>::new(),
+                    "memberCount": member_count,
                     "messages": Vec::<String>::new(),
                     "isPrivate": ch.is_private,
                     "createdAt": iso(&ch.created_at),
                     "updatedAt": iso(&ch.updated_at),
                     "unreadCount": unread,
-                    "lastMessage": last.as_ref().map(|(_, c)| c.clone()),
-                    "lastMessageTime": last.as_ref().and_then(|(t, _)| iso(t)),
+                    "lastMessage": last.as_ref().map(|(_, c, _)| c.clone()),
+                    "lastMessageTime": last.as_ref().and_then(|(t, _, _)| iso(t)),
+                    "lastMessageId": last.as_ref().map(|(_, _, id)| id.to_hex()),
                     "isMuted": is_muted,
+                    "isMutedHere": is_channel_muted_member(&ch, Some(&user_id)),
+                    "mutedHereExpiresAt": moderation::viewer_mute_expires_at(&ch, &user_id),
+                    "rateLimitPerUser": ch.rate_limit_per_user,
+                    "chatLocked": ch.chat_locked,
                 }),
             )
-        }
-    });
+        })
+        .collect();
 
-    let mut enriched = join_all(tasks).await;
     enriched.sort_by(|a, b| b.0.cmp(&a.0));
     let channels: Vec<Value> = enriched.into_iter().map(|(_, c)| c).collect();
 
@@ -232,6 +374,12 @@ pub async fn get_channel_messages(req: HttpRequest) -> HttpResponse {
 
     let db = get_db();
     if let Err(reason) = require_channel_access(&db, channel_id, &user_id).await {
+        if reason == AccessDeniedReason::Unavailable {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": reason.as_str(),
+                "retryable": true,
+            }));
+        }
         return HttpResponse::NotFound().json(json!({
             "message": reason.as_str(),
         }));
@@ -269,7 +417,14 @@ pub async fn get_channel_messages(req: HttpRequest) -> HttpResponse {
         .limit(limit + 1)
         .await
     {
-        Ok(c) => c.try_collect().await.unwrap_or_default(),
+        Ok(c) => match c.try_collect().await {
+            Ok(m) => m,
+            Err(e) => {
+                log::error!("get_channel_messages: {e}");
+                return HttpResponse::InternalServerError()
+                    .json(json!({ "message": "Internal Server Error" }));
+            }
+        },
         Err(e) => {
             log::error!("get_channel_messages: {e}");
             return HttpResponse::InternalServerError().json(json!({ "message": "Internal Server Error" }));
@@ -297,20 +452,44 @@ pub async fn get_channel_details(req: HttpRequest) -> HttpResponse {
         Ok(Some(c)) if can_access_channel(&c, Some(&user_id)) => {
             moderation::maybe_prune_channel_moderation(&db, &c).await
         }
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony lub brak dostępu" })),
+        Ok(Some(_)) | Ok(None) => {
+            return HttpResponse::NotFound()
+                .json(json!({ "message": "Kanał nie znaleziony lub brak dostępu" }));
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
-    let muted: Vec<String> = User::find_by_id(&db, ObjectId::parse_str(&user_id).unwrap_or_default())
-        .await
-        .ok()
-        .flatten()
-        .map(|u| u.muted_channels.iter().map(|o| o.to_hex()).collect())
-        .unwrap_or_default();
-    let is_muted = muted.contains(&cid.to_hex());
+    let Ok(viewer_oid) = ObjectId::parse_str(&user_id) else {
+        return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony lub brak dostępu" }));
+    };
+    let is_muted = match User::find_by_id(&db, viewer_oid).await {
+        Ok(Some(u)) => u.muted_channels.iter().any(|id| *id == cid),
+        // Missing user — do not invent unmuted (parity get_user_channels / contacts).
+        Ok(None) => {
+            return HttpResponse::Unauthorized().json(json!({ "message": "Unauthorized" }));
+        }
+        // Fail closed — do not report unmuted on lookup Err.
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Channels temporarily unavailable. Please retry.",
+                "retryable": true,
+            }));
+        }
+    };
 
     let admin = populate_channel_user(&db, channel.admin).await;
     let members = fetch_users_by_refs(&db, &channel.members).await;
-    let (banned_members, muted_members) = get_channel_ban_mute_lists(&db, cid).await;
+    let Some((banned_members, muted_members)) = get_channel_ban_mute_lists(&db, cid).await else {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Channels temporarily unavailable. Please retry.",
+            "retryable": true,
+        }));
+    };
 
     HttpResponse::Ok().json(json!({
         "channel": {
@@ -326,6 +505,7 @@ pub async fn get_channel_details(req: HttpRequest) -> HttpResponse {
             "isAdmin": is_channel_admin(&channel, Some(&user_id)),
             "isMuted": is_muted,
             "isMutedHere": is_channel_muted_member(&channel, Some(&user_id)),
+            "mutedHereExpiresAt": moderation::viewer_mute_expires_at(&channel, &user_id),
             "rateLimitPerUser": channel.rate_limit_per_user,
             "chatLocked": channel.chat_locked,
         }
@@ -353,7 +533,15 @@ pub async fn rename_channel(req: HttpRequest, body: web::Json<RenameBody>) -> Ht
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if channel.admin.to_hex() != user_id {
@@ -361,12 +549,21 @@ pub async fn rename_channel(req: HttpRequest, body: web::Json<RenameBody>) -> Ht
             .json(json!({ "error": "Tylko administrator może zmienić nazwę kanału" }));
     }
 
-    let _ = Channel::collection(&db)
+    match Channel::collection(&db)
         .update_one(
             doc! { "_id": cid },
             doc! { "$set": { "name": &new_name, "updatedAt": DateTime::now() } },
         )
-        .await;
+        .await
+    {
+        Ok(_) => {}
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Failed to rename channel",
+                "retryable": true,
+            }));
+        }
+    }
 
     emit_to_users(
         &channel_recipient_ids(&channel),
@@ -401,7 +598,15 @@ pub async fn update_channel_slowmode(
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if channel.admin.to_hex() != user_id {
@@ -410,7 +615,7 @@ pub async fn update_channel_slowmode(
         }));
     }
 
-    let _ = Channel::collection(&db)
+    match Channel::collection(&db)
         .update_one(
             doc! { "_id": cid },
             doc! {
@@ -420,13 +625,23 @@ pub async fn update_channel_slowmode(
                 }
             },
         )
-        .await;
+        .await
+    {
+        Ok(_) => {}
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Failed to update slowmode",
+                "retryable": true,
+            }));
+        }
+    }
 
     emit_to_users(
         &channel_recipient_ids(&channel),
         "channel-slowmode-updated",
         json!({ "channelId": cid.to_hex(), "rateLimitPerUser": rate_limit }),
     );
+    typing_access_cache::invalidate_channel(&cid.to_hex());
 
     HttpResponse::Ok().json(json!({ "rateLimitPerUser": rate_limit }))
 }
@@ -451,7 +666,15 @@ pub async fn update_channel_chat_lock(
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if channel.admin.to_hex() != user_id {
@@ -460,7 +683,7 @@ pub async fn update_channel_chat_lock(
         }));
     }
 
-    let _ = Channel::collection(&db)
+    match Channel::collection(&db)
         .update_one(
             doc! { "_id": cid },
             doc! {
@@ -470,13 +693,23 @@ pub async fn update_channel_chat_lock(
                 }
             },
         )
-        .await;
+        .await
+    {
+        Ok(_) => {}
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Failed to update chat lock",
+                "retryable": true,
+            }));
+        }
+    }
 
     emit_to_users(
         &channel_recipient_ids(&channel),
         "channel-chat-locked-updated",
         json!({ "channelId": cid.to_hex(), "chatLocked": chat_locked }),
     );
+    typing_access_cache::invalidate_channel(&cid.to_hex());
 
     HttpResponse::Ok().json(json!({ "chatLocked": chat_locked }))
 }
@@ -490,7 +723,15 @@ pub async fn delete_channel_avatar(req: HttpRequest) -> HttpResponse {
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Channel not found" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Channel not found" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if channel.admin.to_hex() != user_id {
@@ -503,12 +744,21 @@ pub async fn delete_channel_avatar(req: HttpRequest) -> HttpResponse {
         if avatar_key_owned_by_channel(&channel.image, &channel_id) {
             let _ = storage().delete_avatar_key(&channel.image).await;
         }
-        let _ = Channel::collection(&db)
+        match Channel::collection(&db)
             .update_one(
                 doc! { "_id": cid },
                 doc! { "$set": { "image": "", "updatedAt": DateTime::now() } },
             )
-            .await;
+            .await
+        {
+            Ok(_) => {}
+            Err(_) => {
+                return HttpResponse::InternalServerError().json(json!({
+                    "message": "Failed to delete channel avatar",
+                    "retryable": true,
+                }));
+            }
+        }
         emit_to_users(
             &channel_recipient_ids(&channel),
             "channel-avatar-updated",
@@ -537,7 +787,15 @@ pub async fn upload_channel_avatar(
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Channel not found" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Channel not found" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if channel.admin.to_hex() != user_id {
@@ -584,12 +842,22 @@ pub async fn upload_channel_avatar(
         return HttpResponse::InternalServerError().json(json!({ "message": "Internal Server Error" }));
     }
 
-    let _ = Channel::collection(&db)
+    match Channel::collection(&db)
         .update_one(
             doc! { "_id": cid },
             doc! { "$set": { "image": &key, "updatedAt": DateTime::now() } },
         )
-        .await;
+        .await
+    {
+        Ok(_) => {}
+        Err(_) => {
+            let _ = storage().delete_avatar_key(&key).await;
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Failed to update channel avatar",
+                "retryable": true,
+            }));
+        }
+    }
 
     if !previous_image.is_empty()
         && previous_image != key
@@ -615,7 +883,15 @@ pub async fn leave_channel(req: HttpRequest) -> HttpResponse {
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Channel not found" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Channel not found" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if channel.admin.to_hex() == user_id {
@@ -624,13 +900,64 @@ pub async fn leave_channel(req: HttpRequest) -> HttpResponse {
     }
 
     if let Ok(uid) = ObjectId::parse_str(&user_id) {
-        let _ = Channel::collection(&db)
+        match Channel::collection(&db)
             .update_one(
                 doc! { "_id": cid },
                 doc! { "$pull": { "members": uid }, "$set": { "updatedAt": DateTime::now() } },
             )
+            .await
+        {
+            Ok(r) if r.modified_count > 0 || r.matched_count > 0 => {}
+            Ok(_) => {
+                return HttpResponse::NotFound().json(json!({ "message": "Channel not found" }));
+            }
+            Err(_) => {
+                return HttpResponse::InternalServerError().json(json!({
+                    "message": "Failed to leave channel",
+                    "retryable": true,
+                }));
+            }
+        }
+    } else {
+        return HttpResponse::BadRequest().json(json!({ "message": "Invalid user" }));
+    }
+
+    typing_access_cache::invalidate_user_channel(&user_id, &cid.to_hex());
+    // Other members still have this user in cached recipients — refresh channel entries.
+    typing_access_cache::invalidate_channel(&cid.to_hex());
+
+    if let Ok(uid) = ObjectId::parse_str(&user_id) {
+        let _ = crate::model::channel_read_state_model::ChannelReadState::collection(&db)
+            .delete_many(doc! { "userId": uid, "channelId": cid })
             .await;
     }
+
+    let channel_id = cid.to_hex();
+    // Fence stale deltas + clear badge if FE missed channel-left.
+    crate::utils::unread::invalidate_unread_generation(&user_id, "channel", &channel_id);
+    crate::utils::unread::emit_unread_absolute(&user_id, "channel", &channel_id, 0);
+    let participants =
+        crate::utils::voice::channel_voice::leave_channel_voice(&channel_id, &user_id);
+    let mut remaining = channel_recipient_ids(&channel);
+    remaining.retain(|r| r != &user_id);
+    let member_count = remaining.len();
+    crate::ws::registry::emit_to_users(
+        &crate::ws::registry::channel_recipient_ids(&channel),
+        "channel-voice:state",
+        json!({
+            "channelId": channel_id,
+            "participants": participants,
+        }),
+    );
+    emit_to_users(
+        &remaining,
+        "channel-member-left",
+        json!({
+            "channelId": channel_id,
+            "userId": user_id,
+            "memberCount": member_count,
+        }),
+    );
 
     emit_to_user(
         &user_id,
@@ -656,7 +983,15 @@ pub async fn add_user_to_channel(req: HttpRequest, body: web::Json<AddUserBody>)
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Channel not found" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Channel not found" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if channel.admin.to_hex() != user_id {
@@ -674,27 +1009,96 @@ pub async fn add_user_to_channel(req: HttpRequest, body: web::Json<AddUserBody>)
     }
 
     // Zgoda: administrator może dodać do kanału tylko swoich znajomych.
-    if target != user_id && !are_friends(&db, &user_id, &target).await {
-        return HttpResponse::Forbidden().json(json!({
-            "message": "Możesz dodawać do kanału tylko swoich znajomych."
-        }));
+    if target != user_id {
+        match try_are_friends(&db, &user_id, &target).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return HttpResponse::Forbidden().json(json!({
+                    "message": "Możesz dodawać do kanału tylko swoich znajomych."
+                }));
+            }
+            Err(()) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
+        }
     }
 
     let Ok(target_oid) = ObjectId::parse_str(&target) else {
         return HttpResponse::InternalServerError().json(json!({ "message": "Internal Server Error" }));
     };
-    let _ = Channel::collection(&db)
+    // Seed catch-up BEFORE membership so a concurrent send cannot create a bump
+    // row that a later clobbering upsert would zero without an absolute emit.
+    if crate::model::channel_read_state_model::ChannelReadState::seed_if_missing(
+        &db,
+        target_oid,
+        cid,
+    )
+    .await
+    .is_err()
+    {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Temporarily unavailable",
+            "retryable": true,
+        }));
+    }
+
+    match Channel::collection(&db)
         .update_one(
             doc! { "_id": cid },
             doc! { "$addToSet": { "members": target_oid }, "$set": { "updatedAt": DateTime::now() } },
         )
-        .await;
+        .await
+    {
+        Ok(_) => {}
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Failed to add member",
+                "retryable": true,
+            }));
+        }
+    }
 
-    emit_to_user(
-        &target,
-        "channel-added",
-        json!({ "channelId": cid.to_hex() }),
+    // Reload so list item includes the new member in memberCount.
+    let channel = match Channel::find_by_id(&db, cid).await {
+        Ok(Some(ch)) => ch,
+        Ok(None) | Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
+    };
+    match serialize_channel_list_item(&db, &channel, target_oid).await {
+        Some(slim) => {
+            emit_to_user(
+                &target,
+                "channel-added",
+                json!({ "channelId": cid.to_hex(), "channel": slim }),
+            );
+        }
+        None => {
+            emit_to_user(
+                &target,
+                "channel-added",
+                json!({ "channelId": cid.to_hex() }),
+            );
+        }
+    }
+    let mut peers = channel_recipient_ids(&channel);
+    peers.retain(|r| r != &target);
+    emit_to_users(
+        &peers,
+        "channel-member-joined",
+        json!({
+            "channelId": cid.to_hex(),
+            "userId": target,
+            "memberCount": channel_recipient_ids(&channel).len(),
+        }),
     );
+    typing_access_cache::invalidate_channel(&cid.to_hex());
     HttpResponse::Ok().json(json!({ "message": "User added to channel" }))
 }
 
@@ -707,7 +1111,15 @@ pub async fn delete_channel(req: HttpRequest) -> HttpResponse {
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Channel not found" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Channel not found" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if channel.admin.to_hex() != user_id {
@@ -716,8 +1128,144 @@ pub async fn delete_channel(req: HttpRequest) -> HttpResponse {
 
     let channel_id = cid.to_hex();
     let recipients = channel_recipient_ids(&channel);
-    let _ = Channel::collection(&db).delete_one(doc! { "_id": cid }).await;
 
+    // Soft-delete messages BEFORE removing the channel doc so wipe Err stays retryable.
+    // First pass by known ids, then catch concurrent sends that landed mid-wipe.
+    let messages: Vec<Message> = match Message::collection(&db)
+        .find(doc! {
+            "channel": cid,
+            "deleted": { "$ne": true },
+        })
+        .projection(doc! { "_id": 1, "fileUrl": 1 })
+        .await
+    {
+        Ok(cursor) => match cursor.try_collect().await {
+            Ok(m) => m,
+            Err(_) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Failed to delete channel",
+                    "retryable": true,
+                }));
+            }
+        },
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Failed to delete channel",
+                "retryable": true,
+            }));
+        }
+    };
+    let ids: Vec<ObjectId> = messages.iter().filter_map(|m| m.id).collect();
+    if !ids.is_empty() {
+        if Message::collection(&db)
+            .update_many(
+                doc! { "_id": { "$in": &ids } },
+                doc! { "$set": {
+                    "deleted": true,
+                    "deletedAt": DateTime::now(),
+                    "updatedAt": DateTime::now(),
+                    "searchText": "",
+                }},
+            )
+            .await
+            .is_err()
+        {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Failed to delete channel",
+                "retryable": true,
+            }));
+        }
+    }
+    // Catch concurrent sends that landed between the find and the soft-delete.
+    let late: Vec<Message> = match Message::collection(&db)
+        .find(doc! {
+            "channel": cid,
+            "deleted": { "$ne": true },
+        })
+        .projection(doc! { "_id": 1, "fileUrl": 1 })
+        .await
+    {
+        Ok(cursor) => match cursor.try_collect().await {
+            Ok(m) => m,
+            Err(_) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Failed to delete channel",
+                    "retryable": true,
+                }));
+            }
+        },
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Failed to delete channel",
+                "retryable": true,
+            }));
+        }
+    };
+    if !late.is_empty() {
+        let late_ids: Vec<ObjectId> = late.iter().filter_map(|m| m.id).collect();
+        if Message::collection(&db)
+            .update_many(
+                doc! { "_id": { "$in": &late_ids } },
+                doc! { "$set": {
+                    "deleted": true,
+                    "deletedAt": DateTime::now(),
+                    "updatedAt": DateTime::now(),
+                    "searchText": "",
+                }},
+            )
+            .await
+            .is_err()
+        {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Failed to delete channel",
+                "retryable": true,
+            }));
+        }
+    }
+    let cleanups: Vec<_> = messages
+        .iter()
+        .chain(late.iter())
+        .filter_map(|m| m.file_url.as_deref())
+        .map(|url| {
+            crate::utils::messages::access::cleanup_attachment_if_unreferenced(&db, Some(url))
+        })
+        .collect();
+    futures_util::future::join_all(cleanups).await;
+
+    let _ = crate::model::channel_read_state_model::ChannelReadState::collection(&db)
+        .delete_many(doc! { "channelId": cid })
+        .await;
+
+    match Channel::collection(&db).delete_one(doc! { "_id": cid }).await {
+        Ok(r) if r.deleted_count > 0 => {}
+        Ok(_) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Channel not found" }));
+        }
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Failed to delete channel",
+                "retryable": true,
+            }));
+        }
+    }
+
+    typing_access_cache::invalidate_channel(&channel_id);
+    crate::utils::voice::channel_voice::clear_channel_voice(&channel_id);
+
+    // Fence stale deltas + clear badges if FE misses channel-deleted.
+    for rid in &recipients {
+        crate::utils::unread::invalidate_unread_generation(rid, "channel", &channel_id);
+        crate::utils::unread::emit_unread_absolute(rid, "channel", &channel_id, 0);
+    }
+
+    emit_to_users(
+        &recipients,
+        "channel-voice:state",
+        json!({
+            "channelId": channel_id,
+            "participants": Vec::<String>::new(),
+        }),
+    );
     emit_to_users(
         &recipients,
         "channel-deleted",
@@ -735,7 +1283,16 @@ pub async fn toggle_channel_mute(req: HttpRequest) -> HttpResponse {
     let db = get_db();
     match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) if can_access_channel(&c, Some(&user_id)) => {}
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony lub brak dostępu" })),
+        Ok(Some(_)) | Ok(None) => {
+            return HttpResponse::NotFound()
+                .json(json!({ "message": "Kanał nie znaleziony lub brak dostępu" }));
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     let Ok(uid) = ObjectId::parse_str(&user_id) else {
@@ -743,7 +1300,15 @@ pub async fn toggle_channel_mute(req: HttpRequest) -> HttpResponse {
     };
     let user = match User::find_by_id(&db, uid).await {
         Ok(Some(u)) => u,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Użytkownik nie znaleziony" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Użytkownik nie znaleziony" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     let mut muted = user.muted_channels.clone();
@@ -756,7 +1321,14 @@ pub async fn toggle_channel_mute(req: HttpRequest) -> HttpResponse {
         is_muted = true;
     }
 
-    let muted_bson = mongodb::bson::to_bson(&muted).unwrap_or(mongodb::bson::Bson::Array(vec![]));
+    let muted_bson = match mongodb::bson::to_bson(&muted) {
+        Ok(b) => b,
+        // Fail closed — empty array would unmute-all.
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "message": "Internal Server Error" }));
+        }
+    };
     if User::set_fields(&db, uid, doc! { "mutedChannels": muted_bson }).await.is_err() {
         return HttpResponse::InternalServerError().json(json!({ "message": "Internal Server Error" }));
     }
@@ -782,6 +1354,9 @@ pub async fn kick_channel_member(req: HttpRequest, body: web::Json<TargetUserBod
     if target.is_empty() {
         return HttpResponse::BadRequest().json(json!({ "message": "Brak identyfikatora użytkownika" }));
     }
+    let Ok(target_oid) = ObjectId::parse_str(&target) else {
+        return HttpResponse::BadRequest().json(json!({ "message": "Nieprawidłowy identyfikator użytkownika" }));
+    };
     let Ok(cid) = ObjectId::parse_str(param(&req, "channelId")) else {
         return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" }));
     };
@@ -789,7 +1364,15 @@ pub async fn kick_channel_member(req: HttpRequest, body: web::Json<TargetUserBod
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if !is_channel_admin(&channel, Some(&user_id)) {
@@ -799,36 +1382,71 @@ pub async fn kick_channel_member(req: HttpRequest, body: web::Json<TargetUserBod
         return HttpResponse::BadRequest().json(json!({ "message": "Nie można wyrzucić twórcy kanału" }));
     }
 
-    if let Ok(target_oid) = ObjectId::parse_str(&target) {
-        let muted_members = moderation::prepare_unmute_lists(&channel, target_oid);
-        let banned_members = moderation::active_entries(&channel.banned_members);
-        let members: Vec<ObjectId> = channel
-            .members
-            .iter()
-            .copied()
-            .filter(|member| *member != target_oid)
-            .collect();
-        let members_bson =
-            mongodb::bson::to_bson(&members).unwrap_or(mongodb::bson::Bson::Array(vec![]));
-        let _ = Channel::collection(&db)
-            .update_one(
-                doc! { "_id": cid },
-                doc! {
-                    "$set": {
-                        "members": members_bson,
-                        "updatedAt": DateTime::now(),
-                    }
-                },
-            )
-            .await;
-        let _ = moderation::persist_moderation_lists(&db, cid, banned_members, muted_members).await;
+    // $pull — never rewrite full members from a stale snapshot (races invite/add).
+    match Channel::collection(&db)
+        .update_one(
+            doc! { "_id": cid },
+            doc! {
+                "$pull": { "members": target_oid },
+                "$set": { "updatedAt": DateTime::now() },
+            },
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Failed to kick member",
+                "retryable": true,
+            }));
+        }
     }
+    // Best-effort unmute in lists — membership already removed; never skip fanout.
+    let _ = moderation::pull_muted_member(&db, cid, target_oid).await;
 
+    // Fan out after successful $pull even if mute-list persist failed.
     emit_to_user(
         &target,
         "channel-left",
         json!({ "channelId": cid.to_hex() }),
     );
+    typing_access_cache::invalidate_channel(&cid.to_hex());
+    crate::utils::access::channel_access_cache::invalidate_channel(&cid.to_hex());
+
+    let _ = crate::model::channel_read_state_model::ChannelReadState::collection(&db)
+        .delete_many(doc! { "userId": target_oid, "channelId": cid })
+        .await;
+
+    let channel_id = cid.to_hex();
+    crate::utils::unread::invalidate_unread_generation(&target, "channel", &channel_id);
+    crate::utils::unread::emit_unread_absolute(&target, "channel", &channel_id, 0);
+    let participants =
+        crate::utils::voice::channel_voice::leave_channel_voice(&channel_id, &target);
+    // Broadcast to remaining members + kicked user (already got channel-left).
+    let mut recipients = channel_recipient_ids(&channel);
+    if !recipients.iter().any(|r| r == &target) {
+        recipients.push(target.clone());
+    }
+    emit_to_users(
+        &recipients,
+        "channel-voice:state",
+        json!({
+            "channelId": channel_id,
+            "participants": participants,
+        }),
+    );
+    let mut remaining = channel_recipient_ids(&channel);
+    remaining.retain(|r| r != &target);
+    emit_to_users(
+        &remaining,
+        "channel-member-left",
+        json!({
+            "channelId": channel_id,
+            "userId": target,
+            "memberCount": remaining.len(),
+        }),
+    );
+
     HttpResponse::Ok().json(json!({ "message": "Użytkownik wyrzucony z kanału" }))
 }
 
@@ -848,7 +1466,15 @@ pub async fn ban_channel_member(req: HttpRequest, body: web::Json<TargetUserBody
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if !is_channel_admin(&channel, Some(&user_id)) {
@@ -858,33 +1484,98 @@ pub async fn ban_channel_member(req: HttpRequest, body: web::Json<TargetUserBody
         return HttpResponse::BadRequest().json(json!({ "message": "Nie można zbanować twórcy kanału" }));
     }
 
-    let (banned_members, muted_members, members) =
-        moderation::prepare_ban_lists(&channel, target_oid, body.duration_seconds);
+    let entry = moderation::build_moderation_entry(target_oid, body.duration_seconds);
 
-    let banned_bson = mongodb::bson::to_bson(&banned_members).unwrap_or(mongodb::bson::Bson::Array(vec![]));
-    let muted_bson = mongodb::bson::to_bson(&muted_members).unwrap_or(mongodb::bson::Bson::Array(vec![]));
-    let members_bson = mongodb::bson::to_bson(&members).unwrap_or(mongodb::bson::Bson::Array(vec![]));
-
-    let _ = Channel::collection(&db)
+    // Ban first — if upsert fails, membership untouched (no kick-without-ban).
+    if moderation::upsert_banned_member(&db, cid, entry).await.is_err() {
+        return HttpResponse::InternalServerError().json(json!({
+            "message": "Failed to ban member",
+            "retryable": true,
+        }));
+    }
+    match Channel::collection(&db)
         .update_one(
             doc! { "_id": cid },
             doc! {
-                "$set": {
-                    "bannedMembers": banned_bson,
-                    "mutedMembers": muted_bson,
-                    "members": members_bson,
-                    "updatedAt": DateTime::now(),
-                }
+                "$pull": { "members": target_oid },
+                "$set": { "updatedAt": DateTime::now() },
             },
         )
-        .await;
+        .await
+    {
+        Ok(_) => {}
+        Err(_) => {
+            // Compensate — do not leave banned-but-still-member half-state.
+            let mut compensated = false;
+            for _ in 0..3 {
+                if moderation::pull_banned_member(&db, cid, target_oid)
+                    .await
+                    .is_ok()
+                {
+                    compensated = true;
+                    break;
+                }
+            }
+            if !compensated {
+                log::error!(
+                    "ban compensate failed channel={} target={}",
+                    cid.to_hex(),
+                    target_oid.to_hex()
+                );
+            }
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Failed to ban member",
+                "retryable": true,
+            }));
+        }
+    }
+    // Mute pull best-effort — ban already durable.
+    let _ = moderation::pull_muted_member(&db, cid, target_oid).await;
 
     emit_to_user(
         &target,
         "channel-left",
         json!({ "channelId": cid.to_hex() }),
     );
-    let (banned_members, muted_members) = get_channel_ban_mute_lists(&db, cid).await;
+    typing_access_cache::invalidate_channel(&cid.to_hex());
+    crate::utils::access::channel_access_cache::invalidate_channel(&cid.to_hex());
+    let _ = crate::model::channel_read_state_model::ChannelReadState::collection(&db)
+        .delete_many(doc! { "userId": target_oid, "channelId": cid })
+        .await;
+    let channel_id = cid.to_hex();
+    crate::utils::unread::invalidate_unread_generation(&target, "channel", &channel_id);
+    crate::utils::unread::emit_unread_absolute(&target, "channel", &channel_id, 0);
+    let participants =
+        crate::utils::voice::channel_voice::leave_channel_voice(&channel_id, &target);
+    let mut recipients = channel_recipient_ids(&channel);
+    if !recipients.iter().any(|r| r == &target) {
+        recipients.push(target.clone());
+    }
+    emit_to_users(
+        &recipients,
+        "channel-voice:state",
+        json!({
+            "channelId": channel_id,
+            "participants": participants,
+        }),
+    );
+    let mut remaining = channel_recipient_ids(&channel);
+    remaining.retain(|r| r != &target);
+    emit_to_users(
+        &remaining,
+        "channel-member-left",
+        json!({
+            "channelId": channel_id,
+            "userId": target,
+            "memberCount": remaining.len(),
+        }),
+    );
+    let Some((banned_members, muted_members)) = get_channel_ban_mute_lists(&db, cid).await else {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Channels temporarily unavailable. Please retry.",
+            "retryable": true,
+        }));
+    };
     HttpResponse::Ok().json(json!({
         "message": "Użytkownik zbanowany na kanale",
         "bannedMembers": banned_members,
@@ -908,18 +1599,40 @@ pub async fn unban_channel_member(req: HttpRequest, body: web::Json<TargetUserBo
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if !is_channel_admin(&channel, Some(&user_id)) {
         return HttpResponse::Forbidden().json(json!({ "message": "Tylko twórca kanału może odbanować" }));
     }
 
-    let banned_members = moderation::prepare_unban_lists(&channel, target_oid);
-    let muted_members = moderation::active_entries(&channel.muted_members);
-    let _ = moderation::persist_moderation_lists(&db, cid, banned_members, muted_members).await;
+    if moderation::pull_banned_member(&db, cid, target_oid)
+        .await
+        .is_err()
+    {
+        return HttpResponse::InternalServerError().json(json!({
+            "message": "Failed to unban member",
+            "retryable": true,
+        }));
+    }
 
-    let (banned_members, muted_members) = get_channel_ban_mute_lists(&db, cid).await;
+    typing_access_cache::invalidate_channel(&cid.to_hex());
+    crate::utils::access::channel_access_cache::invalidate_channel(&cid.to_hex());
+
+    let Some((banned_members, muted_members)) = get_channel_ban_mute_lists(&db, cid).await else {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Channels temporarily unavailable. Please retry.",
+            "retryable": true,
+        }));
+    };
     HttpResponse::Ok().json(json!({
         "message": "Ban użytkownika cofnięty",
         "bannedMembers": banned_members,
@@ -943,7 +1656,15 @@ pub async fn mute_channel_member(req: HttpRequest, body: web::Json<TargetUserBod
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if !is_channel_admin(&channel, Some(&user_id)) {
@@ -956,9 +1677,23 @@ pub async fn mute_channel_member(req: HttpRequest, body: web::Json<TargetUserBod
         return HttpResponse::BadRequest().json(json!({ "message": "Użytkownik nie jest na kanale" }));
     }
 
-    let (muted_members, banned_members) =
-        moderation::prepare_mute_lists(&channel, target_oid, body.duration_seconds);
-    let _ = moderation::persist_moderation_lists(&db, cid, banned_members, muted_members).await;
+    let entry = moderation::build_moderation_entry(target_oid, body.duration_seconds);
+    if moderation::upsert_muted_member(&db, cid, entry.clone())
+        .await
+        .is_err()
+    {
+        return HttpResponse::InternalServerError().json(json!({
+            "message": "Failed to mute member",
+            "retryable": true,
+        }));
+    }
+    // Ban pull best-effort — mute already durable.
+    let _ = moderation::pull_banned_member(&db, cid, target_oid).await;
+
+    let muted_here_expires_at = entry
+        .expires_at
+        .as_ref()
+        .and_then(|dt| dt.try_to_rfc3339_string().ok());
 
     emit_to_user(
         &target,
@@ -966,10 +1701,18 @@ pub async fn mute_channel_member(req: HttpRequest, body: web::Json<TargetUserBod
         json!({
             "channelId": cid.to_hex(),
             "isMutedHere": true,
+            "mutedHereExpiresAt": muted_here_expires_at,
         }),
     );
+    typing_access_cache::invalidate_channel(&cid.to_hex());
+    crate::utils::access::channel_access_cache::invalidate_channel(&cid.to_hex());
 
-    let (banned_members, muted_members) = get_channel_ban_mute_lists(&db, cid).await;
+    let Some((banned_members, muted_members)) = get_channel_ban_mute_lists(&db, cid).await else {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Channels temporarily unavailable. Please retry.",
+            "retryable": true,
+        }));
+    };
     HttpResponse::Ok().json(json!({
         "message": "Użytkownik wyciszony na kanale",
         "bannedMembers": banned_members,
@@ -993,16 +1736,30 @@ pub async fn unmute_channel_member(req: HttpRequest, body: web::Json<TargetUserB
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if !is_channel_admin(&channel, Some(&user_id)) {
         return HttpResponse::Forbidden().json(json!({ "message": "Tylko twórca kanału może cofnąć wyciszenie" }));
     }
 
-    let muted_members = moderation::prepare_unmute_lists(&channel, target_oid);
-    let banned_members = moderation::active_entries(&channel.banned_members);
-    let _ = moderation::persist_moderation_lists(&db, cid, banned_members, muted_members).await;
+    if moderation::pull_muted_member(&db, cid, target_oid)
+        .await
+        .is_err()
+    {
+        return HttpResponse::InternalServerError().json(json!({
+            "message": "Failed to unmute member",
+            "retryable": true,
+        }));
+    }
 
     emit_to_user(
         &target,
@@ -1010,10 +1767,18 @@ pub async fn unmute_channel_member(req: HttpRequest, body: web::Json<TargetUserB
         json!({
             "channelId": cid.to_hex(),
             "isMutedHere": false,
+            "mutedHereExpiresAt": Value::Null,
         }),
     );
+    typing_access_cache::invalidate_channel(&cid.to_hex());
+    crate::utils::access::channel_access_cache::invalidate_channel(&cid.to_hex());
 
-    let (banned_members, muted_members) = get_channel_ban_mute_lists(&db, cid).await;
+    let Some((banned_members, muted_members)) = get_channel_ban_mute_lists(&db, cid).await else {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Channels temporarily unavailable. Please retry.",
+            "retryable": true,
+        }));
+    };
     HttpResponse::Ok().json(json!({
         "message": "Wyciszenie użytkownika cofnięte",
         "bannedMembers": banned_members,
@@ -1055,7 +1820,15 @@ pub async fn report_channel(req: HttpRequest, body: web::Json<ReportBody>) -> Ht
     let db = get_db();
     let channel = match Channel::find_by_id(&db, cid).await {
         Ok(Some(c)) => c,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Kanał nie znaleziony" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     if !is_channel_member(&channel, Some(&user_id)) {
@@ -1067,7 +1840,15 @@ pub async fn report_channel(req: HttpRequest, body: web::Json<ReportBody>) -> Ht
     };
     let reporter = match User::find_by_id(&db, uid).await {
         Ok(Some(u)) => u,
-        _ => return HttpResponse::NotFound().json(json!({ "message": "Użytkownik nie znaleziony" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "message": "Użytkownik nie znaleziony" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
     let input = CreateChannelReportInput {

@@ -132,6 +132,14 @@ async fn main() -> std::io::Result<()> {
     });
 
     tokio::spawn(async {
+        let interval = std::time::Duration::from_secs(15);
+        loop {
+            tokio::time::sleep(interval).await;
+            klovy_chat_server::ws::handlers::sweep_expired_call_sessions().await;
+        }
+    });
+
+    tokio::spawn(async {
         let interval = std::time::Duration::from_secs(24 * 60 * 60);
         loop {
             tokio::time::sleep(interval).await;
@@ -179,7 +187,7 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn ensure_indexes(db: &mongodb::Database) {
-    let tasks: [(&str, mongodb::error::Result<()>); 14] = [
+    let tasks: [(&str, mongodb::error::Result<()>); 15] = [
         ("users", User::create_indexes(db).await),
         ("signup_quotas", klovy_chat_server::utils::registration::create_indexes(db).await),
         ("channels", Channel::create_indexes(db).await),
@@ -187,6 +195,7 @@ async fn ensure_indexes(db: &mongodb::Database) {
         ("friend_requests", FriendRequest::create_indexes(db).await),
         ("invites", Invite::create_indexes(db).await),
         ("channel_read_states", ChannelReadState::create_indexes(db).await),
+        ("dm_conversation_tips", klovy_chat_server::utils::conversation_tips::DmConversationTip::create_indexes(db).await),
         ("channel_reports", ChannelReport::create_indexes(db).await),
         ("refresh_tokens", RefreshToken::create_indexes(db).await),
         ("pending_uploads", PendingUpload::create_indexes(db).await),

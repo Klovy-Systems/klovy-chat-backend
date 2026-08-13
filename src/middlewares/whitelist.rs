@@ -6,6 +6,7 @@ use actix_web::{
 use actix_web_lab::middleware::Next;
 
 use crate::middlewares::auth_middleware::resolve_authenticated_user;
+use crate::utils::auth::jwt_auth::JwtUserError;
 use crate::utils::whitelist::is_whitelist_enabled;
 
 pub async fn whitelist_check(
@@ -17,8 +18,15 @@ pub async fn whitelist_check(
     }
 
     let user = match resolve_authenticated_user(&req).await {
-        Some(user) => user,
-        None => {
+        Ok(user) => user,
+        Err(JwtUserError::Unavailable) => {
+            let (req, _) = req.into_parts();
+            let res = HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "message": "Temporarily unavailable. Retry."
+            }));
+            return Ok(ServiceResponse::new(req, res));
+        }
+        Err(JwtUserError::Denied) => {
             let (req, _) = req.into_parts();
             let res = HttpResponse::Unauthorized()
                 .json(serde_json::json!({ "message": "User not authenticated." }));

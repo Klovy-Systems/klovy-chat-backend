@@ -23,18 +23,25 @@ pub async fn verify_step_up_auth(user: &User, code: Option<&str>) -> Result<Step
 
     if is_totp_code(code) {
         if let Some(encrypted) = user.totp_secret.as_deref() {
-            if let Ok(secret) = decrypt_totp_secret(encrypted) {
-                if verify_totp_code(&user.username, &secret, code) {
-                    return Ok(StepUpResult::Verified);
+            match decrypt_totp_secret(encrypted) {
+                Ok(secret) => {
+                    match verify_totp_code(&user.username, &secret, code) {
+                        Ok(true) => return Ok(StepUpResult::Verified),
+                        Ok(false) => {}
+                        Err(()) => return Err("Temporarily unavailable. Retry."),
+                    }
                 }
+                Err(_) => return Err("Temporarily unavailable. Retry."),
             }
         }
         return Err("Invalid authentication code.");
     }
 
     if let Some(hashes) = user.backup_codes.as_ref() {
-        if let Some(index) = verify_and_consume_backup_code(code, hashes).await {
-            return Ok(StepUpResult::BackupConsumed { index });
+        match verify_and_consume_backup_code(code, hashes).await {
+            Ok(Some(index)) => return Ok(StepUpResult::BackupConsumed { index }),
+            Ok(None) => {}
+            Err(()) => return Err("Temporarily unavailable. Retry."),
         }
     }
 

@@ -7,7 +7,7 @@ use crate::model::refresh_token_model::RefreshToken;
 use crate::model::user_model::User;
 use crate::utils::app_env::is_production;
 use crate::utils::auth::jwt_validation::hs256_validation;
-use crate::utils::auth::refresh_token::family_id_from_refresh_token;
+use crate::utils::auth::refresh_token::{family_id_from_refresh_token, RefreshAuthError};
 use crate::utils::db::get_db;
 
 pub fn jwt_secret() -> Result<String, String> {
@@ -71,19 +71,23 @@ pub fn user_id_from_jwt_token(token: &str) -> Option<String> {
 pub async fn resolve_session_family_id(
     payload: &TokenPayload,
     refresh_token: Option<&str>,
-) -> Option<String> {
+) -> Result<Option<String>, JwtUserError> {
     if let Some(ref family_id) = payload.session_family_id {
         if !family_id.is_empty() {
-            return Some(family_id.clone());
+            return Ok(Some(family_id.clone()));
         }
-        return None;
+        return Ok(None);
     }
 
     if let Some(raw) = refresh_token {
-        return family_id_from_refresh_token(raw).await;
+        return match family_id_from_refresh_token(raw).await {
+            Ok(v) => Ok(v),
+            Err(RefreshAuthError::Unavailable) => Err(JwtUserError::Unavailable),
+            Err(RefreshAuthError::Denied) => Ok(None),
+        };
     }
 
-    None
+    Ok(None)
 }
 
 pub fn session_family_from_jwt(token: &str) -> Option<String> {
@@ -101,21 +105,29 @@ pub fn session_family_from_jwt(token: &str) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
-pub async fn user_from_jwt(token: &str) -> Option<User> {
+/// JWT user resolution outcome. Mongo/transient failures must not look like deny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JwtUserError {
+    Denied,
+    Unavailable,
+}
+
+pub async fn user_from_jwt(token: &str) -> Result<User, JwtUserError> {
     user_from_jwt_with_refresh(token, None).await
 }
 
 pub async fn user_from_jwt_with_refresh(
     token: &str,
     refresh_token: Option<&str>,
-) -> Option<User> {
+) -> Result<User, JwtUserError> {
     if token.is_empty() || token.len() > 1000 {
-        return None;
+        return Err(JwtUserError::Denied);
     }
 
-    let key = jwt_decoding_key().ok()?;
+    // Key/config failure ≠ bad credentials — WS must not treat as 401 Denied.
+    let key = jwt_decoding_key().map_err(|_| JwtUserError::Unavailable)?;
     let payload = decode::<TokenPayload>(token, &key, &hs256_validation())
-        .ok()?
+        .map_err(|_| JwtUserError::Denied)?
         .claims;
 
     user_from_token_payload(&payload, refresh_token).await
@@ -124,31 +136,35 @@ pub async fn user_from_jwt_with_refresh(
 pub async fn user_from_token_payload(
     payload: &TokenPayload,
     refresh_token: Option<&str>,
-) -> Option<User> {
+) -> Result<User, JwtUserError> {
     if payload.user_id.is_empty() {
-        return None;
+        return Err(JwtUserError::Denied);
     }
 
-    let user_id = ObjectId::parse_str(&payload.user_id).ok()?;
+    let user_id =
+        ObjectId::parse_str(&payload.user_id).map_err(|_| JwtUserError::Denied)?;
     let db = get_db();
-    let user = User::find_by_id(&db, user_id).await.ok()??;
+    let user = match User::find_by_id(&db, user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return Err(JwtUserError::Denied),
+        Err(_) => return Err(JwtUserError::Unavailable),
+    };
 
     if user.token_version != payload.token_version {
-        return None;
+        return Err(JwtUserError::Denied);
     }
     if !user.is_login_allowed() {
-        return None;
+        return Err(JwtUserError::Denied);
     }
 
-    let family_id = resolve_session_family_id(payload, refresh_token).await;
+    let family_id = resolve_session_family_id(payload, refresh_token).await?;
     if let Some(ref family_id) = family_id {
-        let active = RefreshToken::family_is_active(&db, family_id)
-            .await
-            .unwrap_or(false);
-        if !active {
-            return None;
+        match RefreshToken::family_is_active(&db, family_id).await {
+            Ok(true) => {}
+            Ok(false) => return Err(JwtUserError::Denied),
+            Err(_) => return Err(JwtUserError::Unavailable),
         }
     }
 
-    Some(user)
+    Ok(user)
 }

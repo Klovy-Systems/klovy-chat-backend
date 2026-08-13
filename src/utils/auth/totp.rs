@@ -58,21 +58,32 @@ pub fn build_otpauth_url(username: &str, secret: &str) -> String {
         .unwrap_or_default()
 }
 
-pub fn verify_totp_code(username: &str, secret: &str, code: &str) -> bool {
+pub fn verify_totp_code(username: &str, secret: &str, code: &str) -> Result<bool, ()> {
     let normalized = code.trim();
     if normalized.len() != 6 || !normalized.chars().all(|c| c.is_ascii_digit()) {
-        return false;
+        return Ok(false);
     }
 
+    let mut constructed = false;
+    let mut saw_check_err = false;
     for algorithm in [PRIMARY_TOTP_ALGORITHM, LEGACY_TOTP_ALGORITHM] {
         let Ok(totp) = totp_for_account(username, secret, algorithm) else {
             continue;
         };
-        if totp.check_current(normalized).unwrap_or(false) {
-            return true;
+        constructed = true;
+        match totp.check_current(normalized) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            // SystemTime / crypto infra — Unavailable, not Denied.
+            Err(_) => saw_check_err = true,
         }
     }
-    false
+    // No algorithm could be built (bad secret / crypto) — Unavailable, not Denied.
+    if !constructed || saw_check_err {
+        Err(())
+    } else {
+        Ok(false)
+    }
 }
 
 pub fn encrypt_totp_secret(secret: &str) -> Result<String, String> {
@@ -120,20 +131,23 @@ pub async fn hash_backup_codes(codes: &[String]) -> Result<Vec<String>, String> 
     Ok(hashed)
 }
 
+/// `Ok(Some(i))` matched · `Ok(None)` no match · `Err(())` verify runtime failure.
 pub async fn verify_and_consume_backup_code(
     code: &str,
     stored_hashes: &[String],
-) -> Option<usize> {
+) -> Result<Option<usize>, ()> {
     let normalized = normalize_backup_code(code);
     if normalized.len() != 8 {
-        return None;
+        return Ok(None);
     }
     for (index, hash) in stored_hashes.iter().enumerate() {
-        if verify_reset_token(&normalized, hash).await {
-            return Some(index);
+        match verify_reset_token(&normalized, hash).await {
+            Ok(true) => return Ok(Some(index)),
+            Ok(false) => {}
+            Err(()) => return Err(()),
         }
     }
-    None
+    Ok(None)
 }
 
 pub fn is_totp_code(code: &str) -> bool {

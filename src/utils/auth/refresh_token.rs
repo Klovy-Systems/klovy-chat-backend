@@ -173,24 +173,33 @@ pub struct RotatedSession {
     pub family_id: String,
 }
 
+/// Refresh-token auth outcome. Mongo/transient must not look like session deny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshAuthError {
+    Denied,
+    Unavailable,
+}
+
 pub async fn rotate_refresh_token(
     raw_token: &str,
     metadata: SessionClientMetadata,
-) -> Result<RotatedSession, String> {
+) -> Result<RotatedSession, RefreshAuthError> {
     if raw_token.is_empty() || raw_token.len() > 128 {
-        return Err("Invalid refresh token".to_string());
+        return Err(RefreshAuthError::Denied);
     }
 
     let db = get_db();
-    let stored = find_stored_refresh_token(&db, raw_token)
-        .await?
-        .ok_or_else(|| "Invalid refresh token".to_string())?;
+    let stored = match find_stored_refresh_token(&db, raw_token).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err(RefreshAuthError::Denied),
+        Err(_) => return Err(RefreshAuthError::Unavailable),
+    };
 
     if stored.revoked {
         let _ = RefreshToken::revoke_family(&db, &stored.family_id).await;
         let _ = User::invalidate_tokens(&db, stored.user_id).await;
         crate::ws::registry::disconnect_user(&stored.user_id.to_hex());
-        return Err("Refresh token reuse detected".to_string());
+        return Err(RefreshAuthError::Denied);
     }
 
     if let Some(stored_fp) = stored.client_fingerprint.as_deref() {
@@ -202,38 +211,40 @@ pub async fn rotate_refresh_token(
                 let _ = RefreshToken::revoke_family(&db, &stored.family_id).await;
                 let _ = User::invalidate_tokens(&db, stored.user_id).await;
                 crate::ws::registry::disconnect_user(&stored.user_id.to_hex());
-                return Err("Refresh token fingerprint mismatch".to_string());
+                return Err(RefreshAuthError::Denied);
             }
         }
     } else {
         if let Some(id) = stored.id {
             let _ = RefreshToken::revoke_by_id(&db, id).await;
         }
-        return Err("Refresh token requires re-authentication".to_string());
+        return Err(RefreshAuthError::Denied);
     }
 
     let expires_at_ms = stored.expires_at.timestamp_millis();
     if expires_at_ms < Utc::now().timestamp_millis() {
-        return Err("Refresh token expired".to_string());
+        return Err(RefreshAuthError::Denied);
     }
 
-    let user = User::find_by_id(&db, stored.user_id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "User not found".to_string())?;
+    let user = match User::find_by_id(&db, stored.user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return Err(RefreshAuthError::Denied),
+        Err(_) => return Err(RefreshAuthError::Unavailable),
+    };
 
     if !user.is_login_allowed() {
-        return Err("Account is not active".to_string());
+        return Err(RefreshAuthError::Denied);
     }
 
     if let Some(id) = stored.id {
         RefreshToken::revoke_by_id(&db, id)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| RefreshAuthError::Unavailable)?;
     }
 
     let new_raw = generate_raw_token();
-    let new_hash = hash_refresh_token_for_storage(&new_raw)?;
+    let new_hash =
+        hash_refresh_token_for_storage(&new_raw).map_err(|_| RefreshAuthError::Unavailable)?;
     let now = Utc::now();
     let new_expires = now + Duration::milliseconds(REFRESH_MAX_AGE_MS);
     let now_bson = RefreshToken::bson_expiry(now);
@@ -275,7 +286,7 @@ pub async fn rotate_refresh_token(
 
     RefreshToken::insert(&db, &new_doc)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| RefreshAuthError::Unavailable)?;
 
     if is_legacy_refresh_hash(&stored.token_hash) {
         log::info!(
@@ -291,26 +302,46 @@ pub async fn rotate_refresh_token(
     })
 }
 
-pub async fn family_id_from_refresh_token(raw_token: &str) -> Option<String> {
+/// `Ok(Some)` active family · `Ok(None)` missing/revoked/invalid · `Err(Unavailable)` Mongo.
+pub async fn family_id_from_refresh_token(
+    raw_token: &str,
+) -> Result<Option<String>, RefreshAuthError> {
     if raw_token.is_empty() || raw_token.len() > 128 {
-        return None;
+        return Ok(None);
     }
     let db = get_db();
-    let stored = find_stored_refresh_token(&db, raw_token).await.ok()??;
+    let stored = match find_stored_refresh_token(&db, raw_token).await {
+        Ok(v) => v,
+        Err(_) => return Err(RefreshAuthError::Unavailable),
+    };
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
     if stored.revoked {
-        return None;
+        return Ok(None);
     }
-    Some(stored.family_id)
+    Ok(Some(stored.family_id))
 }
 
-pub async fn revoke_refresh_token_family(raw_token: &str) -> Option<ObjectId> {
+/// `Ok(Some(uid))` revoked · `Ok(None)` no matching token · `Err` transient (do not claim logout).
+pub async fn revoke_refresh_token_family(
+    raw_token: &str,
+) -> Result<Option<ObjectId>, RefreshAuthError> {
     if raw_token.is_empty() || raw_token.len() > 128 {
-        return None;
+        return Ok(None);
     }
     let db = get_db();
-    let stored = find_stored_refresh_token(&db, raw_token).await.ok()??;
-    let _ = RefreshToken::revoke_family(&db, &stored.family_id).await;
-    Some(stored.user_id)
+    let stored = match find_stored_refresh_token(&db, raw_token).await {
+        Ok(v) => v,
+        Err(_) => return Err(RefreshAuthError::Unavailable),
+    };
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    RefreshToken::revoke_family(&db, &stored.family_id)
+        .await
+        .map_err(|_| RefreshAuthError::Unavailable)?;
+    Ok(Some(stored.user_id))
 }
 
 pub async fn revoke_session_for_user(

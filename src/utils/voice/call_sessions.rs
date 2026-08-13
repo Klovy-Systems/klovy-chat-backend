@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const RINGING_TTL: Duration = Duration::from_secs(60);
-const PURGE_INTERVAL: Duration = Duration::from_secs(30);
+/// Hard cap so a forgotten accepted call cannot leave the pair BUSY forever.
+const ACCEPTED_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallPhase {
@@ -13,7 +14,7 @@ pub enum CallPhase {
     Accepted,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSession {
     pub session_id: String,
     pub caller_id: String,
@@ -22,14 +23,20 @@ pub struct CallSession {
     pub phase: CallPhase,
     pub created_at: Instant,
     pub accepted_at: Option<Instant>,
+    /// WS connection that owns the caller's side (invite tab).
+    pub caller_conn_id: Option<u64>,
+    /// WS connection that owns the callee's side (accept tab).
+    pub callee_conn_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallSessionError {
     NotFound,
     WrongRole,
     InvalidPhase,
     InProgress,
+    /// Ringing TTL elapsed — session removed; caller should finalize (notify + missed log).
+    Expired(CallSession),
 }
 
 fn pair_key(a: &str, b: &str) -> String {
@@ -40,40 +47,71 @@ fn pair_key(a: &str, b: &str) -> String {
 
 static SESSIONS: LazyLock<Mutex<HashMap<String, CallSession>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static LAST_PURGE: LazyLock<Mutex<Instant>> =
-    LazyLock::new(|| Mutex::new(Instant::now()));
 
-fn maybe_purge_expired() {
-    let mut last = LAST_PURGE.lock().unwrap_or_else(|e| e.into_inner());
-    if last.elapsed() < PURGE_INTERVAL {
-        return;
-    }
-    *last = Instant::now();
-    drop(last);
-
-    let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    sessions.retain(|_, session| {
-        match session.phase {
-            CallPhase::Ringing => session.created_at.elapsed() < RINGING_TTL,
-            CallPhase::Accepted => true,
-        }
-    });
+fn is_accepted_stale(session: &CallSession) -> bool {
+    let started = session.accepted_at.unwrap_or(session.created_at);
+    started.elapsed() >= ACCEPTED_TTL
 }
 
-pub fn create_ringing_session(caller_id: &str, callee_id: &str, mode: &str) -> Result<String, CallSessionError> {
-    maybe_purge_expired();
+fn take_stale_locked(sessions: &mut HashMap<String, CallSession>) -> Vec<CallSession> {
+    let mut stale = Vec::new();
+    sessions.retain(|_, session| match session.phase {
+        CallPhase::Ringing if session.created_at.elapsed() >= RINGING_TTL => {
+            stale.push(session.clone());
+            false
+        }
+        CallPhase::Accepted if is_accepted_stale(session) => {
+            stale.push(session.clone());
+            false
+        }
+        _ => true,
+    });
+    stale
+}
+
+/// Remove expired ringing + stale accepted sessions for notify / missed / end logs.
+/// Not rate-limited — callers finalize every drained session.
+pub fn drain_expired_sessions() -> Vec<CallSession> {
+    let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    take_stale_locked(&mut sessions)
+}
+
+/// Back-compat alias used by call invite/timeout/connect paths.
+pub fn drain_expired_ringing_sessions() -> Vec<CallSession> {
+    drain_expired_sessions()
+        .into_iter()
+        .filter(|s| s.phase == CallPhase::Ringing)
+        .collect()
+}
+
+/// Creates a ringing session. If an expired ringing session for the same pair was
+/// replaced, it is returned so the caller can notify + write a missed-call log.
+pub fn create_ringing_session(
+    caller_id: &str,
+    callee_id: &str,
+    mode: &str,
+    caller_conn_id: u64,
+) -> Result<(String, Option<CallSession>), CallSessionError> {
     let key = pair_key(caller_id, callee_id);
     let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 
+    let mut replaced_expired = None;
     if let Some(existing) = sessions.get(&key) {
         let active = match existing.phase {
             CallPhase::Ringing => existing.created_at.elapsed() < RINGING_TTL,
-            CallPhase::Accepted => true,
+            CallPhase::Accepted => !is_accepted_stale(existing),
         };
         if active {
             return Err(CallSessionError::InProgress);
         }
-        sessions.remove(&key);
+        replaced_expired = sessions.remove(&key);
+    }
+
+    // Global busy: either party already ringing/accepted with anyone else.
+    if user_has_active_session_locked(&sessions, caller_id)
+        || user_has_active_session_locked(&sessions, callee_id)
+    {
+        return Err(CallSessionError::InProgress);
     }
 
     let session_id = Uuid::new_v4().to_string();
@@ -87,13 +125,33 @@ pub fn create_ringing_session(caller_id: &str, callee_id: &str, mode: &str) -> R
             phase: CallPhase::Ringing,
             created_at: Instant::now(),
             accepted_at: None,
+            caller_conn_id: Some(caller_conn_id),
+            callee_conn_id: None,
         },
     );
-    Ok(session_id)
+    Ok((session_id, replaced_expired))
 }
 
-pub fn accept_session(callee_id: &str, caller_id: &str) -> Result<CallSession, CallSessionError> {
-    maybe_purge_expired();
+fn user_has_active_session_locked(
+    sessions: &HashMap<String, CallSession>,
+    user_id: &str,
+) -> bool {
+    sessions.values().any(|session| {
+        if session.caller_id != user_id && session.callee_id != user_id {
+            return false;
+        }
+        match session.phase {
+            CallPhase::Ringing => session.created_at.elapsed() < RINGING_TTL,
+            CallPhase::Accepted => !is_accepted_stale(session),
+        }
+    })
+}
+
+pub fn accept_session(
+    callee_id: &str,
+    caller_id: &str,
+    callee_conn_id: u64,
+) -> Result<CallSession, CallSessionError> {
     let key = pair_key(caller_id, callee_id);
     let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(session) = sessions.get_mut(&key) else {
@@ -102,17 +160,20 @@ pub fn accept_session(callee_id: &str, caller_id: &str) -> Result<CallSession, C
     if session.callee_id != callee_id || session.caller_id != caller_id {
         return Err(CallSessionError::WrongRole);
     }
-    if session.phase != CallPhase::Ringing || session.created_at.elapsed() >= RINGING_TTL {
-        sessions.remove(&key);
+    if session.phase != CallPhase::Ringing {
         return Err(CallSessionError::InvalidPhase);
+    }
+    if session.created_at.elapsed() >= RINGING_TTL {
+        let expired = sessions.remove(&key).ok_or(CallSessionError::NotFound)?;
+        return Err(CallSessionError::Expired(expired));
     }
     session.phase = CallPhase::Accepted;
     session.accepted_at = Some(Instant::now());
+    session.callee_conn_id = Some(callee_conn_id);
     Ok(session.clone())
 }
 
 pub fn reject_session(callee_id: &str, caller_id: &str) -> Result<(), CallSessionError> {
-    maybe_purge_expired();
     let key = pair_key(caller_id, callee_id);
     let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(session) = sessions.get(&key) else {
@@ -129,7 +190,6 @@ pub fn reject_session(callee_id: &str, caller_id: &str) -> Result<(), CallSessio
 }
 
 pub fn cancel_session(caller_id: &str, callee_id: &str) -> Result<(), CallSessionError> {
-    maybe_purge_expired();
     let key = pair_key(caller_id, callee_id);
     let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(session) = sessions.get(&key) else {
@@ -146,7 +206,6 @@ pub fn cancel_session(caller_id: &str, callee_id: &str) -> Result<(), CallSessio
 }
 
 pub fn end_session(user_id: &str, peer_id: &str) -> Result<CallSession, CallSessionError> {
-    maybe_purge_expired();
     let key = pair_key(user_id, peer_id);
     let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(session) = sessions.get(&key) else {
@@ -163,7 +222,6 @@ pub fn end_session(user_id: &str, peer_id: &str) -> Result<CallSession, CallSess
 }
 
 pub fn token_allowed(user_id: &str, peer_id: &str) -> Result<CallSession, CallSessionError> {
-    maybe_purge_expired();
     let key = pair_key(user_id, peer_id);
     let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(session) = sessions.get(&key) else {
@@ -175,19 +233,19 @@ pub fn token_allowed(user_id: &str, peer_id: &str) -> Result<CallSession, CallSe
     if !is_participant {
         return Err(CallSessionError::WrongRole);
     }
-    if session.phase != CallPhase::Accepted {
+    if session.phase != CallPhase::Accepted || is_accepted_stale(session) {
         return Err(CallSessionError::InvalidPhase);
     }
     Ok(session.clone())
 }
 
 pub fn active_session_for_user(user_id: &str) -> Option<CallSession> {
-    maybe_purge_expired();
     let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     sessions
         .values()
         .find(|session| {
             session.phase == CallPhase::Accepted
+                && !is_accepted_stale(session)
                 && (session.caller_id == user_id || session.callee_id == user_id)
         })
         .cloned()
@@ -203,9 +261,92 @@ pub fn clear_ringing_sessions_for_user(user_id: &str) {
     });
 }
 
-pub fn clear_sessions_for_user(user_id: &str) {
+fn connection_owns_side(session: &CallSession, user_id: &str, conn_id: u64) -> bool {
+    if session.caller_id == user_id {
+        return session.caller_conn_id == Some(conn_id);
+    }
+    if session.callee_id == user_id {
+        // Ringing callee is not bound to a tab until accept — closing another
+        // tab must not cancel the ring for remaining tabs.
+        return session.phase == CallPhase::Accepted && session.callee_conn_id == Some(conn_id);
+    }
+    false
+}
+
+/// Tear down sessions owned by this WS connection (tab close while other tabs remain).
+pub fn take_sessions_for_connection(user_id: &str, conn_id: u64) -> Vec<CallSession> {
     let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut taken = Vec::new();
     sessions.retain(|_, session| {
-        session.caller_id != user_id && session.callee_id != user_id
+        if connection_owns_side(session, user_id, conn_id) {
+            taken.push(session.clone());
+            false
+        } else {
+            true
+        }
     });
+    taken
+}
+
+/// Remove every call session involving `user_id` and return them for peer notify.
+pub fn take_sessions_for_user(user_id: &str) -> Vec<CallSession> {
+    let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut taken = Vec::new();
+    sessions.retain(|_, session| {
+        if session.caller_id == user_id || session.callee_id == user_id {
+            taken.push(session.clone());
+            false
+        } else {
+            true
+        }
+    });
+    taken
+}
+
+/// Re-insert sessions taken during disconnect teardown if the user reconnected.
+/// Skips any pair that already has an active session (late invite wins).
+pub fn restore_sessions(sessions: Vec<CallSession>) {
+    if sessions.is_empty() {
+        return;
+    }
+    let mut map = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    for session in sessions {
+        let key = pair_key(&session.caller_id, &session.callee_id);
+        if map.contains_key(&key) {
+            continue;
+        }
+        // Do not restore expired ringing / stale accepted sessions.
+        let still_valid = match session.phase {
+            CallPhase::Ringing => session.created_at.elapsed() < RINGING_TTL,
+            CallPhase::Accepted => !is_accepted_stale(&session),
+        };
+        if still_valid {
+            map.insert(key, session);
+        }
+    }
+}
+
+/// Non-destructive: active ringing sessions where `user_id` is the callee.
+pub fn ringing_sessions_for_callee(user_id: &str) -> Vec<CallSession> {
+    let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    sessions
+        .values()
+        .filter(|session| {
+            session.callee_id == user_id
+                && session.phase == CallPhase::Ringing
+                && session.created_at.elapsed() < RINGING_TTL
+        })
+        .cloned()
+        .collect()
+}
+
+/// Remove the session for a specific pair (e.g. unfriend teardown).
+pub fn take_session_for_pair(a: &str, b: &str) -> Option<CallSession> {
+    let key = pair_key(a, b);
+    let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    sessions.remove(&key)
+}
+
+pub fn clear_sessions_for_user(user_id: &str) {
+    let _ = take_sessions_for_user(user_id);
 }

@@ -105,8 +105,22 @@ async fn rebuild_user_storage_usage(db: &Database) -> mongodb::error::Result<u64
     }
 
     let mut updated = 0u64;
-    for (user_id, bytes) in usage {
-        UserStorageUsage::set_bytes(db, user_id, bytes).await?;
+    for (user_id, bytes) in &usage {
+        UserStorageUsage::set_bytes(db, *user_id, *bytes).await?;
+        updated += 1;
+    }
+
+    // Zero sticky quotas for users who no longer have any counted attachments.
+    let existing = UserStorageUsage::collection(db).find(doc! {}).await?;
+    let rows: Vec<UserStorageUsage> = existing.try_collect().await?;
+    for row in rows {
+        if usage.contains_key(&row.user_id) {
+            continue;
+        }
+        if row.bytes_used <= 0 {
+            continue;
+        }
+        UserStorageUsage::set_bytes(db, row.user_id, 0).await?;
         updated += 1;
     }
 

@@ -5,59 +5,164 @@ use serde_json::{json, Value};
 
 use crate::model::friend_request_model::FriendRequest;
 use crate::model::user_model::User;
+use crate::utils::friends::cache::{
+    get_cached_friend_ids, get_cached_friend_set, put_cached_friend_ids,
+};
 use crate::utils::user::badges::{populate_user_badges, BadgeVisibility};
 use crate::utils::user::serialize_user::resolve_display_name;
 
-pub async fn are_friends(db: &Database, user_id1: &str, user_id2: &str) -> bool {
-    if user_id1.is_empty() || user_id2.is_empty() || user_id1 == user_id2 {
-        return false;
+pub mod cache;
+
+pub use cache::{
+    invalidate_block_pair, invalidate_block_pair_for_user, invalidate_friend_ids_cache,
+    invalidate_friend_ids_pair,
+};
+
+/// `(viewer_blocks_peer, peer_blocks_viewer)` for DM block UI / errors.
+/// `Err(())` on Mongo lookup failure — do not treat as unblocked.
+pub async fn try_dm_block_flags(
+    db: &Database,
+    viewer: &str,
+    peer: &str,
+) -> Result<(bool, bool), ()> {
+    if viewer.is_empty() || peer.is_empty() || viewer == peer {
+        return Ok((false, false));
     }
-    let (Ok(u1), Ok(u2)) = (ObjectId::parse_str(user_id1), ObjectId::parse_str(user_id2)) else {
-        return false;
+    if let Some(flags) = crate::utils::friends::cache::get_cached_block_flags(viewer, peer) {
+        return Ok(flags);
+    }
+    let (Ok(u1), Ok(u2)) = (ObjectId::parse_str(viewer), ObjectId::parse_str(peer)) else {
+        return Ok((false, false));
     };
 
-    let filter = doc! {
-        "status": "accepted",
-        "$or": [
-            { "from": u1, "to": u2 },
-            { "from": u2, "to": u1 },
-        ],
+    use mongodb::bson::Document;
+
+    let coll = db.collection::<Document>("users");
+    let cursor = coll
+        .find(doc! { "_id": { "$in": [u1, u2] } })
+        .projection(doc! { "_id": 1, "blockedContacts": 1 })
+        .await
+        .map_err(|_| ())?;
+    let docs: Vec<Document> = cursor.try_collect().await.map_err(|_| ())?;
+    if docs.len() < 2 {
+        // Missing user doc(s) — authoritative not-blocked.
+        crate::utils::friends::cache::put_cached_block_flags(viewer, peer, false, false);
+        return Ok((false, false));
+    }
+
+    let blocks = |doc: &Document, other: ObjectId| -> bool {
+        doc.get_array("blockedContacts")
+            .ok()
+            .map(|arr| {
+                arr.iter().any(|b| {
+                    b.as_object_id()
+                        .map(|id| id == other)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
     };
 
-    matches!(
-        FriendRequest::collection(db).find_one(filter).await,
-        Ok(Some(_))
-    )
+    let mut viewer_blocks = false;
+    let mut peer_blocks = false;
+    for doc in &docs {
+        let Ok(id) = doc.get_object_id("_id") else { continue };
+        if id == u1 {
+            viewer_blocks = blocks(doc, u2);
+        } else if id == u2 {
+            peer_blocks = blocks(doc, u1);
+        }
+    }
+    crate::utils::friends::cache::put_cached_block_flags(
+        viewer,
+        peer,
+        viewer_blocks,
+        peer_blocks,
+    );
+    Ok((viewer_blocks, peer_blocks))
+}
+
+pub async fn dm_block_flags(db: &Database, viewer: &str, peer: &str) -> (bool, bool) {
+    try_dm_block_flags(db, viewer, peer)
+        .await
+        .unwrap_or((false, false))
 }
 
 pub async fn is_dm_blocked(db: &Database, user_id1: &str, user_id2: &str) -> bool {
+    matches!(
+        try_is_dm_blocked(db, user_id1, user_id2).await,
+        Ok(true)
+    )
+}
+
+/// `Ok(true/false)` when block lookup succeeds; `Err(())` on Mongo failure.
+pub async fn try_is_dm_blocked(
+    db: &Database,
+    user_id1: &str,
+    user_id2: &str,
+) -> Result<bool, ()> {
+    let (a, b) = try_dm_block_flags(db, user_id1, user_id2).await?;
+    Ok(a || b)
+}
+
+pub async fn are_friends(db: &Database, user_id1: &str, user_id2: &str) -> bool {
+    matches!(try_are_friends(db, user_id1, user_id2).await, Ok(true))
+}
+
+/// `Ok(true/false)` from cache or Mongo; `Err(())` on lookup failure (do not treat as not-friends).
+pub async fn try_are_friends(db: &Database, user_id1: &str, user_id2: &str) -> Result<bool, ()> {
     if user_id1.is_empty() || user_id2.is_empty() || user_id1 == user_id2 {
-        return false;
+        return Ok(false);
     }
-    let (Ok(u1), Ok(u2)) = (ObjectId::parse_str(user_id1), ObjectId::parse_str(user_id2)) else {
-        return false;
-    };
-
-    let user_blocks_other = |user: &User, other: ObjectId| {
-        user.blocked_contacts.iter().any(|id| *id == other)
-    };
-
-    let Ok(Some(a)) = User::find_by_id(db, u1).await else {
-        return false;
-    };
-    let Ok(Some(b)) = User::find_by_id(db, u2).await else {
-        return false;
-    };
-
-    user_blocks_other(&a, u2) || user_blocks_other(&b, u1)
+    if let Some(set) = get_cached_friend_set(user_id1) {
+        return Ok(set.contains(user_id2));
+    }
+    match load_friend_ids_uncached(db, user_id1).await {
+        Ok(ids) => {
+            put_cached_friend_ids(user_id1, ids.clone());
+            Ok(ids.iter().any(|id| id == user_id2))
+        }
+        Err(_) => match load_friend_ids_uncached(db, user_id1).await {
+            Ok(ids) => {
+                put_cached_friend_ids(user_id1, ids.clone());
+                Ok(ids.iter().any(|id| id == user_id2))
+            }
+            Err(_) => Err(()),
+        },
+    }
 }
 
 /// Zwraca listę identyfikatorów (hex) zaakceptowanych znajomych użytkownika.
 /// Używane do rozgłaszania zdarzeń obecności/profilu tylko do znajomych,
 /// zamiast do wszystkich zalogowanych klientów.
 pub async fn friend_ids(db: &Database, user_id: &str) -> Vec<String> {
+    try_friend_ids(db, user_id).await.unwrap_or_default()
+}
+
+/// Like `friend_ids`, but `Err(())` when Mongo load fails (do not treat as empty).
+pub async fn try_friend_ids(db: &Database, user_id: &str) -> Result<Vec<String>, ()> {
+    if let Some(cached) = get_cached_friend_ids(user_id) {
+        return Ok(cached);
+    }
+
+    match load_friend_ids_uncached(db, user_id).await {
+        Ok(ids) => {
+            put_cached_friend_ids(user_id, ids.clone());
+            Ok(ids)
+        }
+        Err(_) => match load_friend_ids_uncached(db, user_id).await {
+            Ok(ids) => {
+                put_cached_friend_ids(user_id, ids.clone());
+                Ok(ids)
+            }
+            Err(_) => Err(()),
+        },
+    }
+}
+
+async fn load_friend_ids_uncached(db: &Database, user_id: &str) -> Result<Vec<String>, ()> {
     let Ok(uid) = ObjectId::parse_str(user_id) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let filter = doc! {
@@ -67,12 +172,15 @@ pub async fn friend_ids(db: &Database, user_id: &str) -> Vec<String> {
 
     let cursor = match FriendRequest::collection(db).find(filter).await {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(_) => return Err(()),
     };
 
-    let requests: Vec<FriendRequest> = cursor.try_collect().await.unwrap_or_default();
+    let requests: Vec<FriendRequest> = match cursor.try_collect().await {
+        Ok(r) => r,
+        Err(_) => return Err(()),
+    };
 
-    requests
+    Ok(requests
         .into_iter()
         .filter_map(|r| {
             let other = if r.from == uid { r.to } else { r.from };
@@ -82,16 +190,39 @@ pub async fn friend_ids(db: &Database, user_id: &str) -> Vec<String> {
                 Some(other.to_hex())
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Rozgłasza zdarzenie WS tylko do zaakceptowanych znajomych użytkownika.
 /// Zastępuje globalny broadcast, który wyciekał obecność/profil do wszystkich
 /// zalogowanych klientów (spójne z polityką HTTP `get_user_status`).
 pub async fn emit_to_friends(db: &Database, user_id: &str, event: &str, data: Value) {
-    let recipients = friend_ids(db, user_id).await;
-    if !recipients.is_empty() {
-        crate::ws::registry::emit_to_users(&recipients, event, data);
+    if let Some(cached) = get_cached_friend_ids(user_id) {
+        if !cached.is_empty() {
+            crate::ws::registry::emit_to_users(&cached, event, data);
+        }
+        return;
+    }
+    match load_friend_ids_uncached(db, user_id).await {
+        Ok(ids) => {
+            put_cached_friend_ids(user_id, ids.clone());
+            if !ids.is_empty() {
+                crate::ws::registry::emit_to_users(&ids, event, data);
+            }
+        }
+        Err(_) => match load_friend_ids_uncached(db, user_id).await {
+            Ok(ids) => {
+                put_cached_friend_ids(user_id, ids.clone());
+                if !ids.is_empty() {
+                    crate::ws::registry::emit_to_users(&ids, event, data);
+                }
+            }
+            Err(_) => {
+                // Last resort: emit to the actor so multi-tab still updates; friends
+                // will heal on next successful presence poll / profile refresh.
+                log::warn!("emit_to_friends: friend list unavailable for {user_id}");
+            }
+        },
     }
 }
 
@@ -122,6 +253,13 @@ pub fn map_friend_user(user: &User) -> Value {
 
 pub async fn map_friend_user_profile(db: &Database, user: &User) -> Value {
     let badges = populate_user_badges(db, user, BadgeVisibility::All).await;
+    map_friend_user_profile_from_map(user, badges)
+}
+
+pub fn map_friend_user_profile_from_map(
+    user: &User,
+    badges: Vec<Value>,
+) -> Value {
     json!({
         "_id": user.id.map(|o| o.to_hex()).unwrap_or_default(),
         "username": user.username,

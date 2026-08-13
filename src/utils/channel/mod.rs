@@ -1,3 +1,6 @@
+use std::collections::{HashMap, HashSet};
+
+use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
 use serde_json::{json, Value};
@@ -7,13 +10,20 @@ use crate::model::channel_model::Channel;
 use crate::model::channel_read_state_model::ChannelReadState;
 use crate::model::messages_model::Message;
 use crate::model::user_model::User;
-use crate::utils::user::badges::{populate_user_badges, BadgeVisibility};
+use crate::utils::user::badges::{
+    load_badges_by_ids, populate_user_badges, populate_user_badges_from_map, BadgeVisibility,
+};
 use crate::utils::user::serialize_user::resolve_display_name;
 
 pub mod moderation;
 
 pub fn channel_member_count(channel: &Channel) -> usize {
-    channel.members.len() + 1
+    let mut ids = HashSet::with_capacity(channel.members.len() + 1);
+    ids.insert(channel.admin);
+    for m in &channel.members {
+        ids.insert(*m);
+    }
+    ids.len()
 }
 
 pub fn is_channel_admin(channel: &Channel, user_id: Option<&str>) -> bool {
@@ -55,85 +65,467 @@ pub fn is_channel_chat_locked_for_sender(channel: &Channel, sender_id: &str) -> 
     channel.chat_locked && channel.admin.to_hex() != sender_id
 }
 
-pub async fn populate_channel_user(db: &Database, id: ObjectId) -> Value {
-    match User::find_by_id(db, id).await {
-        Ok(Some(u)) => {
-            let badges = populate_user_badges(db, &u, BadgeVisibility::All).await;
-            json!({
-                "_id": u.id.map(|o| o.to_hex()),
-                "username": u.username,
-                "displayName": resolve_display_name(&u),
-                "bio": u.bio,
-                "image": u.image,
-                "banner": u.banner,
-                "color": u.color,
-                "badges": badges,
-            })
-        }
-        _ => json!({ "_id": id.to_hex() }),
-    }
+fn user_to_list_admin(db_value: Option<&Value>, admin_id: ObjectId) -> Value {
+    db_value
+        .cloned()
+        .unwrap_or_else(|| json!({ "_id": admin_id.to_hex() }))
 }
 
-pub async fn fetch_users_by_refs(db: &Database, ids: &[ObjectId]) -> Vec<Value> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for id in ids {
-        if seen.insert(id.to_hex()) {
-            out.push(populate_channel_user(db, *id).await);
+/// Slim channel payload for sidebar list / channel-added WS (no member roster).
+/// Returns `None` when mute lookup or unread enrich fails — callers must not invent unmuted/zero.
+pub async fn serialize_channel_list_item(
+    db: &Database,
+    channel: &Channel,
+    viewer_id: ObjectId,
+) -> Option<Value> {
+    let admin_map = fetch_users_map_slim(db, &[channel.admin]).await;
+    let admin = user_to_list_admin(admin_map.get(&channel.admin), channel.admin);
+    let ch_id = channel.id.map(|o| o.to_hex()).unwrap_or_default();
+    let is_muted = match User::find_by_id(db, viewer_id).await {
+        Ok(Some(u)) => u.muted_channels.iter().any(|id| Some(*id) == channel.id),
+        // Missing user — fail closed (do not invent unmuted).
+        Ok(None) => return None,
+        // Fail closed — do not report unmuted on lookup Err.
+        Err(_) => return None,
+    };
+    let (unread, last) = enrich_channel_unread(db, viewer_id, channel).await?;
+
+    Some(json!({
+        "_id": ch_id,
+        "name": channel.name,
+        "description": channel.description,
+        "image": channel.image,
+        "admin": admin,
+        "members": Vec::<Value>::new(),
+        "memberCount": channel_member_count(channel),
+        "messages": Vec::<String>::new(),
+        "isPrivate": channel.is_private,
+        "createdAt": channel.created_at.try_to_rfc3339_string().ok(),
+        "updatedAt": channel.updated_at.try_to_rfc3339_string().ok(),
+        "unreadCount": unread,
+        "lastMessage": last.as_ref().map(|(_, c, _)| c.clone()),
+        "lastMessageTime": last.as_ref().and_then(|(t, _, _)| t.try_to_rfc3339_string().ok()),
+        "lastMessageId": last.as_ref().map(|(_, _, id)| id.to_hex()),
+        "isMuted": is_muted,
+        "isMutedHere": is_channel_muted_member(channel, Some(&viewer_id.to_hex())),
+        "mutedHereExpiresAt": crate::utils::channel::moderation::viewer_mute_expires_at(
+            channel,
+            &viewer_id.to_hex(),
+        ),
+        "rateLimitPerUser": channel.rate_limit_per_user,
+        "chatLocked": channel.chat_locked,
+    }))
+}
+
+fn user_to_channel_json(user: &User, badges: Vec<Value>) -> Value {
+    json!({
+        "_id": user.id.map(|o| o.to_hex()),
+        "username": user.username,
+        "displayName": resolve_display_name(user),
+        "bio": user.bio,
+        "image": user.image,
+        "banner": user.banner,
+        "color": user.color,
+        "badges": badges,
+    })
+}
+
+fn user_to_channel_json_slim(user: &User) -> Value {
+    json!({
+        "_id": user.id.map(|o| o.to_hex()),
+        "username": user.username,
+        "displayName": resolve_display_name(user),
+        "image": user.image,
+        "color": user.color,
+    })
+}
+
+/// Batch-load slim profiles for channel list (no badges / bio / banner).
+pub async fn fetch_users_map_slim(db: &Database, ids: &[ObjectId]) -> HashMap<ObjectId, Value> {
+    let mut seen = HashSet::new();
+    let unique: Vec<ObjectId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+    let mut out = HashMap::with_capacity(unique.len());
+    if unique.is_empty() {
+        return out;
+    }
+
+    let users: Vec<User> = match User::collection(db)
+        .find(doc! { "_id": { "$in": &unique } })
+        .await
+    {
+        Ok(cursor) => cursor.try_collect().await.unwrap_or_default(),
+        Err(_) => {
+            for id in unique {
+                out.insert(id, json!({ "_id": id.to_hex() }));
+            }
+            return out;
+        }
+    };
+
+    let mut found = HashSet::new();
+    for user in &users {
+        let Some(id) = user.id else { continue };
+        found.insert(id);
+        out.insert(id, user_to_channel_json_slim(user));
+    }
+    for id in unique {
+        if !found.contains(&id) {
+            out.insert(id, json!({ "_id": id.to_hex() }));
         }
     }
     out
 }
 
-pub async fn get_channel_ban_mute_lists(db: &Database, channel_id: ObjectId) -> (Vec<Value>, Vec<Value>) {
+pub async fn populate_channel_user(db: &Database, id: ObjectId) -> Value {
+    match User::find_by_id(db, id).await {
+        Ok(Some(u)) => {
+            let badges = populate_user_badges(db, &u, BadgeVisibility::All).await;
+            user_to_channel_json(&u, badges)
+        }
+        _ => json!({ "_id": id.to_hex() }),
+    }
+}
+
+/// Batch-load channel member/admin profiles (one users query + one badges query).
+pub async fn fetch_users_map(db: &Database, ids: &[ObjectId]) -> HashMap<ObjectId, Value> {
+    let mut seen = HashSet::new();
+    let unique: Vec<ObjectId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+    let mut out = HashMap::with_capacity(unique.len());
+    if unique.is_empty() {
+        return out;
+    }
+
+    let users: Vec<User> = match User::collection(db)
+        .find(doc! { "_id": { "$in": &unique } })
+        .await
+    {
+        Ok(cursor) => cursor.try_collect().await.unwrap_or_default(),
+        Err(_) => {
+            for id in unique {
+                out.insert(id, json!({ "_id": id.to_hex() }));
+            }
+            return out;
+        }
+    };
+
+    let badge_ids = users.iter().flat_map(|u| u.badges.iter().map(|b| b.badge_id));
+    let badge_map = load_badges_by_ids(db, badge_ids).await;
+
+    let mut found = HashSet::new();
+    for user in &users {
+        let Some(id) = user.id else { continue };
+        found.insert(id);
+        let badges = populate_user_badges_from_map(user, BadgeVisibility::All, &badge_map);
+        out.insert(id, user_to_channel_json(user, badges));
+    }
+    for id in unique {
+        if !found.contains(&id) {
+            out.insert(id, json!({ "_id": id.to_hex() }));
+        }
+    }
+    out
+}
+
+pub async fn fetch_users_by_refs(db: &Database, ids: &[ObjectId]) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let unique: Vec<ObjectId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+    if unique.is_empty() {
+        return Vec::new();
+    }
+    let map = fetch_users_map(db, &unique).await;
+    unique
+        .into_iter()
+        .map(|id| map.get(&id).cloned().unwrap_or_else(|| json!({ "_id": id.to_hex() })))
+        .collect()
+}
+
+pub async fn get_channel_ban_mute_lists(
+    db: &Database,
+    channel_id: ObjectId,
+) -> Option<(Vec<Value>, Vec<Value>)> {
     moderation::get_channel_ban_mute_lists(db, channel_id).await
 }
 
+/// Tip + unread for one channel. Tip is resolved before unread trust.
+/// Returns `None` on read-state / tip-query failure (callers must not invent 0).
 pub async fn enrich_channel_unread(
     db: &Database,
     user_id: ObjectId,
     channel: &Channel,
-) -> (u64, Option<(DateTime, String)>) {
-    use futures_util::TryStreamExt;
-
+) -> Option<(u64, Option<(DateTime, String, ObjectId)>)> {
     let Some(channel_id) = channel.id else {
-        return (0, None);
+        return Some((0, None));
     };
 
-    let last_read = ChannelReadState::find(db, user_id, channel_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|s| s.last_read_at)
-        .unwrap_or_else(|| DateTime::from_millis(0));
+    // Resolve tip first — missing denorm tip must not trust unread 0 before fill.
+    let tip = match (
+        channel.last_message_at,
+        channel.last_message.as_ref(),
+        channel.last_message_id,
+    ) {
+        (Some(ts), Some(preview), Some(mid)) => Some((ts, preview.clone(), mid)),
+        _ => {
+            match Message::collection(db)
+                .find(doc! { "channel": channel_id, "deleted": { "$ne": true } })
+                .sort(doc! { "timestamp": -1, "_id": -1 })
+                .limit(1)
+                .await
+            {
+                Ok(mut cursor) => match cursor.try_next().await {
+                    Ok(Some(m)) => m.id.map(|id| {
+                        (
+                            m.timestamp,
+                            crate::utils::messages::content_storage::content_for_api(&m.content),
+                            id,
+                        )
+                    }),
+                    Ok(None) => None,
+                    Err(_) => return None,
+                },
+                Err(_) => return None,
+            }
+        }
+    };
 
-    let unread = Message::collection(db)
-        .count_documents(doc! {
-            "channel": channel_id,
-            "timestamp": { "$gt": last_read },
-            "sender": { "$ne": user_id },
-            "deleted": { "$ne": true },
-        })
-        .await
-        .unwrap_or(0);
+    let state = match ChannelReadState::find(db, user_id, channel_id).await {
+        Ok(s) => s,
+        // Mongo Err ≠ missing row — fail closed (batch path returns None).
+        Err(_) => return None,
+    };
 
-    let last = match Message::collection(db)
-        .find(doc! { "channel": channel_id, "deleted": { "$ne": true } })
-        .sort(doc! { "timestamp": -1 })
-        .limit(1)
+    let unread = if let Some(ref s) = state {
+        // Trust positive denorm only when lastRead is still behind tip — otherwise
+        // sticky-high after mark-read × late $inc must be recounted.
+        let effective = if s.last_read_at.timestamp_millis() <= 0 {
+            s.created_at
+        } else {
+            s.last_read_at
+        };
+        let tip_ts = tip.as_ref().map(|(ts, _, _)| *ts);
+        let behind_tip = tip_ts
+            .is_some_and(|ts| effective.timestamp_millis() < ts.timestamp_millis());
+        let stale_high = s.unread_count > 0
+            && tip_ts.is_some_and(|ts| effective.timestamp_millis() >= ts.timestamp_millis());
+        // Parity with contacts: never trust positive denorm when behind tip
+        // (failed bump after WS +1 leaves denorm low).
+        if s.unread_count > 0 && !stale_high && !behind_tip {
+            s.unread_count
+        } else if s.unread_count == 0 && !behind_tip && tip.is_none() {
+            // Empty channel (no tip) — truly caught up.
+            0
+        } else {
+            // Tip present + unread 0: verify (stale tip after failed upsert).
+            // behind_tip / stale_high: always recount.
+            match crate::utils::unread::try_count_channel_unread(db, user_id, channel_id).await {
+                Some(n) => n,
+                // Sticky positive denorm over undercount; never invent 0 when verify required.
+                None if s.unread_count > 0 => s.unread_count,
+                None => return None,
+            }
+        }
+    } else if tip.is_some() {
+        // Tip present + no read-state — never invent caught-up 0 (failed seed).
+        return None;
+    } else {
+        // Empty channel (no tip, no row) — truly caught up.
+        0
+    };
+
+    Some((unread, tip))
+}
+
+/// Batch last-message + unread for many channels (one read-state query + unread agg).
+/// Last-message prefers denormalized channel tip fields when present.
+/// Returns `None` when read-state stream fails — callers must not invent all-zero.
+pub async fn enrich_channels_batch(
+    db: &Database,
+    user_id: ObjectId,
+    channels: &[Channel],
+) -> Option<HashMap<ObjectId, (u64, Option<(DateTime, String, ObjectId)>)>> {
+    let channel_ids: Vec<ObjectId> = channels.iter().filter_map(|c| c.id).collect();
+    let mut out: HashMap<ObjectId, (u64, Option<(DateTime, String, ObjectId)>)> = HashMap::new();
+    for id in &channel_ids {
+        out.insert(*id, (0, None));
+    }
+    if channel_ids.is_empty() {
+        return Some(out);
+    }
+
+    let mut missing_tip: Vec<ObjectId> = Vec::new();
+    for ch in channels {
+        let Some(id) = ch.id else { continue };
+        match (ch.last_message_at, ch.last_message.as_ref(), ch.last_message_id) {
+            (Some(ts), Some(preview), Some(mid)) => {
+                if let Some(entry) = out.get_mut(&id) {
+                    entry.1 = Some((ts, preview.clone(), mid));
+                }
+            }
+            _ => missing_tip.push(id),
+        }
+    }
+
+    // Tip fill BEFORE unread trust — missing denorm tip must not trust unread 0.
+    if !missing_tip.is_empty() {
+        let last_pipeline = vec![
+            doc! {
+                "$match": {
+                    "channel": { "$in": &missing_tip },
+                    "deleted": { "$ne": true },
+                }
+            },
+            doc! { "$sort": { "timestamp": -1, "_id": -1 } },
+            doc! {
+                "$group": {
+                    "_id": "$channel",
+                    "timestamp": { "$first": "$timestamp" },
+                    "content": { "$first": "$content" },
+                    "messageId": { "$first": "$_id" },
+                }
+            },
+        ];
+        match Message::collection(db).aggregate(last_pipeline).await {
+            Ok(mut cursor) => {
+                let mut filled: HashMap<ObjectId, (DateTime, String, ObjectId)> = HashMap::new();
+                loop {
+                    match cursor.try_next().await {
+                        Ok(Some(doc)) => {
+                            let Ok(cid) = doc.get_object_id("_id") else { continue };
+                            let ts = doc.get_datetime("timestamp").ok().copied();
+                            let content = doc
+                                .get_str("content")
+                                .ok()
+                                .map(crate::utils::messages::content_storage::content_for_api);
+                            let mid = doc.get_object_id("messageId").ok();
+                            if let (Some(ts), Some(content), Some(mid)) = (ts, content, mid) {
+                                filled.insert(cid, (ts, content, mid));
+                            }
+                        }
+                        Ok(None) => break,
+                        // Mid-stream Err — fail closed (parity with contacts tip 503).
+                        Err(_) => return None,
+                    }
+                }
+                for (cid, tip) in filled {
+                    if let Some(entry) = out.get_mut(&cid) {
+                        entry.1 = Some(tip);
+                    }
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+
+    let mut last_reads: HashMap<ObjectId, DateTime> = HashMap::new();
+    let mut missing_unread: Vec<ObjectId> = Vec::new();
+    match ChannelReadState::collection(db)
+        .find(doc! { "userId": user_id, "channelId": { "$in": &channel_ids } })
         .await
     {
-        Ok(mut cursor) => match cursor.try_next().await.ok().flatten() {
-            Some(m) => Some((
-                m.timestamp,
-                crate::utils::messages::content_storage::content_for_api(
-                    &m.content,
-                ),
-            )),
-            None => None,
-        },
-        Err(_) => None,
-    };
+        Ok(cursor) => {
+            let states: Vec<ChannelReadState> = match cursor.try_collect().await {
+                Ok(s) => s,
+                // Fail closed — partial state would leave missing channels at init 0.
+                Err(_) => return None,
+            };
+            for s in states {
+                // Epoch lastReadAt → createdAt (legacy bump-before-seed rows).
+                let effective = if s.last_read_at.timestamp_millis() <= 0 {
+                    s.created_at
+                } else {
+                    s.last_read_at
+                };
+                last_reads.insert(s.channel_id, effective);
+                let tip_ts = out.get(&s.channel_id).and_then(|e| e.1.as_ref().map(|t| t.0));
+                let behind_tip = tip_ts
+                    .is_some_and(|ts| effective.timestamp_millis() < ts.timestamp_millis());
+                // Positive denorm behind tip must recount (failed bump undercount).
+                // Tip present + unread 0: verify (parity contacts; stale tip after upsert fail).
+                // Trust denorm 0 only when no tip (empty channel).
+                if s.unread_count > 0 {
+                    let stale_high = tip_ts
+                        .is_some_and(|ts| effective.timestamp_millis() >= ts.timestamp_millis());
+                    if stale_high || behind_tip {
+                        missing_unread.push(s.channel_id);
+                    } else if let Some(entry) = out.get_mut(&s.channel_id) {
+                        entry.0 = s.unread_count;
+                    }
+                } else if behind_tip || tip_ts.is_some() {
+                    missing_unread.push(s.channel_id);
+                }
+            }
+            // Tip present but no read-state — fail closed (parity single enrich; no epoch invent).
+            for cid in &channel_ids {
+                if last_reads.contains_key(cid) {
+                    continue;
+                }
+                if out.get(cid).and_then(|e| e.1.as_ref()).is_some() {
+                    return None;
+                }
+            }
+        }
+        Err(_) => {
+            // Query failed — do not invent all-zero badges.
+            return None;
+        }
+    }
 
-    (unread, last)
+    if !missing_unread.is_empty() {
+        let mut or_clauses = Vec::with_capacity(missing_unread.len());
+        for cid in &missing_unread {
+            let last_read = last_reads
+                .get(cid)
+                .copied()
+                .unwrap_or_else(|| DateTime::from_millis(0));
+            or_clauses.push(doc! {
+                "channel": cid,
+                "timestamp": { "$gt": last_read },
+            });
+        }
+        let unread_pipeline = vec![
+            doc! {
+                "$match": {
+                    "deleted": { "$ne": true },
+                    "sender": { "$ne": user_id },
+                    "$or": or_clauses,
+                }
+            },
+            doc! {
+                "$group": {
+                    "_id": "$channel",
+                    "count": { "$sum": 1 },
+                }
+            },
+        ];
+        match Message::collection(db).aggregate(unread_pipeline).await {
+            Ok(mut cursor) => {
+                loop {
+                    match cursor.try_next().await {
+                        Ok(Some(doc)) => {
+                            let Ok(cid) = doc.get_object_id("_id") else { continue };
+                            let count = match doc.get("count") {
+                                Some(mongodb::bson::Bson::Int64(n)) => (*n).max(0) as u64,
+                                Some(mongodb::bson::Bson::Int32(n)) => (*n).max(0) as u64,
+                                _ => 0,
+                            };
+                            if let Some(entry) = out.get_mut(&cid) {
+                                entry.0 = count;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            // Mid-stream Err — do not leave undercount candidates at init 0.
+                            return None;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Recount failed — fail closed (parity with contacts tip 503).
+                return None;
+            }
+        }
+    }
+
+    Some(out)
 }
+

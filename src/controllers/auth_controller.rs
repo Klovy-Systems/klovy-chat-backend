@@ -14,7 +14,7 @@ use crate::utils::auth::token_utils::{create_access_token, ACCESS_MAX_AGE_MS, RE
 use crate::utils::auth::refresh_token::{
     family_id_from_refresh_token, issue_refresh_token, list_user_sessions,
     revoke_other_sessions_for_user, revoke_refresh_token_family, revoke_session_for_user,
-    revoke_user_refresh_tokens, rotate_refresh_token, REFRESH_COOKIE,
+    revoke_user_refresh_tokens, rotate_refresh_token, RefreshAuthError, REFRESH_COOKIE,
 };
 use crate::utils::auth::session_metadata::session_metadata_from_request;
 use crate::utils::auth::step_up::{
@@ -66,6 +66,25 @@ fn whitelist_flag() -> Option<bool> {
 
 fn req_user_id(req: &HttpRequest) -> Option<String> {
     req.extensions().get::<RequestUserId>().map(|u| u.0.clone())
+}
+
+/// Password verify: `Ok(bool)` · `Err(HttpResponse)` on runtime Unavailable (not bad password).
+async fn password_matches(plain: &str, hash: &str) -> Result<bool, HttpResponse> {
+    match verify_user_password(plain, hash).await {
+        Ok(v) => Ok(v),
+        Err(()) => Err(HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Temporarily unavailable. Retry."
+        }))),
+    }
+}
+
+/// Step-up / TOTP infra Err → 503; bad code → 400.
+fn step_up_err_response(message: &str) -> HttpResponse {
+    if message.starts_with("Temporarily unavailable") {
+        HttpResponse::ServiceUnavailable().json(json!({ "message": message }))
+    } else {
+        HttpResponse::BadRequest().json(json!({ "message": message }))
+    }
 }
 
 fn jwt_cookie(value: &str, max_age_ms: i64) -> Cookie<'static> {
@@ -215,17 +234,21 @@ async fn verify_account_action_credentials(
         })));
     }
 
-    if !verify_user_password(password, &user.password).await {
-        add_login_delay().await;
-        return Err(HttpResponse::BadRequest().json(json!({
-            "message": "Hasło jest nieprawidłowe."
-        })));
+    match password_matches(password, &user.password).await {
+        Ok(true) => {}
+        Ok(false) => {
+            add_login_delay().await;
+            return Err(HttpResponse::BadRequest().json(json!({
+                "message": "Hasło jest nieprawidłowe."
+            })));
+        }
+        Err(res) => return Err(res),
     }
 
     match verify_step_up_auth(user, code).await {
         Err(message) => {
             add_login_delay().await;
-            Err(HttpResponse::BadRequest().json(json!({ "message": message })))
+            Err(step_up_err_response(message))
         }
         Ok(StepUpResult::BackupConsumed { index }) => {
             let codes_bson = backup_codes_bson_after_consumption(user, index);
@@ -428,6 +451,14 @@ pub async fn signup(
                 SecurityEventType::AuthFailure,
                 json!({ "reason": err.code(), "action": "signup" }),
             );
+            use crate::utils::registration::SignupQuotaError;
+            if err == SignupQuotaError::Unavailable {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": err.user_message(),
+                    "code": err.code(),
+                    "retryable": true,
+                }));
+            }
             return HttpResponse::TooManyRequests().json(json!({
                 "message": err.user_message(),
                 "code": err.code()
@@ -458,16 +489,20 @@ pub async fn signup(
             }))
         }
         Err(e) => {
-            if User::username_exists(&db, &normalized).await.unwrap_or(false) {
-                add_login_delay().await;
-                HttpResponse::BadRequest().json(json!({
-                    "message": "Nie można utworzyć konta. Sprawdź dane lub wybierz inną nazwę użytkownika."
-                }))
-            } else {
-                log::error!("signup failed: {e}");
-                HttpResponse::BadRequest().json(json!({
-                    "message": "Nie można utworzyć konta. Sprawdź dane lub wybierz inną nazwę użytkownika."
-                }))
+            match User::username_exists(&db, &normalized).await {
+                Ok(_) => {
+                    // Don't leak whether username exists; same client message either way.
+                    add_login_delay().await;
+                    HttpResponse::BadRequest().json(json!({
+                        "message": "Nie można utworzyć konta. Sprawdź dane lub wybierz inną nazwę użytkownika."
+                    }))
+                }
+                Err(_) => {
+                    log::error!("signup failed (username lookup unavailable): {e}");
+                    HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Temporarily unavailable. Retry."
+                    }))
+                }
             }
         }
     }
@@ -523,13 +558,17 @@ pub async fn login(
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
 
-    if !verify_user_password(&password, &user.password).await {
-        monitor.log_event(
-            SecurityEventType::LoginFailures,
-            json!({ "username": normalized, "reason": "invalid_password" }),
-        );
-        add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({ "message": "Invalid credentials" }));
+    match password_matches(&password, &user.password).await {
+        Ok(true) => {}
+        Ok(false) => {
+            monitor.log_event(
+                SecurityEventType::LoginFailures,
+                json!({ "username": normalized, "reason": "invalid_password" }),
+            );
+            add_login_delay().await;
+            return HttpResponse::BadRequest().json(json!({ "message": "Invalid credentials" }));
+        }
+        Err(res) => return res,
     }
 
     if let Some(response) = account_status_response(&user) {
@@ -599,15 +638,37 @@ pub async fn verify_two_factor_login(req: HttpRequest, body: web::Json<TwoFactor
 
     if is_totp_code(code) {
         if let Some(encrypted) = user.totp_secret.as_deref() {
-            if let Ok(secret) = decrypt_totp_secret(encrypted) {
-                verified = verify_totp_code(&user.username, &secret, code);
+            match decrypt_totp_secret(encrypted) {
+                Ok(secret) => {
+                    match verify_totp_code(&user.username, &secret, code) {
+                        Ok(v) => verified = v,
+                        Err(()) => {
+                            return HttpResponse::ServiceUnavailable().json(json!({
+                                "message": "Temporarily unavailable. Retry."
+                            }));
+                        }
+                    }
+                }
+                Err(_) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Temporarily unavailable. Retry."
+                    }));
+                }
             }
         }
     } else if let Some(hashes) = user.backup_codes.as_ref() {
-        if let Some(index) = verify_and_consume_backup_code(code, hashes).await {
-            verified = true;
-            if let Some(codes) = updated_backup_codes.as_mut() {
-                codes.remove(index);
+        match verify_and_consume_backup_code(code, hashes).await {
+            Ok(Some(index)) => {
+                verified = true;
+                if let Some(codes) = updated_backup_codes.as_mut() {
+                    codes.remove(index);
+                }
+            }
+            Ok(None) => {}
+            Err(()) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable. Retry."
+                }));
             }
         }
     }
@@ -625,7 +686,20 @@ pub async fn verify_two_factor_login(req: HttpRequest, body: web::Json<TwoFactor
             _ => Bson::Null,
         };
 
-        let _ = User::set_fields(&db, user_oid, doc! { "backupCodes": backup_val }).await;
+        match User::set_fields(&db, user_oid, doc! { "backupCodes": backup_val }).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return HttpResponse::NotFound()
+                    .json(json!({ "message": "User not found." }));
+            }
+            Err(_) => {
+                // Consumed code must not unlock a session if the write failed —
+                // otherwise the same backup code remains reusable.
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable. Retry."
+                }));
+            }
+        }
     }
 
     login_response(&req, user).await
@@ -656,9 +730,13 @@ pub async fn setup_two_factor(
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
 
-    if !verify_user_password(password, &user.password).await {
-        add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({ "message": "Invalid password." }));
+    match password_matches(password, &user.password).await {
+        Ok(true) => {}
+        Ok(false) => {
+            add_login_delay().await;
+            return HttpResponse::BadRequest().json(json!({ "message": "Invalid password." }));
+        }
+        Err(res) => return res,
     }
 
     if user.two_factor_enabled {
@@ -709,9 +787,13 @@ pub async fn enable_two_factor(
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
 
-    if !verify_user_password(password, &user.password).await {
-        add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({ "message": "Invalid password." }));
+    match password_matches(password, &user.password).await {
+        Ok(true) => {}
+        Ok(false) => {
+            add_login_delay().await;
+            return HttpResponse::BadRequest().json(json!({ "message": "Invalid password." }));
+        }
+        Err(res) => return res,
     }
 
     if user.two_factor_enabled {
@@ -728,18 +810,34 @@ pub async fn enable_two_factor(
 
     let secret = match decrypt_totp_secret(pending_encrypted) {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable. Retry."
+            }));
+        }
     };
 
-    if !verify_totp_code(&user.username, &secret, code) {
-        add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({ "message": "Invalid authentication code." }));
+    match verify_totp_code(&user.username, &secret, code) {
+        Ok(true) => {}
+        Ok(false) => {
+            add_login_delay().await;
+            return HttpResponse::BadRequest().json(json!({ "message": "Invalid authentication code." }));
+        }
+        Err(()) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable. Retry."
+            }));
+        }
     }
 
     let plain_codes = generate_backup_codes();
     let hashed_codes = match hash_backup_codes(&plain_codes).await {
         Ok(codes) => codes,
-        Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable. Retry."
+            }));
+        }
     };
 
     let backup_bson: Vec<Bson> = hashed_codes.into_iter().map(Bson::String).collect();
@@ -803,20 +901,46 @@ pub async fn disable_two_factor(
         }));
     }
 
-    if !verify_user_password(password, &user.password).await {
-        add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({ "message": "Invalid password." }));
+    match password_matches(password, &user.password).await {
+        Ok(true) => {}
+        Ok(false) => {
+            add_login_delay().await;
+            return HttpResponse::BadRequest().json(json!({ "message": "Invalid password." }));
+        }
+        Err(res) => return res,
     }
 
     let mut verified = false;
     if is_totp_code(code) {
         if let Some(encrypted) = user.totp_secret.as_deref() {
-            if let Ok(secret) = decrypt_totp_secret(encrypted) {
-                verified = verify_totp_code(&user.username, &secret, code);
+            match decrypt_totp_secret(encrypted) {
+                Ok(secret) => {
+                    match verify_totp_code(&user.username, &secret, code) {
+                        Ok(v) => verified = v,
+                        Err(()) => {
+                            return HttpResponse::ServiceUnavailable().json(json!({
+                                "message": "Temporarily unavailable. Retry."
+                            }));
+                        }
+                    }
+                }
+                Err(_) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Temporarily unavailable. Retry."
+                    }));
+                }
             }
         }
     } else if let Some(hashes) = user.backup_codes.as_ref() {
-        verified = verify_and_consume_backup_code(code, hashes).await.is_some();
+        match verify_and_consume_backup_code(code, hashes).await {
+            Ok(Some(_)) => verified = true,
+            Ok(None) => {}
+            Err(()) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable. Retry."
+                }));
+            }
+        }
     }
 
     if !verified {
@@ -882,17 +1006,21 @@ pub async fn change_password(
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
 
-    if !verify_user_password(current, &user.password).await {
-        add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({
-            "message": "Current password is incorrect."
-        }));
+    match password_matches(current, &user.password).await {
+        Ok(true) => {}
+        Ok(false) => {
+            add_login_delay().await;
+            return HttpResponse::BadRequest().json(json!({
+                "message": "Current password is incorrect."
+            }));
+        }
+        Err(res) => return res,
     }
 
     match verify_step_up_auth(&user, body.code.as_deref()).await {
         Err(message) => {
             add_login_delay().await;
-            return HttpResponse::BadRequest().json(json!({ "message": message }));
+            return step_up_err_response(message);
         }
         Ok(StepUpResult::BackupConsumed { index }) => {
             let codes_bson = backup_codes_bson_after_consumption(&user, index);
@@ -967,9 +1095,13 @@ pub async fn change_username(
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
 
-    if !verify_user_password(password, &user.password).await {
-        add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({ "message": "Nieprawidłowe hasło." }));
+    match password_matches(password, &user.password).await {
+        Ok(true) => {}
+        Ok(false) => {
+            add_login_delay().await;
+            return HttpResponse::BadRequest().json(json!({ "message": "Nieprawidłowe hasło." }));
+        }
+        Err(res) => return res,
     }
 
     if normalized == user.username {
@@ -981,7 +1113,7 @@ pub async fn change_username(
     match verify_step_up_auth(&user, body.code.as_deref()).await {
         Err(message) => {
             add_login_delay().await;
-            return HttpResponse::BadRequest().json(json!({ "message": message }));
+            return step_up_err_response(message);
         }
         Ok(StepUpResult::BackupConsumed { index }) => {
             let codes_bson = backup_codes_bson_after_consumption(&user, index);
@@ -1022,16 +1154,15 @@ pub async fn change_username(
         }
         Ok(None) => HttpResponse::NotFound().body("User not found."),
         Err(_) => {
-            // Zabezpieczenie na wypadek wyścigu z unikalnym indeksem na `username`.
-            if User::username_taken_by_other(&db, &normalized, oid)
-                .await
-                .unwrap_or(false)
-            {
-                HttpResponse::Conflict().json(json!({
+            // Race with unique username index — distinguish Conflict vs Unavailable.
+            match User::username_taken_by_other(&db, &normalized, oid).await {
+                Ok(true) => HttpResponse::Conflict().json(json!({
                     "message": "Ta nazwa użytkownika jest już zajęta. Wybierz inną."
-                }))
-            } else {
-                HttpResponse::InternalServerError().body("Internal Server Error.")
+                })),
+                Ok(false) => HttpResponse::InternalServerError().body("Internal Server Error."),
+                Err(_) => HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable. Retry."
+                })),
             }
         }
     }
@@ -1074,7 +1205,11 @@ pub async fn refresh_session(req: HttpRequest) -> HttpResponse {
                     "csrfToken": csrf,
                 }))
         }
-        Err(_) => HttpResponse::Unauthorized()
+        // Transient Mongo — keep cookies so the client can retry.
+        Err(RefreshAuthError::Unavailable) => HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Temporarily unavailable. Retry."
+        })),
+        Err(RefreshAuthError::Denied) => HttpResponse::Unauthorized()
             .cookie(jwt_cookie("", 0))
             .cookie(clear_refresh_cookie())
             .cookie(clear_legacy_refresh_cookie())
@@ -1085,13 +1220,29 @@ pub async fn refresh_session(req: HttpRequest) -> HttpResponse {
 pub async fn logout(req: HttpRequest) -> HttpResponse {
     if let Some(cookie) = req.cookie(REFRESH_COOKIE) {
         let raw = cookie.value();
-        let family_id = family_id_from_refresh_token(raw).await;
-        if let Some(user_id) = revoke_refresh_token_family(raw).await {
-            let uid = user_id.to_hex();
-            if let Some(fid) = family_id {
-                revoke_session_remotely(&uid, &fid);
-            } else {
-                disconnect_user(&uid);
+        let family_id = match family_id_from_refresh_token(raw).await {
+            Ok(v) => v,
+            Err(RefreshAuthError::Unavailable) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable. Retry."
+                }));
+            }
+            Err(RefreshAuthError::Denied) => None,
+        };
+        match revoke_refresh_token_family(raw).await {
+            Ok(Some(user_id)) => {
+                let uid = user_id.to_hex();
+                if let Some(fid) = family_id {
+                    revoke_session_remotely(&uid, &fid);
+                } else {
+                    disconnect_user(&uid);
+                }
+            }
+            Ok(None) => {}
+            Err(RefreshAuthError::Unavailable) | Err(RefreshAuthError::Denied) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable. Retry."
+                }));
             }
         }
     } else if let Some(user_id) = req_user_id(&req) {
@@ -1117,7 +1268,15 @@ pub async fn list_sessions(req: HttpRequest) -> HttpResponse {
     };
 
     let current_family_id = if let Some(cookie) = req.cookie(REFRESH_COOKIE) {
-        family_id_from_refresh_token(cookie.value()).await
+        match family_id_from_refresh_token(cookie.value()).await {
+            Ok(v) => v,
+            Err(RefreshAuthError::Unavailable) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable. Retry."
+                }));
+            }
+            Err(RefreshAuthError::Denied) => None,
+        }
     } else {
         None
     };
@@ -1150,7 +1309,15 @@ pub async fn revoke_session(req: HttpRequest) -> HttpResponse {
         .map(|cookie| cookie.value().to_string());
 
     let current_family = if let Some(raw) = current_family_id {
-        family_id_from_refresh_token(&raw).await
+        match family_id_from_refresh_token(&raw).await {
+            Ok(v) => v,
+            Err(RefreshAuthError::Unavailable) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable. Retry."
+                }));
+            }
+            Err(RefreshAuthError::Denied) => None,
+        }
     } else {
         None
     };
@@ -1199,10 +1366,18 @@ pub async fn revoke_other_sessions(req: HttpRequest) -> HttpResponse {
         }));
     };
 
-    let Some(current_family) = family_id_from_refresh_token(&raw_token).await else {
-        return HttpResponse::BadRequest().json(json!({
-            "message": "Bieżąca sesja jest nieprawidłowa."
-        }));
+    let current_family = match family_id_from_refresh_token(&raw_token).await {
+        Ok(Some(fid)) => fid,
+        Ok(None) => {
+            return HttpResponse::BadRequest().json(json!({
+                "message": "Bieżąca sesja jest nieprawidłowa."
+            }));
+        }
+        Err(RefreshAuthError::Unavailable) | Err(RefreshAuthError::Denied) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable. Retry."
+            }));
+        }
     };
 
     let db = get_db();
@@ -1457,6 +1632,7 @@ pub async fn update_availability_status(
     .await
     {
         Ok(Some(user)) => {
+            crate::utils::user::availability_cache::put(&user_id, status);
             emit_status_event(
                 &db,
                 &user_id,
@@ -1504,8 +1680,12 @@ pub async fn add_profile_image(
     }
 
     let db = get_db();
-    let existing = User::find_by_id(&db, oid).await.ok().flatten();
-    let previous_image = existing.as_ref().and_then(|user| user.image.clone());
+    let existing = match User::find_by_id(&db, oid).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return HttpResponse::NotFound().body("User not found."),
+        Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error."),
+    };
+    let previous_image = existing.image.clone();
 
     let key = avatar_user_key(&user_id);
     let webp = match reencode_upload_to_webp(form.file.file.path()) {
@@ -1563,20 +1743,30 @@ pub async fn remove_profile_image(req: HttpRequest) -> HttpResponse {
     };
 
     if let Some(image) = &user.image {
-        if avatar_key_owned_by_user(image, &user_id) {
-            let _ = storage().delete_avatar_key(image).await;
+        match User::set_fields(&db, oid, doc! { "image": Bson::Null }).await {
+            Ok(Some(_)) => {
+                if avatar_key_owned_by_user(image, &user_id) {
+                    let _ = storage().delete_avatar_key(image).await;
+                }
+                emit_profile_event(
+                    &db,
+                    &user_id,
+                    "profile-image-updated",
+                    json!({
+                        "userId": user_id,
+                        "image": null,
+                    }),
+                )
+                .await;
+            }
+            Ok(None) => {
+                return HttpResponse::NotFound().json(json!({ "error": "User not found" }));
+            }
+            Err(_) => {
+                return HttpResponse::InternalServerError()
+                    .json(json!({ "error": "Internal server error" }));
+            }
         }
-        let _ = User::set_fields(&db, oid, doc! { "image": Bson::Null }).await;
-        emit_profile_event(
-            &db,
-            &user_id,
-            "profile-image-updated",
-            json!({
-                "userId": user_id,
-                "image": null,
-            }),
-        )
-        .await;
     }
 
     HttpResponse::Ok().json(json!({ "message": "Profile image removed successfully" }))
@@ -1672,20 +1862,30 @@ pub async fn remove_profile_banner(req: HttpRequest) -> HttpResponse {
     };
 
     if let Some(banner) = &user.banner {
-        if public_media_key_owned_by_user(banner, &user_id) {
-            let _ = storage().delete_public_media_key(banner).await;
+        match User::set_fields(&db, oid, doc! { "banner": Bson::Null }).await {
+            Ok(Some(_)) => {
+                if public_media_key_owned_by_user(banner, &user_id) {
+                    let _ = storage().delete_public_media_key(banner).await;
+                }
+                emit_profile_event(
+                    &db,
+                    &user_id,
+                    "profile-banner-updated",
+                    json!({
+                        "userId": user_id,
+                        "banner": null,
+                    }),
+                )
+                .await;
+            }
+            Ok(None) => {
+                return HttpResponse::NotFound().json(json!({ "error": "User not found" }));
+            }
+            Err(_) => {
+                return HttpResponse::InternalServerError()
+                    .json(json!({ "error": "Internal server error" }));
+            }
         }
-        let _ = User::set_fields(&db, oid, doc! { "banner": Bson::Null }).await;
-        emit_profile_event(
-            &db,
-            &user_id,
-            "profile-banner-updated",
-            json!({
-                "userId": user_id,
-                "banner": null,
-            }),
-        )
-        .await;
     }
 
     HttpResponse::Ok().json(json!({ "message": "Profile banner removed successfully" }))
@@ -1742,9 +1942,26 @@ pub async fn update_featured_badges(
         }
     }
 
-    let featured_bson = mongodb::bson::to_bson(&featured_ids).unwrap_or(Bson::Array(vec![]));
+    let featured_bson = match mongodb::bson::to_bson(&featured_ids) {
+        Ok(b) => b,
+        // Fail closed — empty array would wipe featured badges.
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "success": false,
+                "message": "Failed to update featured badges",
+            }));
+        }
+    };
     let update_doc = if badges_changed {
-        let badges_bson = mongodb::bson::to_bson(&badges).unwrap_or(Bson::Array(vec![]));
+        let badges_bson = match mongodb::bson::to_bson(&badges) {
+            Ok(b) => b,
+            Err(_) => {
+                return HttpResponse::InternalServerError().json(json!({
+                    "success": false,
+                    "message": "Failed to update featured badges",
+                }));
+            }
+        };
         doc! { "badges": badges_bson, "featuredBadgeIds": featured_bson }
     } else {
         doc! { "featuredBadgeIds": featured_bson }

@@ -5,7 +5,7 @@ use serde_json::json;
 use crate::middlewares::auth_middleware::request_user_id;
 use crate::model::user_model::User;
 use crate::utils::db::get_db;
-use crate::utils::friends::are_friends;
+use crate::utils::friends::try_are_friends;
 use crate::utils::user::serialize_user::availability_status_str;
 
 pub async fn get_user_status(req: HttpRequest) -> HttpResponse {
@@ -23,8 +23,19 @@ pub async fn get_user_status(req: HttpRequest) -> HttpResponse {
     };
 
     let db = get_db();
-    if viewer_id != user_id && !are_friends(&db, &viewer_id, user_id).await {
-        return HttpResponse::Forbidden().json(json!({ "error": "Forbidden" }));
+    if viewer_id != user_id {
+        match try_are_friends(&db, &viewer_id, user_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return HttpResponse::Forbidden().json(json!({ "error": "Forbidden" }));
+            }
+            Err(()) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
+        }
     }
 
     match User::find_by_id(&db, oid).await {

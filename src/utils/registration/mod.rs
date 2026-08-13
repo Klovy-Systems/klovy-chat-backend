@@ -57,6 +57,7 @@ pub fn is_registration_open() -> bool {
 pub enum SignupQuotaError {
     HourlyLimit,
     DailyLimit,
+    Unavailable,
 }
 
 impl SignupQuotaError {
@@ -65,6 +66,7 @@ impl SignupQuotaError {
             Self::HourlyLimit | Self::DailyLimit => {
                 "Rejestracja jest tymczasowo niedostępna z powodu dużego obciążenia. Spróbuj ponownie później."
             }
+            Self::Unavailable => "Temporarily unavailable. Retry.",
         }
     }
 
@@ -72,6 +74,7 @@ impl SignupQuotaError {
         match self {
             Self::HourlyLimit => "SIGNUP_HOURLY_LIMIT",
             Self::DailyLimit => "SIGNUP_DAILY_LIMIT",
+            Self::Unavailable => "UNAVAILABLE",
         }
     }
 }
@@ -134,16 +137,18 @@ pub async fn try_consume_global_signup_slot(
     let now = DateTime::now();
     let (hour_key, day_key) = utc_window_keys(now);
 
-    let hour_ok = try_consume_window(db, &hour_key, signup_max_global_per_hour())
-        .await
-        .unwrap_or(false);
+    let hour_ok = match try_consume_window(db, &hour_key, signup_max_global_per_hour()).await {
+        Ok(v) => v,
+        Err(_) => return Err(SignupQuotaError::Unavailable),
+    };
     if !hour_ok {
         return Err(SignupQuotaError::HourlyLimit);
     }
 
-    let day_ok = try_consume_window(db, &day_key, signup_max_global_per_day())
-        .await
-        .unwrap_or(false);
+    let day_ok = match try_consume_window(db, &day_key, signup_max_global_per_day()).await {
+        Ok(v) => v,
+        Err(_) => return Err(SignupQuotaError::Unavailable),
+    };
     if !day_ok {
         // Best-effort rollback of the hour slot so failed day checks don't skew hourly stats.
         let _ = quota_collection(db)

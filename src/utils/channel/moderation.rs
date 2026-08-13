@@ -1,4 +1,4 @@
-use mongodb::bson::{doc, oid::ObjectId, DateTime, Bson};
+use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
 use serde_json::{json, Value};
 
@@ -8,24 +8,107 @@ use crate::model::channel_moderation::{
 };
 use crate::model::channel_model::Channel;
 
-pub async fn persist_moderation_lists(
+/// Atomic mute-list remove — avoids rewriting full arrays from a stale snapshot.
+pub async fn pull_muted_member(
     db: &Database,
     channel_id: ObjectId,
-    banned_members: Vec<ChannelModerationEntry>,
-    muted_members: Vec<ChannelModerationEntry>,
+    user_id: ObjectId,
 ) -> mongodb::error::Result<()> {
-    let banned_bson = mongodb::bson::to_bson(&banned_members).unwrap_or(Bson::Array(vec![]));
-    let muted_bson = mongodb::bson::to_bson(&muted_members).unwrap_or(Bson::Array(vec![]));
     Channel::collection(db)
         .update_one(
             doc! { "_id": channel_id },
             doc! {
+                "$pull": { "mutedMembers": { "userId": user_id } },
+                "$set": { "updatedAt": DateTime::now() },
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Atomic ban-list remove.
+pub async fn pull_banned_member(
+    db: &Database,
+    channel_id: ObjectId,
+    user_id: ObjectId,
+) -> mongodb::error::Result<()> {
+    Channel::collection(db)
+        .update_one(
+            doc! { "_id": channel_id },
+            doc! {
+                "$pull": { "bannedMembers": { "userId": user_id } },
+                "$set": { "updatedAt": DateTime::now() },
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Upsert one ban entry without clobbering the rest of the list (single pipeline update).
+pub async fn upsert_banned_member(
+    db: &Database,
+    channel_id: ObjectId,
+    entry: ChannelModerationEntry,
+) -> mongodb::error::Result<()> {
+    let entry_bson = mongodb::bson::to_bson(&entry).map_err(|e| {
+        mongodb::error::Error::custom(format!("failed to serialize ban entry: {e}"))
+    })?;
+    let uid = entry.user_id;
+    Channel::collection(db)
+        .update_one(
+            doc! { "_id": channel_id },
+            vec![doc! {
                 "$set": {
-                    "bannedMembers": banned_bson,
-                    "mutedMembers": muted_bson,
+                    "bannedMembers": {
+                        "$concatArrays": [
+                            {
+                                "$filter": {
+                                    "input": { "$ifNull": ["$bannedMembers", []] },
+                                    "as": "e",
+                                    "cond": { "$ne": ["$$e.userId", uid] },
+                                }
+                            },
+                            [entry_bson],
+                        ]
+                    },
                     "updatedAt": DateTime::now(),
                 }
-            },
+            }],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Upsert one mute entry without clobbering the rest of the list (single pipeline update).
+pub async fn upsert_muted_member(
+    db: &Database,
+    channel_id: ObjectId,
+    entry: ChannelModerationEntry,
+) -> mongodb::error::Result<()> {
+    let entry_bson = mongodb::bson::to_bson(&entry).map_err(|e| {
+        mongodb::error::Error::custom(format!("failed to serialize mute entry: {e}"))
+    })?;
+    let uid = entry.user_id;
+    Channel::collection(db)
+        .update_one(
+            doc! { "_id": channel_id },
+            vec![doc! {
+                "$set": {
+                    "mutedMembers": {
+                        "$concatArrays": [
+                            {
+                                "$filter": {
+                                    "input": { "$ifNull": ["$mutedMembers", []] },
+                                    "as": "e",
+                                    "cond": { "$ne": ["$$e.userId", uid] },
+                                }
+                            },
+                            [entry_bson],
+                        ]
+                    },
+                    "updatedAt": DateTime::now(),
+                }
+            }],
         )
         .await?;
     Ok(())
@@ -35,11 +118,20 @@ pub async fn populate_moderation_user_list(
     db: &Database,
     entries: &[ChannelModerationEntry],
 ) -> Vec<Value> {
-    use super::populate_channel_user;
+    use super::fetch_users_map;
 
-    let mut out = Vec::new();
-    for entry in active_moderation_entries(entries) {
-        let mut user = populate_channel_user(db, entry.user_id).await;
+    let active = active_moderation_entries(entries);
+    if active.is_empty() {
+        return Vec::new();
+    }
+    let ids: Vec<ObjectId> = active.iter().map(|e| e.user_id).collect();
+    let map = fetch_users_map(db, &ids).await;
+    let mut out = Vec::with_capacity(active.len());
+    for entry in active {
+        let mut user = map
+            .get(&entry.user_id)
+            .cloned()
+            .unwrap_or_else(|| json!({ "_id": entry.user_id.to_hex() }));
         if let Some(obj) = user.as_object_mut() {
             obj.insert(
                 "moderationExpiresAt".to_string(),
@@ -62,16 +154,19 @@ pub async fn populate_moderation_user_list(
     out
 }
 
+/// `None` when channel lookup fails under Mongo Err (callers must not invent empty lists).
 pub async fn get_channel_ban_mute_lists(
     db: &Database,
     channel_id: ObjectId,
-) -> (Vec<Value>, Vec<Value>) {
-    let Ok(Some(channel)) = Channel::find_by_id(db, channel_id).await else {
-        return (vec![], vec![]);
+) -> Option<(Vec<Value>, Vec<Value>)> {
+    let channel = match Channel::find_by_id(db, channel_id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return Some((vec![], vec![])),
+        Err(_) => return None,
     };
     let banned = populate_moderation_user_list(db, &channel.banned_members).await;
     let muted = populate_moderation_user_list(db, &channel.muted_members).await;
-    (banned, muted)
+    Some((banned, muted))
 }
 
 pub fn build_moderation_entry(
@@ -141,14 +236,61 @@ pub fn active_moderation_user_ids(entries: &[ChannelModerationEntry]) -> Vec<Str
         .collect()
 }
 
+/// ISO expiry for the viewer's active timed mute (if any).
+pub fn viewer_mute_expires_at(channel: &Channel, viewer_id: &str) -> Option<String> {
+    channel
+        .muted_members
+        .iter()
+        .find(|entry| entry.is_active() && entry.user_id.to_hex() == viewer_id)
+        .and_then(|entry| entry.expires_at.as_ref())
+        .and_then(|dt| dt.try_to_rfc3339_string().ok())
+}
+
 pub async fn maybe_prune_channel_moderation(db: &Database, channel: &Channel) -> Channel {
     let banned = active_moderation_entries(&channel.banned_members);
     let muted = active_moderation_entries(&channel.muted_members);
     if banned.len() == channel.banned_members.len() && muted.len() == channel.muted_members.len() {
         return channel.clone();
     }
+
+    let active_muted: std::collections::HashSet<ObjectId> =
+        muted.iter().map(|e| e.user_id).collect();
+    let expired_mute_users: Vec<String> = channel
+        .muted_members
+        .iter()
+        .filter(|entry| !active_muted.contains(&entry.user_id))
+        .map(|entry| entry.user_id.to_hex())
+        .collect();
+
     if let Some(channel_id) = channel.id {
-        let _ = persist_moderation_lists(db, channel_id, banned.clone(), muted.clone()).await;
+        // Pull only expired timed entries — never rewrite full arrays (races upsert).
+        let now = DateTime::now();
+        let _ = Channel::collection(db)
+            .update_one(
+                doc! { "_id": channel_id },
+                doc! {
+                    "$pull": {
+                        "bannedMembers": { "expiresAt": { "$lte": now } },
+                        "mutedMembers": { "expiresAt": { "$lte": now } },
+                    },
+                    "$set": { "updatedAt": now },
+                },
+            )
+            .await;
+        let channel_id_hex = channel_id.to_hex();
+        crate::ws::typing_access_cache::invalidate_channel(&channel_id_hex);
+        crate::utils::access::channel_access_cache::invalidate_channel(&channel_id_hex);
+        for user_id in expired_mute_users {
+            crate::ws::registry::emit_to_user(
+                &user_id,
+                "channel-moderation-updated",
+                json!({
+                    "channelId": channel_id_hex,
+                    "isMutedHere": false,
+                    "mutedHereExpiresAt": Value::Null,
+                }),
+            );
+        }
     }
     Channel {
         banned_members: banned,

@@ -10,7 +10,6 @@ use crate::middlewares::auth_middleware::request_user_id;
 use crate::model::channel_model::Channel;
 use crate::utils::channel::can_access_channel;
 use crate::utils::db::get_db;
-use crate::utils::friends::are_friends;
 use crate::utils::ratelimit::Store;
 use crate::utils::voice::call_sessions::{active_session_for_user, token_allowed, CallSessionError};
 use mongodb::bson::oid::ObjectId;
@@ -62,7 +61,9 @@ struct LiveKitClaims {
 
 fn token_denied_message(err: CallSessionError) -> &'static str {
     match err {
-        CallSessionError::NotFound | CallSessionError::InvalidPhase => {
+        CallSessionError::NotFound
+        | CallSessionError::InvalidPhase
+        | CallSessionError::Expired(_) => {
             "Połączenie nie jest aktywne lub wygasło. Zaakceptuj rozmowę przed dołączeniem."
         }
         CallSessionError::WrongRole | CallSessionError::InProgress => {
@@ -103,9 +104,18 @@ pub async fn get_voice_token(req: HttpRequest, body: web::Json<VoiceTokenBody>) 
             };
 
             let db = get_db();
-            if !are_friends(&db, &user_id, peer_id).await {
-                return HttpResponse::Forbidden()
-                    .json(json!({ "message": "Możesz dzwonić tylko do znajomych." }));
+            match crate::utils::friends::try_are_friends(&db, &user_id, peer_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return HttpResponse::Forbidden()
+                        .json(json!({ "message": "Możesz dzwonić tylko do znajomych." }));
+                }
+                Err(()) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Temporarily unavailable",
+                        "retryable": true,
+                    }));
+                }
             }
 
             let _ = session;

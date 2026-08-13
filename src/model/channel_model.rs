@@ -55,6 +55,16 @@ pub struct Channel {
     #[serde(rename = "chatLocked", default)]
     pub chat_locked: bool,
 
+    /// Denormalized list tip (updated on send/edit/delete).
+    #[serde(rename = "lastMessage", default, skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<String>,
+
+    #[serde(rename = "lastMessageAt", default, skip_serializing_if = "Option::is_none")]
+    pub last_message_at: Option<DateTime>,
+
+    #[serde(rename = "lastMessageId", default, skip_serializing_if = "Option::is_none")]
+    pub last_message_id: Option<ObjectId>,
+
     #[serde(rename = "createdAt")]
     pub created_at: DateTime,
 
@@ -174,6 +184,9 @@ impl Channel {
             is_private: input.is_private.unwrap_or(false),
             rate_limit_per_user: 0,
             chat_locked: false,
+            last_message: None,
+            last_message_at: None,
+            last_message_id: None,
             created_at: now,
             updated_at: now,
         };

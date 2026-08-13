@@ -7,10 +7,10 @@ use crate::middlewares::auth_middleware::request_user_id;
 use crate::model::channel_model::Channel;
 use crate::model::invite_model::{Invite, MAX_INVITE_USE_LIMIT};
 use crate::model::user_model::User;
-use crate::utils::channel::{is_channel_banned, is_channel_member};
+use crate::utils::channel::{is_channel_banned, is_channel_member, serialize_channel_list_item};
 use crate::utils::db::get_db;
 use crate::utils::user::serialize_user::resolve_display_name;
-use crate::ws::registry::emit_to_user;
+use crate::ws::registry::{channel_recipient_ids, emit_to_user, emit_to_users};
 
 #[derive(Debug, Deserialize, Default)]
 struct CreateInviteBody {
@@ -22,6 +22,14 @@ struct CreateInviteBody {
 fn db_error(context: &str, e: impl std::fmt::Display) -> HttpResponse {
     log::error!("{context}: {e}");
     HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" }))
+}
+
+fn db_error_retryable(context: &str, e: impl std::fmt::Display) -> HttpResponse {
+    log::error!("{context}: {e}");
+    HttpResponse::InternalServerError().json(json!({
+        "error": "Internal Server Error",
+        "retryable": true,
+    }))
 }
 
 fn frontend_origin(req: &HttpRequest) -> String {
@@ -167,12 +175,12 @@ pub async fn get_invite(req: HttpRequest) -> HttpResponse {
         Err(e) => return db_error("get_invite: lookup", e),
     };
 
-    let channel = Channel::find_by_id(&db, invite.channel_id)
-        .await
-        .ok()
-        .flatten();
+    let channel = match Channel::find_by_id(&db, invite.channel_id).await {
+        Ok(c) => c,
+        Err(e) => return db_error("get_invite: channel", e),
+    };
     let channel_json = channel.map(|c| {
-        let member_count = c.members.len() + 1;
+        let member_count = crate::utils::channel::channel_member_count(&c);
         json!({
             "_id": c.id.map(|o| o.to_hex()),
             "name": c.name,
@@ -190,7 +198,8 @@ pub async fn get_invite(req: HttpRequest) -> HttpResponse {
             "image": user.image,
             "color": user.color,
         })),
-        _ => None,
+        Ok(None) => None,
+        Err(e) => return db_error("get_invite: inviter", e),
     };
 
     let expired = invite
@@ -285,11 +294,18 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
 
     let channel = match Channel::find_by_id(&db, consumed.channel_id).await {
         Ok(Some(c)) => c,
-        Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje" })),
-        Err(e) => return db_error("accept_invite: channel reload", e),
+        Ok(None) => {
+            let _ = Invite::release_use(&db, invite_id).await;
+            return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje" }));
+        }
+        Err(e) => {
+            let _ = Invite::release_use(&db, invite_id).await;
+            return db_error_retryable("accept_invite: channel reload", e);
+        }
     };
 
     if is_channel_banned(&channel, Some(&user_id)) {
+        let _ = Invite::release_use(&db, invite_id).await;
         return HttpResponse::Forbidden()
             .json(json!({ "error": "Nie masz dostępu do tego kanału" }));
     }
@@ -297,31 +313,109 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
     let channel_id_hex = channel.id.map(|o| o.to_hex());
 
     let Ok(user_oid) = ObjectId::parse_str(&user_id) else {
+        let _ = Invite::release_use(&db, invite_id).await;
         return HttpResponse::BadRequest().json(json!({ "error": "Użytkownik nie istnieje" }));
     };
     match User::find_by_id(&db, user_oid).await {
         Ok(Some(_)) => {}
-        _ => return HttpResponse::BadRequest().json(json!({ "error": "Użytkownik nie istnieje" })),
+        Ok(None) => {
+            let _ = Invite::release_use(&db, invite_id).await;
+            return HttpResponse::BadRequest().json(json!({ "error": "Użytkownik nie istnieje" }));
+        }
+        Err(_) => {
+            let _ = Invite::release_use(&db, invite_id).await;
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     }
 
     let Some(channel_oid) = channel.id else {
-        return HttpResponse::InternalServerError().json(json!({ "error": "Kanał nie istnieje" }));
+        let _ = Invite::release_use(&db, invite_id).await;
+        return HttpResponse::InternalServerError().json(json!({
+            "error": "Kanał nie istnieje",
+            "retryable": true,
+        }));
     };
+    // Seed catch-up BEFORE membership so a concurrent send cannot create a bump
+    // row that a later clobbering upsert would zero without an absolute emit.
+    if crate::model::channel_read_state_model::ChannelReadState::seed_if_missing(
+        &db,
+        user_oid,
+        channel_oid,
+    )
+    .await
+    .is_err()
+    {
+        let _ = Invite::release_use(&db, invite_id).await;
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "Temporarily unavailable",
+            "retryable": true,
+        }));
+    }
+
     let res = Channel::collection(&db)
         .update_one(
             doc! { "_id": channel_oid },
             doc! { "$addToSet": { "members": user_oid }, "$set": { "updatedAt": DateTime::now() } },
         )
         .await;
-    if res.is_err() {
-        return HttpResponse::InternalServerError()
-            .json(json!({ "error": "Internal Server Error" }));
+    let modified = match res {
+        Ok(r) => r.modified_count,
+        Err(_) => {
+            let _ = Invite::release_use(&db, invite_id).await;
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal Server Error", "retryable": true }));
+        }
+    };
+    // Already-member race after consume — refund the slot.
+    if modified == 0 {
+        let _ = Invite::release_use(&db, invite_id).await;
+        return HttpResponse::Ok().json(json!({
+            "success": true,
+            "channelId": channel_id_hex,
+            "alreadyMember": true,
+        }));
     }
 
-    emit_to_user(
-        &user_id,
-        "channel-added",
-        json!({ "channelId": channel_oid.to_hex() }),
+    // Member write landed — never release_use on reload fail (retry → alreadyMember).
+    let channel = match Channel::find_by_id(&db, channel_oid).await {
+        Ok(Some(ch)) => ch,
+        Ok(None) | Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
+    };
+    match serialize_channel_list_item(&db, &channel, user_oid).await {
+        Some(slim) => {
+            emit_to_user(
+                &user_id,
+                "channel-added",
+                json!({ "channelId": channel_oid.to_hex(), "channel": slim }),
+            );
+        }
+        None => {
+            emit_to_user(
+                &user_id,
+                "channel-added",
+                json!({ "channelId": channel_oid.to_hex() }),
+            );
+        }
+    }
+    let mut peers = channel_recipient_ids(&channel);
+    peers.retain(|r| r != &user_id);
+    emit_to_users(
+        &peers,
+        "channel-member-joined",
+        json!({
+            "channelId": channel_oid.to_hex(),
+            "userId": user_id,
+            "memberCount": channel_recipient_ids(&channel).len(),
+        }),
     );
+    crate::ws::typing_access_cache::invalidate_channel(&channel_oid.to_hex());
     HttpResponse::Ok().json(json!({ "success": true, "channelId": channel_id_hex }))
 }

@@ -14,14 +14,17 @@ use crate::model::user_storage_usage_model::UserStorageUsage;
 use crate::utils::file_hash::sha256_hex;
 use crate::model::user_model::User;
 use crate::utils::attachment_audit::log_attachment_upload;
-use crate::utils::access::membership_gate::{authorize_dm_history_read, require_message_participant};
+use crate::utils::access::membership_gate::{
+    authorize_dm_history_read, require_channel_access, require_dm_access, require_message_participant,
+    AccessDeniedReason,
+};
 use crate::utils::db::get_db;
 use crate::utils::image_reencode::{
     reencode_error_message, reencode_upload_to_webp_variants,
 };
 use crate::utils::messages::{
     access::cleanup_attachment_if_unreferenced,
-    can_access_channel_messages, can_access_dm_messages, can_pin_message, dm_conversation_base_clauses,
+    try_can_pin_message, dm_conversation_base_clauses,
     serialize_message, serialize_messages_batch, validate_dm_history_before_cursor,
     message_belongs_to_dm_conversation,
 };
@@ -46,6 +49,7 @@ static LINK_PREVIEW_LIMIT: Lazy<Store> = Lazy::new(|| Store::new(40, Duration::f
 
 const SEARCH_LIMIT: i64 = 50;
 const MIN_QUERY_LENGTH: usize = 2;
+const MAX_QUERY_LENGTH: usize = 200;
 
 /// Domyślna i maksymalna liczba wiadomości zwracanych na jedną stronę historii DM.
 const DEFAULT_MESSAGE_LIMIT: i64 = 30;
@@ -90,6 +94,12 @@ pub async fn get_messages(req: HttpRequest, body: web::Json<GetMessagesBody>) ->
     let db = get_db();
     let (user_oid, contact_oid) = match authorize_dm_history_read(&db, &user_id, &contact_id).await {
         Ok(pair) => pair,
+        Err(AccessDeniedReason::Unavailable) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
         Err(reason) => {
             return HttpResponse::Forbidden().json(json!({
                 "error": "ACCESS_DENIED",
@@ -106,13 +116,28 @@ pub async fn get_messages(req: HttpRequest, body: web::Json<GetMessagesBody>) ->
     let mut and_clauses = dm_conversation_base_clauses(user_oid, contact_oid);
 
     if let Some(before_id) = body.before.as_deref().filter(|s| !s.is_empty()) {
-        let Ok(before_oid) =
-            validate_dm_history_before_cursor(&db, user_oid, contact_oid, before_id).await
-        else {
-            return HttpResponse::BadRequest().json(json!({
-                "error": "INVALID_CURSOR",
-                "message": "Invalid pagination cursor.",
-            }));
+        let before_oid = match validate_dm_history_before_cursor(
+            &db,
+            user_oid,
+            contact_oid,
+            before_id,
+        )
+        .await
+        {
+            Ok(oid) => oid,
+            Err(crate::utils::messages::CursorValidateError::Unavailable) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "UNAVAILABLE",
+                    "message": "Temporarily unavailable. Retry.",
+                    "retryable": true,
+                }));
+            }
+            Err(crate::utils::messages::CursorValidateError::Invalid) => {
+                return HttpResponse::BadRequest().json(json!({
+                    "error": "INVALID_CURSOR",
+                    "message": "Invalid pagination cursor.",
+                }));
+            }
         };
         and_clauses.push(doc! { "_id": { "$lt": before_oid } });
     }
@@ -127,8 +152,17 @@ pub async fn get_messages(req: HttpRequest, body: web::Json<GetMessagesBody>) ->
         .limit(limit + 1)
         .await
     {
-        Ok(c) => c.try_collect().await.unwrap_or_default(),
-        Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
+        Ok(c) => match c.try_collect().await {
+            Ok(m) => m,
+            Err(e) => {
+                log::error!("get_messages try_collect: {e}");
+                return HttpResponse::InternalServerError().body("Internal Server Error");
+            }
+        },
+        Err(e) => {
+            log::error!("get_messages find: {e}");
+            return HttpResponse::InternalServerError().body("Internal Server Error");
+        }
     };
 
     let has_more = messages.len() as i64 > limit;
@@ -243,8 +277,17 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
             if ObjectId::parse_str(&context_id).is_err() {
                 return HttpResponse::BadRequest().body("Invalid contact ID.");
             }
-            if !can_access_dm_messages(&db, &user_id, &context_id).await {
-                return HttpResponse::Forbidden().body("You cannot upload to this conversation.");
+            match require_dm_access(&db, &user_id, &context_id).await {
+                Ok(()) => {}
+                Err(AccessDeniedReason::Unavailable) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "error": "Temporarily unavailable",
+                        "retryable": true,
+                    }));
+                }
+                Err(_) => {
+                    return HttpResponse::Forbidden().body("You cannot upload to this conversation.");
+                }
             }
             let filename = format!("{}.{}", uuid::Uuid::new_v4(), stored_ext);
             attachment_dm_key(&user_id, &context_id, &filename)
@@ -253,11 +296,17 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
             if ObjectId::parse_str(&context_id).is_err() {
                 return HttpResponse::BadRequest().body("Invalid channel ID.");
             }
-            if can_access_channel_messages(&db, &user_id, &context_id)
-                .await
-                .is_none()
-            {
-                return HttpResponse::Forbidden().body("You cannot upload to this channel.");
+            match require_channel_access(&db, &context_id, &user_id).await {
+                Ok(_) => {}
+                Err(AccessDeniedReason::Unavailable) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "error": "Temporarily unavailable",
+                        "retryable": true,
+                    }));
+                }
+                Err(_) => {
+                    return HttpResponse::Forbidden().body("You cannot upload to this channel.");
+                }
             }
             let filename = format!("{}.{}", uuid::Uuid::new_v4(), stored_ext);
             attachment_group_key(&context_id, &filename)
@@ -388,14 +437,22 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
                 return HttpResponse::Forbidden()
                     .json(json!({ "error": "Account is inactive or blocked" }))
             }
-            _ => return HttpResponse::Unauthorized().json(json!({ "error": "User not found" })),
+            Ok(None) => {
+                return HttpResponse::Unauthorized().json(json!({ "error": "User not found" }))
+            }
+            Err(_) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
         }
     }
 
     let message = match Message::find_by_id(&db, mid).await {
         Ok(Some(m)) => m,
         Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "Message not found" })),
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error" })),
+        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error", "retryable": true })),
     };
 
     if message.sender.to_hex() != user_id {
@@ -403,7 +460,18 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
             .json(json!({ "error": "Not authorized to edit this message" }));
     }
 
+    if message.message_type != crate::model::messages_model::MessageType::Text {
+        return HttpResponse::BadRequest()
+            .json(json!({ "error": "Only text messages can be edited" }));
+    }
+
     if let Err(reason) = require_message_participant(&db, &user_id, &message).await {
+        if reason == AccessDeniedReason::Unavailable {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": reason.as_str(),
+                "retryable": true,
+            }));
+        }
         return HttpResponse::Forbidden().json(json!({ "error": reason.as_str() }));
     }
 
@@ -422,33 +490,72 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
 
     // Przelicz wzmianki tak samo jak ścieżka WS, aby dane nie były nieaktualne po edycji.
     let (mentions, mentions_everyone) = if let Some(channel_id) = message.channel {
-        match Channel::find_by_id(&db, channel_id).await.ok().flatten() {
-            Some(channel) => {
-                let mut ids: Vec<String> = channel.members.iter().map(|m| m.to_hex()).collect();
-                ids.push(channel.admin.to_hex());
-                (
-                    resolve_mentions(&db, &content, &ids).await,
-                    has_everyone_mention(&content),
-                )
+        let channel = match Channel::find_by_id(&db, channel_id).await {
+            Ok(Some(ch)) => ch,
+            Ok(None) => {
+                return HttpResponse::NotFound().json(json!({ "error": "Channel not found" }));
             }
-            None => (Vec::new(), false),
-        }
+            Err(_) => match Channel::find_by_id(&db, channel_id).await {
+                Ok(Some(ch)) => ch,
+                Ok(None) => {
+                    return HttpResponse::NotFound().json(json!({ "error": "Channel not found" }));
+                }
+                Err(_) => {
+                    return HttpResponse::InternalServerError().json(json!({
+                        "error": "Internal server error",
+                        "retryable": true,
+                    }));
+                }
+            },
+        };
+        let mut ids: Vec<String> = channel.members.iter().map(|m| m.to_hex()).collect();
+        ids.push(channel.admin.to_hex());
+        let mentions = match resolve_mentions(&db, &content, &ids).await {
+            Ok(m) => m,
+            Err(()) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
+        };
+        (mentions, has_everyone_mention(&content))
     } else if let Some(recipient) = message.recipient {
-        (
-            resolve_mentions(&db, &content, &[message.sender.to_hex(), recipient.to_hex()]).await,
-            false,
+        let mentions = match resolve_mentions(
+            &db,
+            &content,
+            &[message.sender.to_hex(), recipient.to_hex()],
         )
+        .await
+        {
+            Ok(m) => m,
+            Err(()) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
+        };
+        (mentions, false)
     } else {
-        (Vec::new(), false)
+        return HttpResponse::BadRequest().json(json!({ "error": "Invalid message" }));
     };
 
-    let mentions_bson =
-        mongodb::bson::to_bson(&mentions).unwrap_or(mongodb::bson::Bson::Array(vec![]));
+    let mentions_bson = match mongodb::bson::to_bson(&mentions) {
+        Ok(b) => b,
+        // Fail closed — empty array would wipe stored mentions.
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Internal server error",
+                "retryable": true,
+            }));
+        }
+    };
     let stored_content = match crate::utils::messages::content_storage::prepare_content_for_storage(
         content.trim(),
     ) {
         Ok(c) => c,
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error" })),
+        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error", "retryable": true })),
     };
     let search_text = search_text_from_incoming(content.trim());
     let set_doc = doc! {
@@ -460,21 +567,222 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
         "editedAt": DateTime::now(),
         "updatedAt": DateTime::now(),
     };
-    if Message::collection(&db)
+    let edit_ok = match Message::collection(&db)
         .update_one(
-            doc! { "_id": mid },
+            doc! { "_id": mid, "deleted": { "$ne": true } },
             doc! { "$set": set_doc },
         )
         .await
-        .is_err()
     {
-        return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error" }));
+        Ok(r) => r.modified_count > 0,
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal server error", "retryable": true }));
+        }
+    };
+    if !edit_ok {
+        return HttpResponse::NotFound().json(json!({ "error": "Message not found" }));
     }
 
-    match Message::find_by_id(&db, mid).await {
-        Ok(Some(updated)) => HttpResponse::Ok().json(json!({ "message": serialize_message(&db, &updated).await })),
-        _ => HttpResponse::InternalServerError().json(json!({ "error": "Internal server error" })),
+    let updated = match Message::find_by_id(&db, mid).await {
+        Ok(Some(m)) => m,
+        Ok(None) | Err(_) => match Message::find_by_id(&db, mid).await {
+            Ok(Some(m)) => m,
+            _ => {
+                return HttpResponse::InternalServerError().json(json!({
+                    "error": "Internal server error",
+                    "retryable": true,
+                }));
+            }
+        },
+    };
+
+    {
+        let tip_msg = updated.clone();
+        if let Some(cid) = tip_msg.channel {
+            crate::utils::conversation_tips::upsert_channel_tip(&db, cid, &tip_msg).await;
+        } else {
+            crate::utils::conversation_tips::upsert_dm_tip(&db, &tip_msg).await;
+        }
     }
+            let populated = serialize_message(&db, &updated).await;
+            let previous_mentions: std::collections::HashSet<String> =
+                message.mentions.iter().map(|id| id.to_hex()).collect();
+            let previous_everyone = message.mentions_everyone;
+            let sender_id = updated.sender.to_hex();
+            let from_user = populated
+                .get("sender")
+                .cloned()
+                .unwrap_or(json!({ "_id": sender_id }));
+            let preview_content = content.trim().to_string();
+            let message_id_hex = mid.to_hex();
+
+            let muted_lookup: Option<std::collections::HashSet<String>> =
+                if let Some(channel_oid) = updated.channel {
+                    if let Ok(Some(channel)) = Channel::find_by_id(&db, channel_oid).await {
+                        use mongodb::bson::Document;
+                        let coll = db.collection::<Document>("users");
+                        let mut member_oids = channel.members.clone();
+                        if !member_oids.iter().any(|id| *id == channel.admin) {
+                            member_oids.push(channel.admin);
+                        }
+                        match coll
+                            .find(doc! {
+                                "_id": { "$in": &member_oids },
+                                "mutedChannels": channel_oid,
+                            })
+                            .projection(doc! { "_id": 1 })
+                            .await
+                        {
+                            Ok(mut cursor) => {
+                                let mut set = std::collections::HashSet::new();
+                                let mut ok = true;
+                                loop {
+                                    match cursor.try_next().await {
+                                        Ok(Some(d)) => {
+                                            if let Ok(id) = d.get_object_id("_id") {
+                                                set.insert(id.to_hex());
+                                            }
+                                        }
+                                        Ok(None) => break,
+                                        Err(_) => {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if ok {
+                                    Some(set)
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(_) => None,
+                        }
+                    } else {
+                        // Channel missing or find Err — fail closed (no mention spam).
+                        None
+                    }
+                } else if let Some(recipient) = updated.recipient {
+                    use mongodb::bson::Document;
+                    let coll = db.collection::<Document>("users");
+                    match coll
+                        .find_one(doc! { "_id": recipient })
+                        .projection(doc! { "mutedContacts": 1 })
+                        .await
+                    {
+                        Ok(Some(doc)) => {
+                            let muted = doc
+                                .get_array("mutedContacts")
+                                .ok()
+                                .map(|arr| {
+                                    arr.iter().any(|b| {
+                                        b.as_object_id()
+                                            .map(|id| id.to_hex() == sender_id)
+                                            .unwrap_or(false)
+                                    })
+                                })
+                                .unwrap_or(false);
+                            if muted {
+                                Some(std::collections::HashSet::from([recipient.to_hex()]))
+                            } else {
+                                Some(std::collections::HashSet::new())
+                            }
+                        }
+                        // Missing user — fail closed (do not invent unmuted for mentions).
+                        Ok(None) => None,
+                        Err(_) => None,
+                    }
+                } else {
+                    Some(std::collections::HashSet::new())
+                };
+            let mentions_ok = muted_lookup.is_some();
+            let muted_ids = muted_lookup.unwrap_or_default();
+
+            let emit_new_mention = |member_id: &str, scope: &str, source_id: &str, source_name: Option<&str>| {
+                if !mentions_ok || member_id == sender_id || muted_ids.contains(member_id) {
+                    return;
+                }
+                let newly = (mentions.iter().any(|id| id.to_hex() == member_id)
+                    && !previous_mentions.contains(member_id))
+                    || (mentions_everyone && !previous_everyone);
+                if !newly {
+                    return;
+                }
+                let preview = if preview_content.chars().count() > 140 {
+                    format!("{}…", preview_content.chars().take(140).collect::<String>())
+                } else {
+                    preview_content.clone()
+                };
+                crate::ws::registry::emit_to_user(
+                    member_id,
+                    "message-mention",
+                    json!({
+                        "scope": scope,
+                        "sourceId": source_id,
+                        "sourceName": source_name,
+                        "messageId": message_id_hex,
+                        "from": from_user,
+                        "preview": preview,
+                    }),
+                );
+            };
+
+            if let Some(channel_id) = updated.channel {
+                let channel = match Channel::find_by_id(&db, channel_id).await {
+                    Ok(Some(ch)) => Some(ch),
+                    // Missing or transient — fall through to read-state fanout.
+                    Ok(None) | Err(_) => None,
+                };
+                if let Some(channel) = channel {
+                    let recipients = crate::ws::registry::channel_recipient_ids(&channel);
+                    crate::ws::registry::emit_to_users(
+                        &recipients,
+                        "message-edited",
+                        populated.clone(),
+                    );
+                    let channel_id_hex = channel_id.to_hex();
+                    for r in &recipients {
+                        emit_new_mention(r, "channel", &channel_id_hex, Some(&channel.name));
+                    }
+                } else {
+                    // Write landed — fallback to read-state members + actor.
+                    use crate::model::channel_read_state_model::ChannelReadState;
+                    use futures_util::TryStreamExt;
+                    let mut recipients = vec![sender_id.clone()];
+                    if let Ok(cursor) = ChannelReadState::collection(&db)
+                        .find(doc! { "channelId": channel_id })
+                        .await
+                    {
+                        let states: Vec<ChannelReadState> =
+                            cursor.try_collect().await.unwrap_or_default();
+                        for s in states {
+                            let id = s.user_id.to_hex();
+                            if !recipients.iter().any(|r| r == &id) {
+                                recipients.push(id);
+                            }
+                        }
+                    }
+                    crate::ws::registry::emit_to_users(
+                        &recipients,
+                        "message-edited",
+                        populated.clone(),
+                    );
+                }
+            } else if let Some(recipient) = updated.recipient {
+                crate::ws::registry::emit_to_user(
+                    &recipient.to_hex(),
+                    "message-edited",
+                    populated.clone(),
+                );
+                crate::ws::registry::emit_to_user(
+                    &updated.sender.to_hex(),
+                    "message-edited",
+                    populated.clone(),
+                );
+                emit_new_mention(&recipient.to_hex(), "dm", &sender_id, None);
+            }
+            HttpResponse::Ok().json(json!({ "message": populated }))
 }
 
 pub async fn delete_message(req: HttpRequest) -> HttpResponse {
@@ -490,7 +798,7 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
     let message = match Message::find_by_id(&db, mid).await {
         Ok(Some(m)) => m,
         Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "Message not found" })),
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error" })),
+        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error", "retryable": true })),
     };
 
     if message.sender.to_hex() != user_id {
@@ -499,11 +807,229 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
     }
 
     if let Err(reason) = require_message_participant(&db, &user_id, &message).await {
+        if reason == AccessDeniedReason::Unavailable {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": reason.as_str(),
+                "retryable": true,
+            }));
+        }
         return HttpResponse::Forbidden().json(json!({ "error": reason.as_str() }));
     }
 
-    let _ = Message::soft_delete(&db, mid).await;
+    // Snapshot gens before soft-delete unused after sync+absolute path; keep
+    // participant checks only.
+    let outcome = match Message::soft_delete_active(&db, mid).await {
+        Ok(o) => o,
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Failed to delete message",
+                "retryable": true,
+            }));
+        }
+    };
+    let crate::model::messages_model::SoftDeleteOutcome::Deleted { was_unread } = outcome else {
+        return HttpResponse::Ok().json(json!({ "success": true }));
+    };
     cleanup_attachment_if_unreferenced(&db, message.file_url.as_deref()).await;
+    if let Some(channel_id) = message.channel {
+        crate::utils::conversation_tips::refresh_channel_tip_after_delete(&db, channel_id, mid)
+            .await;
+        let body = json!({ "_id": message_id });
+        // Retry once on transient Mongo Err so we don't skip member fanout/unread sync.
+        let channel = match crate::model::channel_model::Channel::find_by_id(&db, channel_id).await {
+            Ok(Some(ch)) => Some(ch),
+            Ok(None) => None,
+            Err(_) => crate::model::channel_model::Channel::find_by_id(&db, channel_id)
+                .await
+                .ok()
+                .flatten(),
+        };
+        if let Some(channel) = channel {
+            let recipients = crate::ws::registry::channel_recipient_ids(&channel);
+            crate::ws::registry::emit_to_users(&recipients, "message-deleted", body);
+            let sender_hex = message.sender.to_hex();
+            let msg_ts = message.timestamp;
+            let channel_id_hex = channel_id.to_hex();
+            use crate::model::channel_read_state_model::ChannelReadState;
+            use futures_util::TryStreamExt;
+            let mut targets: Vec<String> =
+                channel.members.iter().map(|m| m.to_hex()).collect();
+            targets.push(channel.admin.to_hex());
+            let member_oids: Vec<ObjectId> = targets
+                .iter()
+                .filter_map(|id| ObjectId::parse_str(id).ok())
+                .collect();
+            let mut last_reads: std::collections::HashMap<String, (DateTime, DateTime)> =
+                std::collections::HashMap::new();
+            let mut read_state_ok = false;
+            if let Ok(cursor) = ChannelReadState::collection(&db)
+                .find(doc! {
+                    "channelId": channel_id,
+                    "userId": { "$in": &member_oids },
+                })
+                .await
+            {
+                match cursor.try_collect::<Vec<ChannelReadState>>().await {
+                    Ok(states) => {
+                        read_state_ok = true;
+                        for s in states {
+                            last_reads
+                                .insert(s.user_id.to_hex(), (s.last_read_at, s.created_at));
+                        }
+                    }
+                    Err(_) => {
+                        read_state_ok = false;
+                    }
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut affected: Vec<(String, ObjectId)> = Vec::new();
+            for member_id in targets {
+                if member_id == sender_hex || !seen.insert(member_id.clone()) {
+                    continue;
+                }
+                let Ok(oid) = ObjectId::parse_str(&member_id) else {
+                    continue;
+                };
+                // Read-state load failed — heal everyone (avoid sticky-high denorm).
+                if !read_state_ok {
+                    affected.push((member_id, oid));
+                    continue;
+                }
+                let Some(&(last, created)) = last_reads.get(&member_id) else {
+                    // No row (seed miss) — still heal.
+                    affected.push((member_id, oid));
+                    continue;
+                };
+                let effective = if last.timestamp_millis() <= 0 {
+                    created
+                } else {
+                    last
+                };
+                if effective.timestamp_millis() <= 0 || msg_ts <= effective {
+                    continue;
+                }
+                affected.push((member_id, oid));
+            }
+            let sync_futs: Vec<_> = affected
+                .into_iter()
+                .map(|(member_id, oid)| {
+                    let db = db.clone();
+                    let channel_id_hex = channel_id_hex.clone();
+                    async move {
+                        if let Some(n) = crate::utils::unread::try_sync_channel_unread(
+                            &db, oid, channel_id,
+                        )
+                        .await
+                        {
+                            crate::utils::unread::emit_unread_absolute(
+                                &member_id,
+                                "channel",
+                                &channel_id_hex,
+                                n,
+                            );
+                        }
+                    }
+                })
+                .collect();
+            futures_util::future::join_all(sync_futs).await;
+        } else {
+            // Channel doc unreadable — degraded fanout.
+            crate::ws::registry::emit_to_user(&message.sender.to_hex(), "message-deleted", body.clone());
+            crate::ws::registry::emit_to_user(
+                &user_id,
+                "error",
+                json!({
+                    "code": "DELETE_FANOUT_DEGRADED",
+                    "message": "Wiadomość usunięta, ale synchronizacja z kanałem może być niepełna. Odśwież czat.",
+                    "retryable": true,
+                    "messageId": message_id,
+                }),
+            );
+            use crate::model::channel_read_state_model::ChannelReadState;
+            use futures_util::TryStreamExt;
+            if let Ok(cursor) = ChannelReadState::collection(&db)
+                .find(doc! { "channelId": channel_id })
+                .await
+            {
+                let states: Vec<ChannelReadState> = match cursor.try_collect().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Do not pretend zero members — soft-delete already succeeded.
+                        log::error!("delete_message channel fanout try_collect: {e}");
+                        crate::ws::registry::emit_to_user(
+                            &user_id,
+                            "error",
+                            json!({
+                                "code": "DELETE_FANOUT_DEGRADED",
+                                "message": "Wiadomość usunięta, ale synchronizacja z kanałem może być niepełna. Odśwież czat.",
+                                "retryable": true,
+                                "messageId": message_id,
+                            }),
+                        );
+                        return HttpResponse::Ok().json(json!({
+                            "ok": true,
+                            "degraded": true,
+                        }));
+                    }
+                };
+                let mut seen = std::collections::HashSet::new();
+                seen.insert(message.sender.to_hex());
+                let channel_id_hex = channel_id.to_hex();
+                for s in states {
+                    let member_id = s.user_id.to_hex();
+                    if !seen.insert(member_id.clone()) {
+                        continue;
+                    }
+                    crate::ws::registry::emit_to_user(&member_id, "message-deleted", body.clone());
+                    if was_unread {
+                        if let Some(n) = crate::utils::unread::try_sync_channel_unread(
+                            &db, s.user_id, channel_id,
+                        )
+                        .await
+                        {
+                            crate::utils::unread::emit_unread_absolute(
+                                &member_id,
+                                "channel",
+                                &channel_id_hex,
+                                n,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(recipient) = message.recipient {
+        crate::utils::conversation_tips::refresh_dm_tip_after_delete(
+            &db,
+            message.sender,
+            recipient,
+            mid,
+        )
+        .await;
+        let body = json!({ "_id": message_id });
+        crate::ws::registry::emit_to_user(&recipient.to_hex(), "message-deleted", body.clone());
+        crate::ws::registry::emit_to_user(&message.sender.to_hex(), "message-deleted", body);
+        if was_unread {
+            let recipient_hex = recipient.to_hex();
+            let sender_oid = message.sender;
+            // Only absolute when sync recount confirms — no tip/0 fallback.
+            if let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
+                &db,
+                recipient,
+                sender_oid,
+            )
+            .await
+            {
+                crate::utils::unread::emit_unread_absolute(
+                    &recipient_hex,
+                    "dm",
+                    &sender_oid.to_hex(),
+                    n,
+                );
+            }
+        }
+    }
     HttpResponse::Ok().json(json!({ "success": true }))
 }
 
@@ -519,20 +1045,43 @@ pub async fn pin_message(req: HttpRequest) -> HttpResponse {
     let db = get_db();
     let message = match Message::find_by_id(&db, mid).await {
         Ok(Some(m)) if !m.deleted => m,
-        _ => return HttpResponse::NotFound().json(json!({ "error": "Message not found" })),
+        Ok(Some(_)) | Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "error": "Message not found" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
-    if !can_pin_message(&db, &user_id, &message).await {
-        return HttpResponse::Forbidden().json(json!({
-            "error": "FORBIDDEN",
-            "message": "Nie masz uprawnień do przypinania tej wiadomości.",
-        }));
+    match try_can_pin_message(&db, &user_id, &message).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return HttpResponse::Forbidden().json(json!({
+                "error": "FORBIDDEN",
+                "message": "Nie masz uprawnień do przypinania tej wiadomości.",
+            }));
+        }
+        Err(AccessDeniedReason::Unavailable) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
+        Err(_) => {
+            return HttpResponse::Forbidden().json(json!({
+                "error": "FORBIDDEN",
+                "message": "Nie masz uprawnień do przypinania tej wiadomości.",
+            }));
+        }
     }
 
     let Ok(user_oid) = ObjectId::parse_str(&user_id) else {
         return HttpResponse::BadRequest().json(json!({ "error": "Invalid user id" }));
     };
-    let _ = Message::collection(&db)
+    match Message::collection(&db)
         .update_one(
             doc! { "_id": mid },
             doc! { "$set": {
@@ -542,11 +1091,39 @@ pub async fn pin_message(req: HttpRequest) -> HttpResponse {
                 "updatedAt": DateTime::now(),
             }},
         )
-        .await;
+        .await
+    {
+        Ok(_) => {}
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Failed to pin message",
+                "retryable": true,
+            }));
+        }
+    }
 
     match Message::find_by_id(&db, mid).await {
-        Ok(Some(updated)) => HttpResponse::Ok().json(json!({ "message": serialize_message(&db, &updated).await })),
-        _ => HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+        Ok(Some(updated)) => {
+            let populated = serialize_message(&db, &updated).await;
+            emit_message_pin_fanout(&db, &updated, &populated, &user_id).await;
+            HttpResponse::Ok().json(json!({ "message": populated }))
+        }
+        Ok(None) | Err(_) => match Message::find_by_id(&db, mid).await {
+            Ok(Some(updated)) => {
+                let populated = serialize_message(&db, &updated).await;
+                emit_message_pin_fanout(&db, &updated, &populated, &user_id).await;
+                HttpResponse::Ok().json(json!({ "message": populated }))
+            }
+            _ => {
+                let mut patched = message.clone();
+                patched.pinned = true;
+                patched.pinned_at = Some(DateTime::now());
+                patched.pinned_by = Some(user_oid);
+                let populated = serialize_message(&db, &patched).await;
+                emit_message_pin_fanout(&db, &patched, &populated, &user_id).await;
+                HttpResponse::Ok().json(json!({ "message": populated }))
+            }
+        },
     }
 }
 
@@ -562,17 +1139,40 @@ pub async fn unpin_message(req: HttpRequest) -> HttpResponse {
     let db = get_db();
     let message = match Message::find_by_id(&db, mid).await {
         Ok(Some(m)) if !m.deleted => m,
-        _ => return HttpResponse::NotFound().json(json!({ "error": "Message not found" })),
+        Ok(Some(_)) | Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "error": "Message not found" }))
+        }
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
     };
 
-    if !can_pin_message(&db, &user_id, &message).await {
-        return HttpResponse::Forbidden().json(json!({
-            "error": "FORBIDDEN",
-            "message": "Nie masz uprawnień do odpięcia tej wiadomości.",
-        }));
+    match try_can_pin_message(&db, &user_id, &message).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return HttpResponse::Forbidden().json(json!({
+                "error": "FORBIDDEN",
+                "message": "Nie masz uprawnień do odpięcia tej wiadomości.",
+            }));
+        }
+        Err(AccessDeniedReason::Unavailable) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
+        Err(_) => {
+            return HttpResponse::Forbidden().json(json!({
+                "error": "FORBIDDEN",
+                "message": "Nie masz uprawnień do odpięcia tej wiadomości.",
+            }));
+        }
     }
 
-    let _ = Message::collection(&db)
+    match Message::collection(&db)
         .update_one(
             doc! { "_id": mid },
             doc! {
@@ -580,11 +1180,84 @@ pub async fn unpin_message(req: HttpRequest) -> HttpResponse {
                 "$unset": { "pinnedAt": "", "pinnedBy": "" },
             },
         )
-        .await;
+        .await
+    {
+        Ok(_) => {}
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Failed to unpin message",
+                "retryable": true,
+            }));
+        }
+    }
 
     match Message::find_by_id(&db, mid).await {
-        Ok(Some(updated)) => HttpResponse::Ok().json(json!({ "message": serialize_message(&db, &updated).await })),
-        _ => HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+        Ok(Some(updated)) => {
+            let populated = serialize_message(&db, &updated).await;
+            emit_message_pin_fanout(&db, &updated, &populated, &user_id).await;
+            HttpResponse::Ok().json(json!({ "message": populated }))
+        }
+        Ok(None) | Err(_) => match Message::find_by_id(&db, mid).await {
+            Ok(Some(updated)) => {
+                let populated = serialize_message(&db, &updated).await;
+                emit_message_pin_fanout(&db, &updated, &populated, &user_id).await;
+                HttpResponse::Ok().json(json!({ "message": populated }))
+            }
+            _ => {
+                let mut patched = message.clone();
+                patched.pinned = false;
+                patched.pinned_at = None;
+                patched.pinned_by = None;
+                let populated = serialize_message(&db, &patched).await;
+                emit_message_pin_fanout(&db, &patched, &populated, &user_id).await;
+                HttpResponse::Ok().json(json!({ "message": populated }))
+            }
+        },
+    }
+}
+
+/// Fan-out pin/unpin via `message-edited` so peers/tabs update without a new event type.
+async fn emit_message_pin_fanout(
+    db: &mongodb::Database,
+    updated: &Message,
+    populated: &serde_json::Value,
+    actor_id: &str,
+) {
+    if let Some(channel_id) = updated.channel {
+        let channel = match Channel::find_by_id(db, channel_id).await {
+            Ok(Some(ch)) => Some(ch),
+            // Missing or transient — fall through to read-state fanout.
+            Ok(None) | Err(_) => None,
+        };
+        if let Some(channel) = channel {
+            let recipients = crate::ws::registry::channel_recipient_ids(&channel);
+            crate::ws::registry::emit_to_users(&recipients, "message-edited", populated.clone());
+        } else {
+            use crate::model::channel_read_state_model::ChannelReadState;
+            use futures_util::TryStreamExt;
+            let mut recipients = vec![actor_id.to_string(), updated.sender.to_hex()];
+            recipients.dedup();
+            if let Ok(cursor) = ChannelReadState::collection(db)
+                .find(doc! { "channelId": channel_id })
+                .await
+            {
+                let states: Vec<ChannelReadState> =
+                    cursor.try_collect().await.unwrap_or_default();
+                for s in states {
+                    let id = s.user_id.to_hex();
+                    if !recipients.iter().any(|r| r == &id) {
+                        recipients.push(id);
+                    }
+                }
+            }
+            crate::ws::registry::emit_to_users(&recipients, "message-edited", populated.clone());
+        }
+    } else if let Some(recipient) = updated.recipient {
+        crate::ws::registry::emit_to_user(&recipient.to_hex(), "message-edited", populated.clone());
+        crate::ws::registry::emit_to_user(&updated.sender.to_hex(), "message-edited", populated.clone());
+        if actor_id != updated.sender.to_hex() && actor_id != recipient.to_hex() {
+            crate::ws::registry::emit_to_user(actor_id, "message-edited", populated.clone());
+        }
     }
 }
 
@@ -604,8 +1277,17 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
     let db = get_db();
 
     if let Some(channel_id) = body.channel_id.as_deref().filter(|s| !s.is_empty()) {
-        if can_access_channel_messages(&db, &user_id, channel_id).await.is_none() {
-            return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
+        match require_channel_access(&db, channel_id, &user_id).await {
+            Ok(_) => {}
+            Err(AccessDeniedReason::Unavailable) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
+            Err(_) => {
+                return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
+            }
         }
         let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
             return HttpResponse::BadRequest().json(json!({ "error": "Invalid channel id" }));
@@ -616,8 +1298,21 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
             .limit(MAX_PINNED_MESSAGES)
             .await
         {
-            Ok(c) => c.try_collect().await.unwrap_or_default(),
-            Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+            Ok(c) => match c.try_collect().await {
+                Ok(m) => m,
+                Err(_) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "error": "Temporarily unavailable",
+                        "retryable": true,
+                    }));
+                }
+            },
+            Err(_) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
         };
         let out = serialize_all(&db, &messages).await;
         return HttpResponse::Ok().json(json!({ "messages": out }));
@@ -626,6 +1321,12 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
     if let Some(contact_id) = body.contact_id.as_deref().filter(|s| !s.is_empty()) {
         let (uid, cid) = match authorize_dm_history_read(&db, &user_id, contact_id).await {
             Ok(pair) => pair,
+            Err(AccessDeniedReason::Unavailable) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
             Err(_) => {
                 return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
             }
@@ -646,8 +1347,21 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
             .limit(MAX_PINNED_MESSAGES)
             .await
         {
-            Ok(c) => c.try_collect().await.unwrap_or_default(),
-            Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+            Ok(c) => match c.try_collect().await {
+                Ok(m) => m,
+                Err(_) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "error": "Temporarily unavailable",
+                        "retryable": true,
+                    }));
+                }
+            },
+            Err(_) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
         };
         let mut messages = messages;
         messages.retain(|m| message_belongs_to_dm_conversation(m, uid, cid));
@@ -679,6 +1393,12 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
             "message": format!("Wpisz co najmniej {} znaki.", MIN_QUERY_LENGTH),
         }));
     }
+    if trimmed.chars().count() > MAX_QUERY_LENGTH {
+        return HttpResponse::BadRequest().json(json!({
+            "error": "QUERY_TOO_LONG",
+            "message": format!("Zapytanie może mieć co najwyżej {} znaków.", MAX_QUERY_LENGTH),
+        }));
+    }
 
     // Content is sealed at rest — match against server-only `searchText` index instead
     // of decrypting thousands of message bodies in memory.
@@ -686,8 +1406,17 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
     let db = get_db();
 
     if let Some(channel_id) = body.channel_id.as_deref().filter(|s| !s.is_empty()) {
-        if can_access_channel_messages(&db, &user_id, channel_id).await.is_none() {
-            return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
+        match require_channel_access(&db, channel_id, &user_id).await {
+            Ok(_) => {}
+            Err(AccessDeniedReason::Unavailable) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
+            Err(_) => {
+                return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
+            }
         }
         let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
             return HttpResponse::BadRequest().json(json!({ "error": "Invalid channel id" }));
@@ -704,10 +1433,20 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
             .limit(SEARCH_LIMIT)
             .await
         {
-            Ok(c) => c.try_collect().await.unwrap_or_default(),
+            Ok(c) => match c.try_collect().await {
+                Ok(m) => m,
+                Err(_) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "error": "Temporarily unavailable",
+                        "retryable": true,
+                    }));
+                }
+            },
             Err(_) => {
-                return HttpResponse::InternalServerError()
-                    .json(json!({ "error": "Internal Server Error" }))
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
             }
         };
         let out = serialize_all(&db, &messages).await;
@@ -717,6 +1456,12 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
     if let Some(contact_id) = body.contact_id.as_deref().filter(|s| !s.is_empty()) {
         let (uid, cid) = match authorize_dm_history_read(&db, &user_id, contact_id).await {
             Ok(pair) => pair,
+            Err(AccessDeniedReason::Unavailable) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
             Err(_) => {
                 return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
             }
@@ -738,10 +1483,20 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
             .limit(SEARCH_LIMIT)
             .await
         {
-            Ok(c) => c.try_collect().await.unwrap_or_default(),
+            Ok(c) => match c.try_collect().await {
+                Ok(m) => m,
+                Err(_) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "error": "Temporarily unavailable",
+                        "retryable": true,
+                    }));
+                }
+            },
             Err(_) => {
-                return HttpResponse::InternalServerError()
-                    .json(json!({ "error": "Internal Server Error" }))
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Temporarily unavailable",
+                    "retryable": true,
+                }));
             }
         };
         messages.retain(|m| message_belongs_to_dm_conversation(m, uid, cid));
