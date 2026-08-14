@@ -134,3 +134,17 @@ pub fn decrypt_field(encoded: &str) -> Result<String, String> {
     }
     Err(last_err.unwrap_or_else(|| "Failed to decrypt field".to_string()))
 }
+
+/// Offload CPU-bound AES-GCM to the blocking pool (safe inside async handlers).
+pub async fn encrypt_field_async(plain: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || encrypt_field(&plain))
+        .await
+        .map_err(|_| "Encryption task failed".to_string())?
+}
+
+/// Offload CPU-bound AES-GCM to the blocking pool (safe inside async handlers).
+pub async fn decrypt_field_async(encoded: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || decrypt_field(&encoded))
+        .await
+        .map_err(|_| "Decryption task failed".to_string())?
+}

@@ -7,10 +7,10 @@ use serde_json::{json, Value};
 
 use crate::middlewares::auth_middleware::request_user_id;
 use crate::utils::access::membership_gate::{require_channel_access, AccessDeniedReason};
-use crate::utils::image_reencode::{reencode_error_message, reencode_upload_to_webp};
+use crate::utils::image_reencode::{reencode_error_message, reencode_upload_to_webp_async};
 use crate::utils::storage::{avatar_channel_key, avatar_key_owned_by_channel, storage};
 use crate::utils::upload_limits::{file_bytes_within_limit, local_file_size, MAX_AVATAR_BYTES};
-use crate::utils::validators::file_magic::validate_file_magic;
+use crate::utils::validators::file_magic::validate_file_magic_async;
 use crate::utils::validators::unicode_text::sanitize_channel_name;
 use crate::model::channel_model::{Channel, CreateChannelInput};
 use crate::model::channel_report_model::{ChannelReport, CreateChannelReportInput};
@@ -812,10 +812,11 @@ pub async fn upload_channel_avatar(
         .filter(|e| ["jpg", "jpeg", "png", "webp"].contains(&e.as_str()))
         .unwrap_or_else(|| "png".to_string());
 
-    if !validate_file_magic(form.file.file.path(), &ext) {
+    let upload_path = form.file.file.path().to_path_buf();
+    if !validate_file_magic_async(upload_path.clone(), ext.clone()).await {
         return HttpResponse::BadRequest().json(json!({ "message": "Invalid file content" }));
     }
-    if local_file_size(form.file.file.path())
+    if local_file_size(&upload_path)
         .map(|size| !file_bytes_within_limit(size, MAX_AVATAR_BYTES))
         .unwrap_or(true)
     {
@@ -826,7 +827,7 @@ pub async fn upload_channel_avatar(
     let previous_image = channel.image.clone();
     let channel_id = cid.to_hex();
     let key = avatar_channel_key(&channel_id);
-    let webp = match reencode_upload_to_webp(form.file.file.path()) {
+    let webp = match reencode_upload_to_webp_async(upload_path).await {
         Ok(bytes) => bytes,
         Err(err) => {
             return HttpResponse::BadRequest().json(json!({
@@ -1165,6 +1166,7 @@ pub async fn delete_channel(req: HttpRequest) -> HttpResponse {
                     "deletedAt": DateTime::now(),
                     "updatedAt": DateTime::now(),
                     "searchText": "",
+                    "searchTokens": [],
                 }},
             )
             .await
@@ -1211,6 +1213,7 @@ pub async fn delete_channel(req: HttpRequest) -> HttpResponse {
                     "deletedAt": DateTime::now(),
                     "updatedAt": DateTime::now(),
                     "searchText": "",
+                    "searchTokens": [],
                 }},
             )
             .await

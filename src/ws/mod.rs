@@ -29,7 +29,7 @@ use crate::utils::security::client_id::{query_client_valid, query_param, WS_CRYP
 use crate::utils::security::origin::is_origin_header_allowed;
 use crate::utils::security::transport::is_secure_client_connection;
 use crate::ws::crypto_store::{consume_ws_crypto_key, ws_frame_encryption_required};
-use crate::ws::frame_crypto::FrameCipher;
+use crate::ws::frame_crypto::{decrypt_frame_async, encrypt_frame_async, FrameCipher};
 use crate::ws::handlers::{
     dispatch_message, finalize_taken_call_sessions, on_user_connected, on_user_disconnected,
 };
@@ -296,38 +296,25 @@ async fn handle_socket(
     ping_interval.tick().await;
     let mut last_pong_at = std::time::Instant::now();
 
-    let frame_cipher = match frame_key {
-        Some(key) => match FrameCipher::new(&key) {
-            Ok(cipher) => Some(cipher),
-            Err(e) => {
-                log::error!("WebSocket frame cipher init failed for {}: {e}", user_id);
-                app_state.registry.unregister(&user_id, conn_id).await;
-                app_state.socket_state.unregister_connection(&user_id);
-                app_state
-                    .socket_state
-                    .unregister_ip_connection(&client_ip);
-                return;
-            }
-        },
-        None => None,
-    };
-    let encryption_required = frame_cipher.is_some();
-
-    // Auth recheck runs off the socket loop; failure closes via this watch.
-    let (auth_fail_tx, mut auth_fail_rx) = watch::channel(false);
+    let ws_frame_key = frame_key;
+    if let Some(key) = ws_frame_key {
+        if FrameCipher::new(&key).is_err() {
+            log::error!("WebSocket frame cipher init failed for {}", user_id);
+            app_state.registry.unregister(&user_id, conn_id).await;
+            app_state.socket_state.unregister_connection(&user_id);
+            app_state
+                .socket_state
+                .unregister_ip_connection(&client_ip);
+            return;
+        }
+    }
+    let encryption_required = ws_frame_key.is_some();
 
     loop {
         tokio::select! {
             _ = revoke_rx.changed() => {
                 if *revoke_rx.borrow_and_update() {
                     log::info!("WebSocket session revoked for user {}", user_id);
-                    let _ = ws_sender.send(Message::Close(None)).await;
-                    break;
-                }
-            }
-            _ = auth_fail_rx.changed() => {
-                if *auth_fail_rx.borrow_and_update() {
-                    log::info!("WebSocket session expired for user {}", user_id);
                     let _ = ws_sender.send(Message::Close(None)).await;
                     break;
                 }
@@ -347,10 +334,16 @@ async fn handle_socket(
                 }
             }
             _ = auth_interval.tick() => {
+                if !state.try_begin_auth_recheck(
+                    &user_id,
+                    AUTH_RECHECK_INTERVAL.as_millis() as i64,
+                ) {
+                    continue;
+                }
                 let jwt_token = jwt_token.clone();
                 let refresh_token = refresh_token.clone();
                 let user_id = user_id.clone();
-                let auth_fail_tx = auth_fail_tx.clone();
+                let registry = app_state.registry.clone();
                 tokio::spawn(async move {
                     match user_from_jwt_with_refresh(
                         &jwt_token,
@@ -362,7 +355,7 @@ async fn handle_socket(
                         // Transient Mongo — do not kick a live socket.
                         Err(JwtUserError::Unavailable) => return,
                         Err(JwtUserError::Denied) => {
-                            let _ = auth_fail_tx.send(true);
+                            registry.disconnect_user(&user_id).await;
                             return;
                         }
                     }
@@ -378,7 +371,7 @@ async fn handle_socket(
                         };
                         if !still_allowed {
                             log::info!("WebSocket closed — whitelist revoked for {}", user_id);
-                            let _ = auth_fail_tx.send(true);
+                            registry.disconnect_user(&user_id).await;
                         }
                     }
                 });
@@ -386,8 +379,8 @@ async fn handle_socket(
             msg = rx.recv() => {
                 match msg {
                     Some(text) => {
-                        let outbound = if let Some(cipher) = &frame_cipher {
-                            match cipher.encrypt(&text) {
+                        let outbound = if let Some(key) = ws_frame_key {
+                            match encrypt_frame_async(key, text).await {
                                 Ok(bytes) => Message::Binary(bytes.into()),
                                 Err(e) => {
                                     log::warn!("WebSocket encrypt failed for user {}: {e}", user_id);
@@ -410,8 +403,8 @@ async fn handle_socket(
                         if data.len() > MAX_PAYLOAD {
                             continue;
                         }
-                        let text = if let Some(cipher) = &frame_cipher {
-                            match cipher.decrypt(&data) {
+                        let text = if let Some(key) = ws_frame_key {
+                            match decrypt_frame_async(key, data.to_vec()).await {
                                 Ok(value) => value,
                                 Err(e) => {
                                     log::warn!("WebSocket decrypt failed for user {}: {e}", user_id);

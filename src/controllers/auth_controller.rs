@@ -40,7 +40,7 @@ use crate::utils::upload_limits::{
     file_bytes_within_limit, local_file_size, MAX_AVATAR_BYTES, MAX_BANNER_BYTES,
     MAX_BANNER_EDGE,
 };
-use crate::utils::validators::file_magic::validate_file_magic;
+use crate::utils::validators::file_magic::validate_file_magic_async;
 use crate::utils::validators::normalize_username::{is_valid_username, looks_like_email, normalize_username};
 use crate::utils::validators::pwned_password::{check_password_breach, PasswordBreachCheck};
 use crate::utils::security::csrf::{build_csrf_cookie, clear_csrf_cookie, csrf_token_for_response, generate_csrf_token};
@@ -51,7 +51,7 @@ use crate::utils::registration::{is_registration_open, try_consume_global_signup
 use crate::utils::app_env::is_production;
 use crate::utils::admin::DELETION_GRACE_DAYS;
 use crate::utils::image_reencode::{
-    reencode_error_message, reencode_upload_to_webp, reencode_upload_to_webp_max_edge,
+    reencode_error_message, reencode_upload_to_webp_async, reencode_upload_to_webp_max_edge_async,
 };
 use crate::utils::storage::{
     avatar_user_key, avatar_key_owned_by_user, banner_user_key, public_media_key_owned_by_user,
@@ -1669,10 +1669,11 @@ pub async fn add_profile_image(
     if !ALLOWED_IMAGE_EXT.contains(&ext.as_str()) {
         return HttpResponse::BadRequest().body("Invalid file type.");
     }
-    if !validate_file_magic(form.file.file.path(), &ext) {
+    let upload_path = form.file.file.path().to_path_buf();
+    if !validate_file_magic_async(upload_path.clone(), ext.clone()).await {
         return HttpResponse::BadRequest().body("Invalid file content.");
     }
-    if local_file_size(form.file.file.path())
+    if local_file_size(&upload_path)
         .map(|size| !file_bytes_within_limit(size, MAX_AVATAR_BYTES))
         .unwrap_or(true)
     {
@@ -1688,7 +1689,7 @@ pub async fn add_profile_image(
     let previous_image = existing.image.clone();
 
     let key = avatar_user_key(&user_id);
-    let webp = match reencode_upload_to_webp(form.file.file.path()) {
+    let webp = match reencode_upload_to_webp_async(upload_path).await {
         Ok(bytes) => bytes,
         Err(err) => return HttpResponse::BadRequest().body(reencode_error_message(&err)),
     };
@@ -1788,10 +1789,11 @@ pub async fn add_profile_banner(
     if !ALLOWED_IMAGE_EXT.contains(&ext.as_str()) {
         return HttpResponse::BadRequest().body("Invalid file type.");
     }
-    if !validate_file_magic(form.file.file.path(), &ext) {
+    let upload_path = form.file.file.path().to_path_buf();
+    if !validate_file_magic_async(upload_path.clone(), ext.clone()).await {
         return HttpResponse::BadRequest().body("Invalid file content.");
     }
-    if local_file_size(form.file.file.path())
+    if local_file_size(&upload_path)
         .map(|size| !file_bytes_within_limit(size, MAX_BANNER_BYTES))
         .unwrap_or(true)
     {
@@ -1807,7 +1809,7 @@ pub async fn add_profile_banner(
     let previous_banner = user.banner.clone();
 
     let key = banner_user_key(&user_id);
-    let webp = match reencode_upload_to_webp_max_edge(form.file.file.path(), MAX_BANNER_EDGE) {
+    let webp = match reencode_upload_to_webp_max_edge_async(upload_path, MAX_BANNER_EDGE).await {
         Ok(bytes) => bytes,
         Err(err) => return HttpResponse::BadRequest().body(reencode_error_message(&err)),
     };

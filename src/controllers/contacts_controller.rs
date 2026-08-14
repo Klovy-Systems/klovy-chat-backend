@@ -895,6 +895,7 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
                     "deletedAt": DateTime::now(),
                     "updatedAt": DateTime::now(),
                     "searchText": "",
+                    "searchTokens": [],
                 }},
             )
             .await

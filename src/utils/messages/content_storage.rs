@@ -65,23 +65,31 @@ pub fn prepare_content_for_storage(incoming: &str) -> Result<String, String> {
     encrypt_field(&wrap_client_opaque(&plain))
 }
 
-/// API / WS payload: never human-readable plaintext.
-///
-/// Hot path for history/list responses: try a single decrypt first (common after
-/// server-seal migration). Avoids the previous double-decrypt via `is_server_sealed`
-/// followed by `decrypt_field` again.
+pub async fn prepare_content_for_storage_async(incoming: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || prepare_content_for_storage(&incoming))
+        .await
+        .map_err(|_| "Content seal task failed".to_string())?
+}
+
+/// API / WS payload: human-readable plaintext for clients.
+/// At-rest storage stays sealed via [`prepare_content_for_storage`].
 pub fn content_for_api(stored: &str) -> String {
-    let trimmed = stored.trim();
-    if let Ok(plain) = decrypt_field(trimmed) {
-        if is_client_opaque(&plain) {
-            return plain;
-        }
-        return wrap_client_opaque(&plain);
-    }
-    if is_client_opaque(trimmed) {
-        return trimmed.to_string();
-    }
-    wrap_client_opaque(trimmed)
+    reveal_content_internal(stored)
+}
+
+pub async fn content_for_api_async(stored: String) -> String {
+    let fallback = stored.clone();
+    tokio::task::spawn_blocking(move || content_for_api(&stored))
+        .await
+        .unwrap_or(fallback)
+}
+
+/// Decrypt a batch of sealed contents on the blocking pool (serialization hot path).
+pub async fn contents_for_api_batch_async(contents: Vec<String>) -> Vec<String> {
+    let fallback = contents.clone();
+    tokio::task::spawn_blocking(move || contents.iter().map(|s| content_for_api(s)).collect())
+        .await
+        .unwrap_or(fallback)
 }
 
 /// Plaintext for mentions/search/internal use (server-side only).
@@ -97,6 +105,13 @@ pub fn reveal_content_internal(stored: &str) -> String {
         return unwrap_client_opaque(trimmed);
     }
     trimmed.to_string()
+}
+
+pub async fn reveal_content_internal_async(stored: String) -> String {
+    let fallback = stored.clone();
+    tokio::task::spawn_blocking(move || reveal_content_internal(&stored))
+        .await
+        .unwrap_or(fallback)
 }
 
 pub fn unwrap_client_opaque(stored: &str) -> String {
@@ -126,4 +141,17 @@ pub fn normalize_client_opaque_to_plaintext(incoming: &str) -> String {
         current = inner;
     }
     current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_for_api_returns_plaintext_while_storage_stays_sealed() {
+        std::env::set_var("JWT_KEY", "test-jwt-key-for-content-storage-unit-test");
+        let stored = prepare_content_for_storage("elo").expect("seal");
+        assert_ne!(stored, "elo");
+        assert_eq!(content_for_api(&stored), "elo");
+    }
 }

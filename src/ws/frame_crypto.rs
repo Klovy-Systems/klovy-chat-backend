@@ -59,3 +59,15 @@ pub fn encrypt_frame(key: &[u8; 32], plaintext: &str) -> Result<Vec<u8>, String>
 pub fn decrypt_frame(key: &[u8; 32], data: &[u8]) -> Result<String, String> {
     FrameCipher::new(key)?.decrypt(data)
 }
+
+pub async fn encrypt_frame_async(key: [u8; 32], plaintext: String) -> Result<Vec<u8>, String> {
+    tokio::task::spawn_blocking(move || encrypt_frame(&key, &plaintext))
+        .await
+        .map_err(|_| "WS frame encryption task failed".to_string())?
+}
+
+pub async fn decrypt_frame_async(key: [u8; 32], data: Vec<u8>) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || decrypt_frame(&key, &data))
+        .await
+        .map_err(|_| "WS frame decryption task failed".to_string())?
+}

@@ -30,6 +30,12 @@ pub fn validate_upload_document(path: &Path, ext: &str) -> bool {
     }
 }
 
+pub async fn validate_upload_document_async(path: std::path::PathBuf, ext: String) -> bool {
+    tokio::task::spawn_blocking(move || validate_upload_document(&path, &ext))
+        .await
+        .unwrap_or(false)
+}
+
 fn validate_office_zip(path: &Path, kind: &str) -> bool {
     let file = match File::open(path) {
         Ok(file) => file,

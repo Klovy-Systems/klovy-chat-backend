@@ -142,3 +142,9 @@ pub fn validate_file_magic(path: &Path, ext: &str) -> bool {
         _ => false,
     }
 }
+
+pub async fn validate_file_magic_async(path: std::path::PathBuf, ext: String) -> bool {
+    tokio::task::spawn_blocking(move || validate_file_magic(&path, &ext))
+        .await
+        .unwrap_or(false)
+}

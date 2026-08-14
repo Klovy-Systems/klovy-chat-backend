@@ -828,6 +828,7 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
                                 "deletedAt": DateTime::now(),
                                 "updatedAt": DateTime::now(),
                                 "searchText": "",
+                                "searchTokens": [],
                             }},
                         )
                         .await

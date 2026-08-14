@@ -40,6 +40,8 @@ pub struct SocketState {
     typing_fifo: Arc<StdMutex<HashMap<String, TypingSlot>>>,
     /// Call + channel-voice — separate from typing so heartbeats cannot HOL-block accept.
     call_fifo: Arc<StdMutex<HashMap<String, FifoSlot>>>,
+    /// Per-user auth recheck throttle (one JWT lookup per user per interval).
+    auth_recheck_started: Arc<StdMutex<HashMap<String, i64>>>,
     typing_gc_counter: Arc<AtomicU32>,
 }
 
@@ -398,7 +400,26 @@ impl SocketState {
         }
     }
 
+    pub fn try_begin_auth_recheck(&self, user_id: &str, interval_ms: i64) -> bool {
+        let now = now_ms();
+        let mut map = self
+            .auth_recheck_started
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(last) = map.get(user_id) {
+            if now.saturating_sub(*last) < interval_ms {
+                return false;
+            }
+        }
+        map.insert(user_id.to_string(), now);
+        true
+    }
+
     pub fn clear_user_state(&self, user_id: &str) {
+        self.auth_recheck_started
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(user_id);
         self.rate_limits
             .lock()
             .unwrap_or_else(|e| e.into_inner())

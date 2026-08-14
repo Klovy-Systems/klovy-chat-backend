@@ -20,7 +20,7 @@ use crate::utils::access::membership_gate::{
 };
 use crate::utils::db::get_db;
 use crate::utils::image_reencode::{
-    reencode_error_message, reencode_upload_to_webp_variants,
+    reencode_error_message, reencode_upload_to_webp_variants_async,
 };
 use crate::utils::messages::{
     access::cleanup_attachment_if_unreferenced,
@@ -29,7 +29,7 @@ use crate::utils::messages::{
     message_belongs_to_dm_conversation,
 };
 use crate::utils::messages::content_storage::inbound_plaintext_for_processing;
-use crate::utils::messages::search_text::{search_regex_pattern, search_text_from_incoming};
+use crate::utils::messages::search_text::{build_search_index_from_incoming, search_tokens_for_query};
 use crate::utils::storage::{
     attachment_dm_key, attachment_group_key, attachment_thumb_key, storage,
 };
@@ -38,8 +38,10 @@ use crate::utils::upload_limits::{
     file_bytes_within_limit, is_image_extension, local_file_size, MAX_ATTACHMENT_BYTES,
     MAX_CHAT_ATTACHMENTS_PER_WINDOW, MAX_IMAGE_ATTACHMENT_BYTES, CHAT_ATTACHMENT_WINDOW_SECS,
 };
-use crate::utils::validators::archive_validation::validate_upload_document;
-use crate::utils::validators::file_magic::{resolve_upload_content_type, validate_file_magic};
+use crate::utils::validators::archive_validation::validate_upload_document_async;
+use crate::utils::validators::file_magic::{
+    resolve_upload_content_type, validate_file_magic_async,
+};
 use crate::utils::link_preview::{fetch_link_preview, is_safe_preview_target};
 use crate::utils::ratelimit::Store;
 use once_cell::sync::Lazy;
@@ -210,11 +212,12 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     if !ALLOWED_EXTENSIONS.contains(&ext.as_str()) {
         return HttpResponse::BadRequest().body("Invalid file type.");
     }
-    if !validate_file_magic(form.file.file.path(), &ext) {
+    let upload_path = form.file.file.path().to_path_buf();
+    if !validate_file_magic_async(upload_path.clone(), ext.clone()).await {
         return HttpResponse::BadRequest().body("Invalid file content.");
     }
     if matches!(ext.as_str(), "pdf" | "docx" | "xlsx")
-        && !validate_upload_document(form.file.file.path(), &ext)
+        && !validate_upload_document_async(upload_path.clone(), ext.clone()).await
     {
         return HttpResponse::BadRequest().body("Invalid file content.");
     }
@@ -315,14 +318,14 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     };
 
     let (body, thumb_body) = if is_image {
-        match reencode_upload_to_webp_variants(form.file.file.path()) {
+        match reencode_upload_to_webp_variants_async(upload_path).await {
             Ok(variants) => (variants.full, Some(variants.thumb)),
             Err(err) => return HttpResponse::BadRequest().body(reencode_error_message(&err)),
         }
     } else {
-        match std::fs::read(form.file.file.path()) {
-            Ok(bytes) => (bytes, None),
-            Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error."),
+        match tokio::task::spawn_blocking(move || std::fs::read(&upload_path)).await {
+            Ok(Ok(bytes)) => (bytes, None),
+            _ => return HttpResponse::InternalServerError().body("Internal Server Error."),
         }
     };
 
@@ -551,16 +554,22 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
             }));
         }
     };
-    let stored_content = match crate::utils::messages::content_storage::prepare_content_for_storage(
-        content.trim(),
-    ) {
+    let stored_content = match crate::utils::messages::content_storage::prepare_content_for_storage_async(
+        content.trim().to_string(),
+    )
+    .await
+    {
         Ok(c) => c,
         Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error", "retryable": true })),
     };
-    let search_text = search_text_from_incoming(content.trim());
+    let search_index = match build_search_index_from_incoming(content.trim()) {
+        Ok(index) => index,
+        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error", "retryable": true })),
+    };
     let set_doc = doc! {
         "content": stored_content,
-        "searchText": search_text,
+        "searchText": search_index.encrypted_text,
+        "searchTokens": search_index.tokens,
         "mentions": mentions_bson,
         "mentionsEveryone": mentions_everyone,
         "edited": true,
@@ -1400,9 +1409,15 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
         }));
     }
 
-    // Content is sealed at rest — match against server-only `searchText` index instead
+    // Content is sealed at rest — match against server-only `searchTokens` index instead
     // of decrypting thousands of message bodies in memory.
-    let pattern = search_regex_pattern(&trimmed);
+    let tokens = search_tokens_for_query(&trimmed);
+    if tokens.is_empty() {
+        return HttpResponse::BadRequest().json(json!({
+            "error": "QUERY_TOO_SHORT",
+            "message": format!("Wpisz co najmniej {} znaki.", MIN_QUERY_LENGTH),
+        }));
+    }
     let db = get_db();
 
     if let Some(channel_id) = body.channel_id.as_deref().filter(|s| !s.is_empty()) {
@@ -1425,7 +1440,7 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
             "channel": channel_oid,
             "deleted": { "$ne": true },
             "messageType": "TEXT",
-            "searchText": { "$regex": &pattern },
+            "searchTokens": { "$all": &tokens },
         };
         let messages: Vec<Message> = match Message::collection(&db)
             .find(filter)
@@ -1474,7 +1489,7 @@ pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBod
                 ]},
                 { "deleted": { "$ne": true } },
                 { "messageType": "TEXT" },
-                { "searchText": { "$regex": &pattern } },
+                { "searchTokens": { "$all": &tokens } },
             ]
         };
         let mut messages: Vec<Message> = match Message::collection(&db)

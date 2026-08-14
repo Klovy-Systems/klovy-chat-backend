@@ -2062,9 +2062,11 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
             return;
         }
     };
-    let stored_content = match crate::utils::messages::content_storage::prepare_content_for_storage(
-        prepared_content.trim(),
-    ) {
+    let stored_content = match crate::utils::messages::content_storage::prepare_content_for_storage_async(
+        prepared_content.trim().to_string(),
+    )
+    .await
+    {
         Ok(c) => c,
         Err(_) => {
             registry::emit_to_user(
@@ -2079,14 +2081,30 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
             return;
         }
     };
-    let search_text =
-        crate::utils::messages::search_text::search_text_from_incoming(prepared_content.trim());
+    let search_index = match crate::utils::messages::search_text::build_search_index_from_incoming(
+        prepared_content.trim(),
+    ) {
+        Ok(index) => index,
+        Err(_) => {
+            registry::emit_to_user(
+                &user_id,
+                "error",
+                json!({
+                    "code": "EDIT_FAILED",
+                    "message": "Nie udało się edytować wiadomości. Spróbuj ponownie.",
+                    "retryable": true,
+                }),
+            );
+            return;
+        }
+    };
     let edit_result = Message::collection(&db)
         .update_one(
             doc! { "_id": mid, "deleted": { "$ne": true } },
             doc! { "$set": {
                 "content": stored_content,
-                "searchText": search_text,
+                "searchText": search_index.encrypted_text,
+                "searchTokens": search_index.tokens,
                 "mentions": mentions_bson,
                 "mentionsEveryone": mentions_everyone,
                 "edited": true,

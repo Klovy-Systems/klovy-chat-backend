@@ -56,9 +56,13 @@ pub struct Message {
 
     pub content: String,
 
-    /// Normalized lowercase plaintext for server-side search only (never exposed via API).
+    /// AES-GCM sealed normalized body for server-side search (not exposed via manual API serializers).
     #[serde(rename = "searchText", default, skip_serializing_if = "String::is_empty")]
     pub search_text: String,
+
+    /// HMAC n-gram tokens for substring search (not exposed via manual API serializers).
+    #[serde(rename = "searchTokens", default, skip_serializing_if = "Vec::is_empty")]
+    pub search_tokens: Vec<String>,
 
     #[serde(rename = "messageType", default)]
     pub message_type: MessageType,
@@ -276,12 +280,12 @@ impl Message {
             IndexModel::builder().keys(doc! { "recipient": 1, "read": 1, "channel": 1, "deleted": 1 }).build(),
             IndexModel::builder().keys(doc! { "channel": 1, "timestamp": -1, "sender": 1, "deleted": 1 }).build(),
             IndexModel::builder().keys(doc! { "mentions": 1, "read": 1 }).build(),
-            // Server-side search index (searchText is never returned to clients).
+            // Server-side search index (searchTokens never returned to clients).
             IndexModel::builder()
-                .keys(doc! { "channel": 1, "messageType": 1, "searchText": 1 })
+                .keys(doc! { "channel": 1, "messageType": 1, "searchTokens": 1 })
                 .build(),
             IndexModel::builder()
-                .keys(doc! { "sender": 1, "recipient": 1, "messageType": 1, "searchText": 1 })
+                .keys(doc! { "sender": 1, "recipient": 1, "messageType": 1, "searchTokens": 1 })
                 .build(),
             // Idempotent WS send — sparse so legacy rows without nonce are fine.
             IndexModel::builder()
@@ -330,15 +334,17 @@ impl Message {
         }
 
         let trimmed = input.content.trim();
-        let stored_content = crate::utils::messages::content_storage::prepare_content_for_storage(
-            trimmed,
+        let stored_content = crate::utils::messages::content_storage::prepare_content_for_storage_async(
+            trimmed.to_string(),
         )
+        .await
         .map_err(|e| CreateMessageError::Other(e.into()))?;
         let msg_type = input.message_type.clone().unwrap_or_default();
-        let search_text = if msg_type == MessageType::Text {
-            crate::utils::messages::search_text::search_text_from_incoming(trimmed)
+        let search_index = if msg_type == MessageType::Text {
+            crate::utils::messages::search_text::build_search_index_from_incoming(trimmed)
+                .map_err(|e| CreateMessageError::Other(e.into()))?
         } else {
-            String::new()
+            crate::utils::messages::search_text::SearchIndex::empty()
         };
 
         let now = DateTime::now();
@@ -351,7 +357,8 @@ impl Message {
             recipient: input.recipient,
             channel: input.channel,
             content: stored_content,
-            search_text,
+            search_text: search_index.encrypted_text,
+            search_tokens: search_index.tokens,
             message_type: msg_type,
             file_url: input.file_url,
             file_type: input.file_type,
@@ -442,6 +449,7 @@ impl Message {
             "deletedAt": DateTime::now(),
             "updatedAt": DateTime::now(),
             "searchText": "",
+            "searchTokens": [],
         };
         // Claim unread delete first — mutually exclusive with mark-read flip.
         let unread = Self::collection(db)

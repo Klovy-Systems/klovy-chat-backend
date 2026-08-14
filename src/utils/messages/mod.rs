@@ -63,13 +63,36 @@ fn reactions_to_json(msg: &Message) -> Value {
     Value::Object(map)
 }
 
-fn message_content_for_api(msg: &Message) -> String {
-    crate::utils::messages::content_storage::content_for_api(
-        &msg.content,
-    )
+fn message_content_for_api(msg: &Message, content_cache: &HashMap<ObjectId, String>) -> String {
+    msg.id
+        .and_then(|id| content_cache.get(&id).cloned())
+        .unwrap_or_else(|| crate::utils::messages::content_storage::content_for_api(&msg.content))
+}
+
+async fn build_content_cache(msgs: &[Message], quoted: &HashMap<ObjectId, Message>) -> HashMap<ObjectId, String> {
+    let mut pairs: Vec<(ObjectId, String)> = Vec::new();
+    for m in msgs {
+        if let Some(id) = m.id {
+            pairs.push((id, m.content.clone()));
+        }
+    }
+    for m in quoted.values() {
+        if let Some(id) = m.id {
+            pairs.push((id, m.content.clone()));
+        }
+    }
+    let contents: Vec<String> = pairs.iter().map(|(_, c)| c.clone()).collect();
+    let decrypted =
+        crate::utils::messages::content_storage::contents_for_api_batch_async(contents).await;
+    pairs
+        .into_iter()
+        .zip(decrypted)
+        .map(|((id, _), plain)| (id, plain))
+        .collect()
 }
 
 async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bool) -> Value {
+    let content_cache = build_content_cache(std::slice::from_ref(msg), &HashMap::new()).await;
     let sender = populate_user(db, msg.sender).await;
 
     let recipient = match msg.recipient {
@@ -106,7 +129,7 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
         "sender": sender,
         "recipient": recipient,
         "channel": msg.channel.map(|o| o.to_hex()),
-        "content": message_content_for_api(msg),
+        "content": message_content_for_api(msg, &content_cache),
         "messageType": serde_json::to_value(&msg.message_type).unwrap_or(Value::Null),
         "fileUrl": msg.file_url,
         "fileType": msg.file_type,
@@ -181,6 +204,7 @@ fn serialize_message_cached(
     msg: &Message,
     users: &HashMap<ObjectId, Value>,
     quoted: QuotedSer<'_>,
+    content_cache: &HashMap<ObjectId, String>,
 ) -> Value {
     let sender = cached_user(users, msg.sender);
     let recipient = msg
@@ -194,7 +218,9 @@ fn serialize_message_cached(
     let mentions: Vec<Value> = msg.mentions.iter().map(|m| cached_user(users, *m)).collect();
 
     let quoted = match quoted {
-        QuotedSer::Present(qm) => serialize_message_cached(qm, users, QuotedSer::None),
+        QuotedSer::Present(qm) => {
+            serialize_message_cached(qm, users, QuotedSer::None, content_cache)
+        }
         QuotedSer::None => Value::Null,
         QuotedSer::Unavailable(id) => json!({ "_id": id.to_hex(), "unavailable": true }),
     };
@@ -204,7 +230,7 @@ fn serialize_message_cached(
         "sender": sender,
         "recipient": recipient,
         "channel": msg.channel.map(|o| o.to_hex()),
-        "content": message_content_for_api(msg),
+        "content": message_content_for_api(msg, &content_cache),
         "messageType": serde_json::to_value(&msg.message_type).unwrap_or(Value::Null),
         "fileUrl": msg.file_url,
         "fileType": msg.file_type,
@@ -287,6 +313,9 @@ pub async fn serialize_messages_batch(db: &Database, msgs: &[Message]) -> Vec<Va
         }
     }
 
+    // 4. Decrypt sealed contents on the blocking pool (one batch per response).
+    let content_cache = build_content_cache(msgs, &quoted_map).await;
+
     msgs.iter()
         .map(|m| {
             let quoted = match m.quoted_message {
@@ -297,7 +326,7 @@ pub async fn serialize_messages_batch(db: &Database, msgs: &[Message]) -> Vec<Va
                 },
                 None => QuotedSer::None,
             };
-            serialize_message_cached(m, &user_map, quoted)
+            serialize_message_cached(m, &user_map, quoted, &content_cache)
         })
         .collect()
 }

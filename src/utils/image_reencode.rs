@@ -109,6 +109,14 @@ pub fn reencode_upload_to_webp_variants(source: &Path) -> Result<EncodedImageVar
     Ok(EncodedImageVariants { full, thumb })
 }
 
+pub async fn reencode_upload_to_webp_variants_async(
+    source: std::path::PathBuf,
+) -> Result<EncodedImageVariants, ImageReencodeError> {
+    tokio::task::spawn_blocking(move || reencode_upload_to_webp_variants(&source))
+        .await
+        .map_err(|_| ImageReencodeError::IoFailed)?
+}
+
 /// Avatar: lossy WebP, capped at avatar edge.
 pub fn reencode_upload_to_webp(source: &Path) -> Result<Vec<u8>, ImageReencodeError> {
     reencode_upload_to_webp_max_edge(source, crate::utils::upload_limits::MAX_AVATAR_EDGE)
@@ -128,4 +136,19 @@ pub fn reencode_upload_to_webp_max_edge(
         &resized,
         crate::utils::upload_limits::AVATAR_WEBP_QUALITY,
     )
+}
+
+pub async fn reencode_upload_to_webp_async(source: std::path::PathBuf) -> Result<Vec<u8>, ImageReencodeError> {
+    tokio::task::spawn_blocking(move || reencode_upload_to_webp(&source))
+        .await
+        .map_err(|_| ImageReencodeError::IoFailed)?
+}
+
+pub async fn reencode_upload_to_webp_max_edge_async(
+    source: std::path::PathBuf,
+    max_edge: u32,
+) -> Result<Vec<u8>, ImageReencodeError> {
+    tokio::task::spawn_blocking(move || reencode_upload_to_webp_max_edge(&source, max_edge))
+        .await
+        .map_err(|_| ImageReencodeError::IoFailed)?
 }
