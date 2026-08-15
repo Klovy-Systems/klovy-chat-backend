@@ -5,10 +5,8 @@ use mongodb::Database;
 use crate::middlewares::auth_middleware::TokenPayload;
 use crate::utils::auth::jwt_validation::{hs256_header, JWT_AUDIENCE, JWT_ISSUER};
 
-/// Access JWT + cookie lifetime. Keep aligned with WebSocket re-auth so users
-/// are not dropped mid-session every half hour.
-pub const ACCESS_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
-pub const REFRESH_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+pub const ACCESS_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+pub const REFRESH_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 pub async fn create_access_token(
     db: &Database,

@@ -11,10 +11,10 @@ use crate::utils::auth::session_metadata::SessionClientMetadata;
 use crate::utils::crypto::token_hash::{
     hash_refresh_token_for_storage, is_legacy_refresh_hash, legacy_refresh_token_hash,
 };
+use crate::utils::auth::token_utils::REFRESH_MAX_AGE_MS;
 use crate::utils::db::get_db;
 
 pub const REFRESH_COOKIE: &str = "refreshToken";
-pub const REFRESH_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 pub struct IssuedRefreshToken {
     pub raw_token: String,
