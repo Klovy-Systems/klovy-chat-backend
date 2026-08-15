@@ -9,9 +9,8 @@ use crate::utils::crypto::{
 pub const BACKUP_CODE_COUNT: usize = 8;
 const ISSUER: &str = "KlovyChat";
 
-/// New 2FA setups use SHA-256. SHA-1 is kept only for verifying existing enrollments.
-const PRIMARY_TOTP_ALGORITHM: Algorithm = Algorithm::SHA256;
-const LEGACY_TOTP_ALGORITHM: Algorithm = Algorithm::SHA1;
+const PRIMARY_TOTP_ALGORITHM: Algorithm = Algorithm::SHA1;
+const LEGACY_TOTP_ALGORITHM: Algorithm = Algorithm::SHA256;
 
 pub fn generate_totp_secret() -> String {
     secret_base32(&Secret::generate_secret())
@@ -41,7 +40,7 @@ fn totp_for_account(
     TOTP::new(
         algorithm,
         6,
-        1,
+        2,
         30,
         Secret::Encoded(normalized)
             .to_bytes()
@@ -58,11 +57,22 @@ pub fn build_otpauth_url(username: &str, secret: &str) -> String {
         .unwrap_or_default()
 }
 
-pub fn verify_totp_code(username: &str, secret: &str, code: &str) -> Result<bool, ()> {
-    let normalized = code.trim();
-    if normalized.len() != 6 || !normalized.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(false);
+fn totp_digits(code: &str) -> Option<String> {
+    let compact: String = code
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
+    if compact.len() == 6 && compact.chars().all(|c| c.is_ascii_digit()) {
+        Some(compact)
+    } else {
+        None
     }
+}
+
+pub fn verify_totp_code(username: &str, secret: &str, code: &str) -> Result<bool, ()> {
+    let Some(normalized) = totp_digits(code) else {
+        return Ok(false);
+    };
 
     let mut constructed = false;
     let mut saw_check_err = false;
@@ -71,14 +81,12 @@ pub fn verify_totp_code(username: &str, secret: &str, code: &str) -> Result<bool
             continue;
         };
         constructed = true;
-        match totp.check_current(normalized) {
+        match totp.check_current(&normalized) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
-            // SystemTime / crypto infra — Unavailable, not Denied.
             Err(_) => saw_check_err = true,
         }
     }
-    // No algorithm could be built (bad secret / crypto) — Unavailable, not Denied.
     if !constructed || saw_check_err {
         Err(())
     } else {
@@ -150,6 +158,5 @@ pub async fn verify_and_consume_backup_code(
 }
 
 pub fn is_totp_code(code: &str) -> bool {
-    let trimmed = code.trim();
-    trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_digit())
+    totp_digits(code).is_some()
 }

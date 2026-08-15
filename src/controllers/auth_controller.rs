@@ -130,6 +130,32 @@ async fn invalidate_user_session(user_id: ObjectId) {
     disconnect_user(&user_id.to_hex());
 }
 
+async fn revoke_other_devices(req: &HttpRequest, user_id: ObjectId) {
+    let Some(raw) = req.cookie(REFRESH_COOKIE).map(|c| c.value().to_string()) else {
+        return;
+    };
+    let current_family = match family_id_from_refresh_token(&raw).await {
+        Ok(Some(fid)) => fid,
+        _ => return,
+    };
+    let db = get_db();
+    let other_families =
+        match RefreshToken::active_family_ids_for_user_except(&db, user_id, &current_family).await {
+            Ok(families) => families,
+            Err(_) => return,
+        };
+    if revoke_other_sessions_for_user(user_id, &current_family)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let hex = user_id.to_hex();
+    for family in other_families {
+        revoke_session_remotely(&hex, &family);
+    }
+}
+
 async fn add_login_delay() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -853,9 +879,7 @@ pub async fn enable_two_factor(
     .await
     {
         Ok(Some(updated)) => {
-            if let Some(oid) = updated.id {
-                invalidate_user_session(oid).await;
-            }
+            revoke_other_devices(&req, oid).await;
             HttpResponse::Ok().json(json!({
             "message": "Two-factor authentication enabled.",
             "twoFactorEnabled": updated.two_factor_enabled,
@@ -959,9 +983,7 @@ pub async fn disable_two_factor(
     .await
     {
         Ok(Some(updated)) => {
-            if let Some(oid) = updated.id {
-                invalidate_user_session(oid).await;
-            }
+            revoke_other_devices(&req, oid).await;
             HttpResponse::Ok().json(json!({
             "message": "Two-factor authentication disabled.",
             "twoFactorEnabled": updated.two_factor_enabled,
