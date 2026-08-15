@@ -8,8 +8,12 @@ use actix_web::{
 use actix_web_lab::middleware::Next;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// Drop expired / excess keys so a unique-IP flood cannot grow RAM without bound.
+const MAX_STORE_BUCKETS: usize = 50_000;
 
 pub struct Store {
     buckets: Mutex<HashMap<String, Bucket>>,
@@ -22,6 +26,23 @@ struct Bucket {
     reset: Instant,
 }
 
+fn evict_expired_and_cap(map: &mut HashMap<String, Bucket>, max_keys: usize) {
+    let now = Instant::now();
+    map.retain(|_, bucket| now < bucket.reset);
+    if map.len() <= max_keys {
+        return;
+    }
+    let mut by_reset: Vec<(Instant, String)> = map
+        .iter()
+        .map(|(key, bucket)| (bucket.reset, key.clone()))
+        .collect();
+    by_reset.sort_by_key(|(reset, _)| *reset);
+    let overflow = map.len() - max_keys;
+    for (_, key) in by_reset.into_iter().take(overflow) {
+        map.remove(&key);
+    }
+}
+
 impl Store {
     pub fn new(max: u32, window: Duration) -> Self {
         Self {
@@ -31,8 +52,17 @@ impl Store {
         }
     }
 
-    pub fn is_over_limit(&self, key: &str) -> bool {
+    fn lock_buckets(&self) -> MutexGuard<'_, HashMap<String, Bucket>> {
         let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        static GC: AtomicU32 = AtomicU32::new(0);
+        if GC.fetch_add(1, Ordering::Relaxed) % 64 == 0 || map.len() >= MAX_STORE_BUCKETS {
+            evict_expired_and_cap(&mut map, MAX_STORE_BUCKETS);
+        }
+        map
+    }
+
+    pub fn is_over_limit(&self, key: &str) -> bool {
+        let mut map = self.lock_buckets();
         let now = Instant::now();
         match map.get(key) {
             Some(b) if now < b.reset => b.count >= self.max,
@@ -58,7 +88,7 @@ impl Store {
 
     /// Peek without consuming a slot (e.g. slowmode before create).
     pub fn would_block_with_window(&self, key: &str, max: u32, window: Duration) -> bool {
-        let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.lock_buckets();
         let now = Instant::now();
         match map.get_mut(key) {
             Some(bucket) if now < bucket.reset => bucket.count >= max,
@@ -75,7 +105,7 @@ impl Store {
     }
 
     pub fn increment_with_window(&self, key: &str, window: Duration) {
-        let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.lock_buckets();
         let now = Instant::now();
         let bucket = map.entry(key.to_string()).or_insert(Bucket {
             count: 0,
@@ -89,7 +119,7 @@ impl Store {
     }
 
     pub fn increment(&self, key: &str) {
-        let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.lock_buckets();
         let now = Instant::now();
         let bucket = map.entry(key.to_string()).or_insert(Bucket {
             count: 0,
@@ -104,7 +134,7 @@ impl Store {
 
     /// Seconds until the current window resets (at least 1 when blocked).
     pub fn retry_after_secs(&self, key: &str) -> u64 {
-        let map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.lock_buckets();
         let now = Instant::now();
         match map.get(key) {
             Some(b) if now < b.reset => b.reset.duration_since(now).as_secs().max(1),
@@ -222,6 +252,14 @@ static CHANGE_USERNAME: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_
 static FRIEND_ACTION: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(5 * 60)));
 static STATUS_UPDATE: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(60)));
 static PIN_MESSAGE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
+/// Public Axum hop — counted before the HTTP body is buffered. WS is separate.
+static EDGE_HTTP: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(10)));
+/// Process-wide HTTP budget. Per-IP limits do not stop a unique-IP flood.
+static EDGE_HTTP_TOTAL: Lazy<Store> = Lazy::new(|| Store::new(2500, Duration::from_secs(10)));
+/// Process-wide WS handshake budget (before JWT / DB). Separate from HTTP.
+static WS_HANDSHAKE_TOTAL: Lazy<Store> = Lazy::new(|| Store::new(600, Duration::from_secs(10)));
+static HTTP_INFLIGHT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+pub const HTTP_EDGE_TIMEOUT: Duration = Duration::from_secs(60);
 static CHAT_ATTACHMENT: Lazy<Store> = Lazy::new(|| {
     Store::new(
         crate::utils::upload_limits::MAX_CHAT_ATTACHMENTS_PER_WINDOW,
@@ -570,7 +608,108 @@ pub async fn change_username_limiter(
     .await
 }
 
-pub fn ws_handshake_allowed(ip: &str) -> bool {
+fn try_ip_then_total(
+    ip_store: &Store,
+    ip_key: &str,
+    total_store: &Store,
+    total_key: &str,
+) -> Result<(), u64> {
+    ip_store.try_consume(ip_key)?;
+    total_store.try_consume(total_key)
+}
+
+pub fn ws_handshake_allowed(ip: &str) -> Result<(), u64> {
     let key = rate_limit_key("ws-handshake", ip);
-    WS_HANDSHAKE.check_and_increment(&key)
+    try_ip_then_total(
+        &WS_HANDSHAKE,
+        &key,
+        &WS_HANDSHAKE_TOTAL,
+        "ws-handshake-total",
+    )
+}
+
+/// Cheap burst check for the public HTTP proxy (before `to_bytes`).
+/// Per-IP first, then a process-wide budget so a unique-IP flood cannot
+/// walk past 120/10s × N addresses.
+pub fn edge_http_allowed(ip: &str) -> Result<(), u64> {
+    if trusted_ips().iter().any(|trusted| trusted == ip) {
+        return Ok(());
+    }
+    let key = rate_limit_key("edge-http", ip);
+    try_ip_then_total(&EDGE_HTTP, &key, &EDGE_HTTP_TOTAL, "edge-http-total")
+}
+
+/// Slot for one in-flight HTTP proxy request. WebSocket upgrades do not take this.
+pub fn try_acquire_http_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
+    HTTP_INFLIGHT.try_acquire().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evict_drops_expired_buckets() {
+        let mut map = HashMap::new();
+        map.insert(
+            "old".to_string(),
+            Bucket {
+                count: 3,
+                reset: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        map.insert(
+            "live".to_string(),
+            Bucket {
+                count: 1,
+                reset: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        evict_expired_and_cap(&mut map, 50_000);
+        assert!(!map.contains_key("old"));
+        assert!(map.contains_key("live"));
+    }
+
+    #[test]
+    fn evict_caps_by_earliest_reset() {
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        map.insert(
+            "first".to_string(),
+            Bucket {
+                count: 1,
+                reset: now + Duration::from_secs(1),
+            },
+        );
+        map.insert(
+            "second".to_string(),
+            Bucket {
+                count: 1,
+                reset: now + Duration::from_secs(30),
+            },
+        );
+        evict_expired_and_cap(&mut map, 1);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("second"));
+    }
+
+    #[test]
+    fn unique_ips_still_hit_total_budget() {
+        let per_ip = Store::new(10, Duration::from_secs(60));
+        let total = Store::new(3, Duration::from_secs(60));
+        assert!(try_ip_then_total(&per_ip, "a", &total, "all").is_ok());
+        assert!(try_ip_then_total(&per_ip, "b", &total, "all").is_ok());
+        assert!(try_ip_then_total(&per_ip, "c", &total, "all").is_ok());
+        assert!(try_ip_then_total(&per_ip, "d", &total, "all").is_err());
+    }
+
+    #[test]
+    fn per_ip_budget_trips_before_total() {
+        let per_ip = Store::new(2, Duration::from_secs(60));
+        let total = Store::new(50, Duration::from_secs(60));
+        assert!(try_ip_then_total(&per_ip, "same", &total, "all").is_ok());
+        assert!(try_ip_then_total(&per_ip, "same", &total, "all").is_ok());
+        assert!(try_ip_then_total(&per_ip, "same", &total, "all").is_err());
+        assert!(try_ip_then_total(&per_ip, "other", &total, "all").is_ok());
+    }
 }

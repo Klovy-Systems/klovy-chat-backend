@@ -14,6 +14,7 @@ pub mod conversation_tips;
 pub mod crypto;
 pub mod db;
 pub mod friends;
+pub mod http_limits;
 pub mod image_reencode;
 pub mod link_preview;
 pub mod messages;

@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use once_cell::sync::Lazy;
 
 const TTL_MS: i64 = 300_000; // 5 minutes — invalidated on every write anyway
+const CACHE_MAX: usize = 20_000;
 
 struct Entry {
     status: String,
@@ -40,6 +41,13 @@ pub fn put(user_id: &str, status: &str) {
                 at_ms: now_ms(),
             },
         );
+        if guard.len() > CACHE_MAX {
+            let overflow = guard.len() - CACHE_MAX;
+            let keys: Vec<String> = guard.keys().take(overflow).cloned().collect();
+            for key in keys {
+                guard.remove(&key);
+            }
+        }
     }
 }
 

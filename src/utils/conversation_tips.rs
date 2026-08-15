@@ -81,7 +81,6 @@ pub async fn upsert_dm_tip(db: &Database, msg: &Message) {
     };
     let Some(mid) = msg.id else { return };
     // Soft-deleted — do not resurrect tip after delete×late-upsert race.
-    // Probe Err ≠ deleted: skip upsert (leave tip) rather than treat as gone.
     let still_active = match Message::collection(db)
         .find_one(doc! { "_id": mid, "deleted": { "$ne": true } })
         .projection(doc! { "_id": 1 })
@@ -192,7 +191,6 @@ pub async fn upsert_channel_tip(db: &Database, channel_id: ObjectId, msg: &Messa
     }
 }
 
-/// Returns whether the tip row was matched (false → caller should heal absolute).
 pub async fn bump_dm_unread(db: &Database, sender: ObjectId, recipient: ObjectId) -> bool {
     let (pair_key, user_a, _) = dm_pair_key(sender, recipient);
     let field = if recipient == user_a {
@@ -216,7 +214,6 @@ pub async fn bump_dm_unread(db: &Database, sender: ObjectId, recipient: ObjectId
     }
 }
 
-/// Returns `false` when the tip unread write fails (callers must not treat as stable).
 pub async fn set_dm_unread(db: &Database, viewer: ObjectId, peer: ObjectId, unread: u64) -> bool {
     let (pair_key, user_a, _) = dm_pair_key(viewer, peer);
     let field = if viewer == user_a {
@@ -224,7 +221,6 @@ pub async fn set_dm_unread(db: &Database, viewer: ObjectId, peer: ObjectId, unre
     } else {
         "unreadB"
     };
-    // Tip row is created by upsert_dm_tip on send — no invent on miss (parity bump).
     match DmConversationTip::collection(db)
         .update_one(
             doc! { "pairKey": &pair_key },
@@ -237,7 +233,6 @@ pub async fn set_dm_unread(db: &Database, viewer: ObjectId, peer: ObjectId, unre
     }
 }
 
-/// `Ok(Some(n))` tip field present · `Ok(None)` missing tip/field · `Err(())` DB fail.
 async fn tip_unread_field(db: &Database, viewer: ObjectId, peer: ObjectId) -> Result<Option<u64>, ()> {
     let (pair_key, user_a, _) = dm_pair_key(viewer, peer);
     let tip = match DmConversationTip::collection(db)
@@ -257,8 +252,6 @@ async fn tip_unread_field(db: &Database, viewer: ObjectId, peer: ObjectId) -> Re
     })
 }
 
-/// Recount tip unread until stable. Returns `None` when count fails — callers
-/// must not emit absolute 0 from that (would clobber concurrent send).
 pub async fn try_sync_dm_tip_unread(
     db: &Database,
     viewer: ObjectId,
@@ -271,12 +264,10 @@ pub async fn try_sync_dm_tip_unread(
         if !set_dm_unread(db, viewer, peer, n).await {
             return None;
         }
-        // Tip read Err / missing field must not invent tip_n == n (false stable).
         let tip_n = match tip_unread_field(db, viewer, peer).await {
             Ok(Some(v)) => v,
             Ok(None) | Err(()) => return None,
         };
-        // Recount Err — do not invent tip-stable (would emit absolute under pressure).
         let Some(n2) = crate::utils::unread::try_count_dm_unread(db, viewer, peer).await else {
             return None;
         };
@@ -288,7 +279,6 @@ pub async fn try_sync_dm_tip_unread(
     if !set_dm_unread(db, viewer, peer, n).await {
         return None;
     }
-    // Final path: tip + recount must both match — no invent-stable under churn.
     match tip_unread_field(db, viewer, peer).await {
         Ok(Some(v)) if v == n => {}
         _ => return None,
@@ -302,8 +292,6 @@ pub async fn try_sync_dm_tip_unread(
 /// Recount tip unread and re-check until stable (max 3) so a concurrent send
 /// cannot be clobbered by a stale mark-read `set_dm_unread(0)`.
 /// Also re-reads the tip field so a late `$inc` after `$set` cannot stick.
-/// Prefer `try_sync_dm_tip_unread` before emitting absolute.
-/// Prefer `try_sync_dm_tip_unread` — this alias never invents 0 on count failure.
 pub async fn sync_dm_tip_unread(
     db: &Database,
     viewer: ObjectId,
@@ -343,7 +331,6 @@ pub async fn refresh_dm_tip_after_delete(
         .await
     {
         Ok(t) => t,
-        // Transient — do not invent "tip already moved" or force recompute/wipe.
         Err(_) => return,
     };
     if tip
@@ -373,7 +360,6 @@ pub async fn refresh_dm_tip_after_delete(
     {
         Ok(mut c) => match c.try_next().await {
             Ok(m) => m,
-            // Fail closed — do not delete tip on stream Err.
             Err(e) => {
                 log::warn!("refresh_dm_tip_after_delete try_next failed: {e}");
                 return;
@@ -428,7 +414,6 @@ pub async fn refresh_channel_tip_after_delete(
 ) {
     let ch = match Channel::find_by_id(db, channel_id).await {
         Ok(c) => c,
-        // Transient — do not invent "tip already moved" or force recompute/$unset.
         Err(_) => return,
     };
     if ch
@@ -464,7 +449,6 @@ pub async fn recompute_channel_tip(db: &Database, channel_id: ObjectId) {
     {
         Ok(mut c) => match c.try_next().await {
             Ok(m) => m,
-            // Fail closed — do not $unset tip on stream Err.
             Err(e) => {
                 log::warn!(
                     "recompute_channel_tip try_next failed channel={}: {e}",
@@ -512,7 +496,6 @@ pub async fn recompute_channel_tip(db: &Database, channel_id: ObjectId) {
 }
 
 /// peer → (lastAt, preview, lastId, denorm_unread).
-/// `None` when tip stream fails — callers must not invent false-zero unreads.
 pub async fn load_dm_tips_for_friends(
     db: &Database,
     uid: ObjectId,

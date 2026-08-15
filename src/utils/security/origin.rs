@@ -59,15 +59,24 @@ pub fn origin_allowed(value: &str, allowed: &[String]) -> bool {
         .any(|origin| value == origin || value.starts_with(&format!("{origin}/")))
 }
 
+use crate::utils::security::client_id::{
+    canonicalize_request_path, is_security_webhook_path,
+};
+
 /// Ścieżki zwolnione z kontroli Origin.
 pub fn is_origin_guard_exempt(path: &str) -> bool {
-    path == "/api" || path == "/api/" || path.starts_with("/api/security")
+    let path = canonicalize_request_path(path);
+    path == "/api" || is_security_webhook_path(&path)
 }
 
 pub fn requires_origin_guard(method: &Method, path: &str) -> bool {
-    if *method == Method::OPTIONS || is_origin_guard_exempt(path) {
+    if *method == Method::OPTIONS {
         return false;
     }
+    if (*method == Method::GET || *method == Method::HEAD) && is_origin_guard_exempt(path) {
+        return false;
+    }
+    let path = canonicalize_request_path(path);
     path.starts_with("/api") || path.starts_with("/whitelist")
 }
 

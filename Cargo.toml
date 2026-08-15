@@ -54,7 +54,7 @@ futures-util = "0.3"
 
 dotenvy = "0.15"
 uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 
 axum = { version = "0.8", features = ["ws"] }
 http = "1"

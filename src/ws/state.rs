@@ -43,6 +43,8 @@ pub struct SocketState {
     /// Per-user auth recheck throttle (one JWT lookup per user per interval).
     auth_recheck_started: Arc<StdMutex<HashMap<String, i64>>>,
     typing_gc_counter: Arc<AtomicU32>,
+    /// Live WebSocket upgrades currently counted (all IPs).
+    ws_total: Arc<AtomicU32>,
 }
 
 struct TypingJob {
@@ -61,6 +63,7 @@ struct TypingSlot {
 
 const MAX_CONNECTIONS_PER_USER: u32 = 6;
 const MAX_CONNECTIONS_PER_IP: u32 = 24;
+const MAX_GLOBAL_WS_CONNECTIONS: u32 = 2048;
 const CHAT_FIFO_CAP: usize = 128;
 const ACK_FIFO_CAP: usize = 128;
 const CALL_FIFO_CAP: usize = 64;
@@ -318,7 +321,6 @@ impl SocketState {
         true
     }
 
-    /// Returns `Some(is_first_connection)` if accepted, `None` if over limit.
     pub fn register_connection(&self, user_id: &str) -> Option<bool> {
         let mut map = self.connections.lock().unwrap_or_else(|e| e.into_inner());
         let count = map.entry(user_id.to_string()).or_insert(0);
@@ -330,10 +332,33 @@ impl SocketState {
         Some(first)
     }
 
+    pub fn can_accept_ip_connection(&self, ip: &str) -> bool {
+        if self.ws_total.load(Ordering::Relaxed) >= MAX_GLOBAL_WS_CONNECTIONS {
+            return false;
+        }
+        let map = self.ip_connections.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(ip).copied().unwrap_or(0) < MAX_CONNECTIONS_PER_IP
+    }
+
     pub fn register_ip_connection(&self, ip: &str) -> bool {
+        loop {
+            let current = self.ws_total.load(Ordering::Relaxed);
+            if current >= MAX_GLOBAL_WS_CONNECTIONS {
+                return false;
+            }
+            if self
+                .ws_total
+                .compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+
         let mut map = self.ip_connections.lock().unwrap_or_else(|e| e.into_inner());
         let count = map.entry(ip.to_string()).or_insert(0);
         if *count >= MAX_CONNECTIONS_PER_IP {
+            self.ws_total.fetch_sub(1, Ordering::SeqCst);
             return false;
         }
         *count += 1;
@@ -342,12 +367,19 @@ impl SocketState {
 
     pub fn unregister_ip_connection(&self, ip: &str) {
         let mut map = self.ip_connections.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = map.get_mut(ip) {
-            if *count <= 1 {
+        let removed = match map.get_mut(ip) {
+            Some(count) if *count <= 1 => {
                 map.remove(ip);
-            } else {
-                *count -= 1;
+                true
             }
+            Some(count) => {
+                *count -= 1;
+                true
+            }
+            None => false,
+        };
+        if removed {
+            self.ws_total.fetch_sub(1, Ordering::SeqCst);
         }
     }
 

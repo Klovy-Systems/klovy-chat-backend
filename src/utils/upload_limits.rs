@@ -63,6 +63,33 @@ pub const MAX_JSON_PAYLOAD_BYTES: u64 = 10 * 1024 * 1024;
 /// HTTP proxy buffer — 10 MB file plus multipart overhead.
 pub const MAX_HTTP_BODY_BYTES: usize = 11 * 1024 * 1024;
 
+/// GET/HEAD/OPTIONS/DELETE should not carry a large body.
+pub const MAX_EMPTY_METHOD_BODY_BYTES: usize = 16 * 1024;
+
+/// Path + query at the public hop. Bigger URIs are scanner/DoS noise.
+pub const MAX_PROXY_URI_BYTES: usize = 8192;
+
+/// Buffer limit at the public Axum hop, before bytes are read into RAM.
+pub fn max_proxy_body_bytes(method: &str, content_type: Option<&str>) -> usize {
+    if method.eq_ignore_ascii_case("GET")
+        || method.eq_ignore_ascii_case("HEAD")
+        || method.eq_ignore_ascii_case("OPTIONS")
+        || method.eq_ignore_ascii_case("DELETE")
+    {
+        return MAX_EMPTY_METHOD_BODY_BYTES;
+    }
+    let is_multipart = content_type
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("multipart/");
+    if is_multipart {
+        MAX_HTTP_BODY_BYTES
+    } else {
+        MAX_JSON_PAYLOAD_BYTES as usize
+    }
+}
+
 pub fn file_bytes_within_limit(size: u64, max: u64) -> bool {
     size <= max
 }
@@ -76,4 +103,35 @@ pub fn is_image_extension(ext: &str) -> bool {
         ext.to_ascii_lowercase().as_str(),
         "jpg" | "jpeg" | "png" | "webp"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_body_limit_is_small_for_reads() {
+        assert_eq!(max_proxy_body_bytes("GET", None), MAX_EMPTY_METHOD_BODY_BYTES);
+        assert_eq!(
+            max_proxy_body_bytes("DELETE", Some("application/json")),
+            MAX_EMPTY_METHOD_BODY_BYTES
+        );
+        assert_eq!(max_proxy_body_bytes("get", None), MAX_EMPTY_METHOD_BODY_BYTES);
+        assert_eq!(
+            max_proxy_body_bytes("POST", Some(" Multipart/Form-Data; boundary=x")),
+            MAX_HTTP_BODY_BYTES
+        );
+    }
+
+    #[test]
+    fn proxy_body_limit_allows_multipart_uploads() {
+        assert_eq!(
+            max_proxy_body_bytes("POST", Some("multipart/form-data; boundary=x")),
+            MAX_HTTP_BODY_BYTES
+        );
+        assert_eq!(
+            max_proxy_body_bytes("POST", Some("application/json")),
+            MAX_JSON_PAYLOAD_BYTES as usize
+        );
+    }
 }

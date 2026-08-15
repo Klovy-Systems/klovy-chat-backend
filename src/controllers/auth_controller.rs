@@ -68,7 +68,6 @@ fn req_user_id(req: &HttpRequest) -> Option<String> {
     req.extensions().get::<RequestUserId>().map(|u| u.0.clone())
 }
 
-/// Password verify: `Ok(bool)` · `Err(HttpResponse)` on runtime Unavailable (not bad password).
 async fn password_matches(plain: &str, hash: &str) -> Result<bool, HttpResponse> {
     match verify_user_password(plain, hash).await {
         Ok(v) => Ok(v),
@@ -78,7 +77,6 @@ async fn password_matches(plain: &str, hash: &str) -> Result<bool, HttpResponse>
     }
 }
 
-/// Step-up / TOTP infra Err → 503; bad code → 400.
 fn step_up_err_response(message: &str) -> HttpResponse {
     if message.starts_with("Temporarily unavailable") {
         HttpResponse::ServiceUnavailable().json(json!({ "message": message }))
@@ -1946,7 +1944,6 @@ pub async fn update_featured_badges(
 
     let featured_bson = match mongodb::bson::to_bson(&featured_ids) {
         Ok(b) => b,
-        // Fail closed — empty array would wipe featured badges.
         Err(_) => {
             return HttpResponse::InternalServerError().json(json!({
                 "success": false,

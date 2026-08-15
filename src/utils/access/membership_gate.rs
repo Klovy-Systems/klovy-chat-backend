@@ -11,7 +11,6 @@ use crate::utils::friends::try_is_dm_blocked;
 pub enum AccessDeniedReason {
     InvalidId,
     NotFound,
-    /// Transient DB/transport failure — callers must not cache as Denied.
     Unavailable,
     NotMember,
     Banned,

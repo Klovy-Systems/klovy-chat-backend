@@ -37,6 +37,7 @@ static LAST_AUTH_ATTEMPT: Lazy<Mutex<HashMap<String, Instant>>> =
 
 const MIN_AUTH_INTERVAL: Duration = Duration::from_secs(3);
 const FALLBACK_DELAY_BASE_MS: u64 = 1500;
+const LAST_AUTH_ATTEMPT_MAX: usize = 20_000;
 
 const HONEYPOT_FIELDS: &[&str] = &[
     "website",
@@ -92,6 +93,13 @@ fn too_soon_since_last_attempt(ip: &str) -> bool {
     let now = Instant::now();
     let mut map = LAST_AUTH_ATTEMPT.lock().unwrap_or_else(|e| e.into_inner());
     map.retain(|_, ts| now.duration_since(*ts) < Duration::from_secs(3600));
+    if map.len() > LAST_AUTH_ATTEMPT_MAX {
+        let overflow = map.len() - LAST_AUTH_ATTEMPT_MAX;
+        let keys: Vec<String> = map.keys().take(overflow).cloned().collect();
+        for key in keys {
+            map.remove(&key);
+        }
+    }
 
     if let Some(last) = map.get(ip) {
         if now.duration_since(*last) < MIN_AUTH_INTERVAL {

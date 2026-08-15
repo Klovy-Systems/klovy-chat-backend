@@ -19,7 +19,6 @@ pub use cache::{
 };
 
 /// `(viewer_blocks_peer, peer_blocks_viewer)` for DM block UI / errors.
-/// `Err(())` on Mongo lookup failure — do not treat as unblocked.
 pub async fn try_dm_block_flags(
     db: &Database,
     viewer: &str,
@@ -95,7 +94,6 @@ pub async fn is_dm_blocked(db: &Database, user_id1: &str, user_id2: &str) -> boo
     )
 }
 
-/// `Ok(true/false)` when block lookup succeeds; `Err(())` on Mongo failure.
 pub async fn try_is_dm_blocked(
     db: &Database,
     user_id1: &str,
@@ -109,7 +107,6 @@ pub async fn are_friends(db: &Database, user_id1: &str, user_id2: &str) -> bool 
     matches!(try_are_friends(db, user_id1, user_id2).await, Ok(true))
 }
 
-/// `Ok(true/false)` from cache or Mongo; `Err(())` on lookup failure (do not treat as not-friends).
 pub async fn try_are_friends(db: &Database, user_id1: &str, user_id2: &str) -> Result<bool, ()> {
     if user_id1.is_empty() || user_id2.is_empty() || user_id1 == user_id2 {
         return Ok(false);
@@ -139,7 +136,6 @@ pub async fn friend_ids(db: &Database, user_id: &str) -> Vec<String> {
     try_friend_ids(db, user_id).await.unwrap_or_default()
 }
 
-/// Like `friend_ids`, but `Err(())` when Mongo load fails (do not treat as empty).
 pub async fn try_friend_ids(db: &Database, user_id: &str) -> Result<Vec<String>, ()> {
     if let Some(cached) = get_cached_friend_ids(user_id) {
         return Ok(cached);

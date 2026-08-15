@@ -36,8 +36,6 @@ pub fn has_everyone_mention(content: &str) -> bool {
 }
 
 /// Resolve @username mentions among allowed users.
-/// `Ok(vec![])` when there are no usernames / no allowed ids.
-/// `Err(())` on Mongo failure — callers must fail closed (never invent empty mentions).
 pub async fn resolve_mentions(
     db: &Database,
     content: &str,

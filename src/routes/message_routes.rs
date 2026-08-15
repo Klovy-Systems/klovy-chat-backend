@@ -8,7 +8,7 @@ use crate::controllers::messages_controller::{
 use crate::middlewares::auth_middleware::{
     log_suspicious_activity, require_active_account, verify_token,
 };
-use crate::utils::ratelimit::{pin_message_limiter, upload_limiter};
+use crate::utils::ratelimit::{discovery_limiter, pin_message_limiter, upload_limiter};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
@@ -51,6 +51,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .wrap(from_fn(log_suspicious_activity("search-messages")))
             .wrap(from_fn(require_active_account))
             .wrap(from_fn(verify_token))
+            .wrap(from_fn(discovery_limiter))
             .route(web::post().to(search_messages)),
     );
     cfg.service(

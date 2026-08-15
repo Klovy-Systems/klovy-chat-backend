@@ -70,7 +70,6 @@ fn take_stale_locked(sessions: &mut HashMap<String, CallSession>) -> Vec<CallSes
 }
 
 /// Remove expired ringing + stale accepted sessions for notify / missed / end logs.
-/// Not rate-limited — callers finalize every drained session.
 pub fn drain_expired_sessions() -> Vec<CallSession> {
     let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     take_stale_locked(&mut sessions)

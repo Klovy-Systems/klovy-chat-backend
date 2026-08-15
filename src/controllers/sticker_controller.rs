@@ -75,7 +75,7 @@ async fn fetch_from_giphy(
     params: &[(&str, String)],
 ) -> Result<Vec<Value>, HttpResponse> {
     let url = format!("{}{}", GIPHY_BASE_URL, path);
-    let resp = match reqwest::Client::new()
+    let resp = match crate::utils::http_limits::outbound_http_client()
         .get(&url)
         .query(params)
         .header("Accept", "application/json")
@@ -96,7 +96,19 @@ async fn fetch_from_giphy(
             .json(json!({ "error": "Nie udało się pobrać naklejek z Giphy." })));
     }
 
-    let body: Value = match resp.json().await {
+    let bytes = match crate::utils::http_limits::read_response_limited(
+        resp,
+        crate::utils::http_limits::MAX_GIPHY_JSON_BYTES,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(HttpResponse::BadGateway()
+                .json(json!({ "error": "Nie udało się pobrać naklejek z Giphy." })))
+        }
+    };
+    let body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => {
             return Err(HttpResponse::BadGateway()

@@ -10,6 +10,7 @@ use once_cell::sync::Lazy;
 
 const ALLOW_TTL_MS: i64 = 45_000;
 const DENY_TTL_MS: i64 = 3_000;
+const CACHE_MAX: usize = 8_000;
 
 #[derive(Clone)]
 pub enum TypingAccess {
@@ -68,6 +69,13 @@ pub fn get(user_id: &str, chat_id: &str) -> Option<TypingAccess> {
 pub fn put(user_id: &str, chat_id: &str, entry: TypingAccess) {
     if let Ok(mut guard) = TYPING_ACCESS.lock() {
         guard.insert(key(user_id, chat_id), entry);
+        if guard.len() > CACHE_MAX {
+            let overflow = guard.len() - CACHE_MAX;
+            let keys: Vec<String> = guard.keys().take(overflow).cloned().collect();
+            for k in keys {
+                guard.remove(&k);
+            }
+        }
     }
 }
 

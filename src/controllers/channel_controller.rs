@@ -64,9 +64,7 @@ async fn serialize_channel_for_client(
     let ch_id = c.id.map(|o| o.to_hex()).unwrap_or_default();
     let is_muted = match mute_user {
         Ok(Some(u)) => u.muted_channels.iter().any(|id| Some(*id) == c.id),
-        // Missing user — fail closed (do not invent unmuted).
         Ok(None) => return None,
-        // Fail closed — do not report unmuted on lookup Err.
         Err(_) => return None,
     };
 
@@ -291,11 +289,9 @@ pub async fn get_user_channels(req: HttpRequest) -> HttpResponse {
 
     let muted_set: std::collections::HashSet<String> = match User::find_by_id(&db, uid).await {
         Ok(Some(u)) => u.muted_channels.iter().map(|o| o.to_hex()).collect(),
-        // Missing user mid-request — do not invent all unmuted.
         Ok(None) => {
             return HttpResponse::Unauthorized().json(json!({ "message": "Unauthorized" }));
         }
-        // Fail closed — do not report all channels as unmuted.
         Err(_) => {
             return HttpResponse::ServiceUnavailable()
                 .json(json!({ "message": "Channels temporarily unavailable. Please retry." }));
@@ -469,11 +465,9 @@ pub async fn get_channel_details(req: HttpRequest) -> HttpResponse {
     };
     let is_muted = match User::find_by_id(&db, viewer_oid).await {
         Ok(Some(u)) => u.muted_channels.iter().any(|id| *id == cid),
-        // Missing user — do not invent unmuted (parity get_user_channels / contacts).
         Ok(None) => {
             return HttpResponse::Unauthorized().json(json!({ "message": "Unauthorized" }));
         }
-        // Fail closed — do not report unmuted on lookup Err.
         Err(_) => {
             return HttpResponse::ServiceUnavailable().json(json!({
                 "message": "Channels temporarily unavailable. Please retry.",
@@ -1326,7 +1320,6 @@ pub async fn toggle_channel_mute(req: HttpRequest) -> HttpResponse {
 
     let muted_bson = match mongodb::bson::to_bson(&muted) {
         Ok(b) => b,
-        // Fail closed — empty array would unmute-all.
         Err(_) => {
             return HttpResponse::InternalServerError()
                 .json(json!({ "message": "Internal Server Error" }));

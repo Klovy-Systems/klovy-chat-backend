@@ -61,7 +61,6 @@ fn normalize_text(s: &str) -> String {
     mapped.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `None` on Mongo Err — callers must return 503 (never invent empty search results).
 async fn search_users_by_term(
     db: &mongodb::Database,
     exclude: ObjectId,
@@ -314,7 +313,6 @@ async fn dm_unread_counts_batch(
                 out.insert(fid, count);
             }
             Ok(None) => break,
-            // Fail closed — partial map would false-zero missing peers.
             Err(_) => return None,
         }
     }
@@ -373,7 +371,6 @@ async fn dm_last_messages_batch(
     ];
     let mut cursor = match Message::collection(db).aggregate(pipeline).await {
         Ok(c) => c,
-        // Tip fill failed — fail closed (parity channel batch; unread recount alone is insufficient).
         Err(_) => return None,
     };
     let mut filled: std::collections::HashMap<
@@ -437,7 +434,6 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
     let current_user = match User::find_by_id(&db, uid).await {
         Ok(Some(u)) => u,
         Ok(None) => {
-            // Missing user mid-request — do not invent unmuted/empty mute set.
             return HttpResponse::Unauthorized().body("Unauthorized");
         }
         Err(_) => {
@@ -503,7 +499,6 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
         .collect();
 
     let Some(last_map) = dm_last_messages_batch(&db, uid, &active_friend_ids).await else {
-        // Tip load failed — do not invent false-zero unreads for the whole list.
         return HttpResponse::ServiceUnavailable()
             .body("Contacts temporarily unavailable. Please retry.");
     };
@@ -528,7 +523,6 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
     } else {
         dm_unread_counts_batch(&db, uid, &need_unread).await
     };
-    // Recount required but failed — do not invent tip/false-zero for the list.
     let Some(unread_map) = unread_map else {
         return HttpResponse::ServiceUnavailable()
             .body("Contacts temporarily unavailable. Please retry.");
@@ -645,7 +639,6 @@ pub async fn toggle_contact_mute(req: HttpRequest) -> HttpResponse {
 
     let muted_bson = match mongodb::bson::to_bson(&muted) {
         Ok(b) => b,
-        // Fail closed — empty array would unmute-all.
         Err(_) => {
             return HttpResponse::InternalServerError()
                 .json(json!({ "message": "Internal Server Error" }));
@@ -783,7 +776,6 @@ pub async fn toggle_contact_block(req: HttpRequest) -> HttpResponse {
 
     let blocked_bson = match mongodb::bson::to_bson(&blocked) {
         Ok(b) => b,
-        // Fail closed — empty array would wipe all blocks.
         Err(_) => {
             return HttpResponse::InternalServerError()
                 .json(json!({ "message": "Internal Server Error" }));

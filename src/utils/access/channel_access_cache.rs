@@ -12,6 +12,7 @@ use crate::utils::access::membership_gate::AccessDeniedReason;
 
 const ALLOW_TTL_MS: i64 = 30_000;
 const DENY_TTL_MS: i64 = 3_000;
+const CACHE_MAX: usize = 8_000;
 
 #[derive(Clone)]
 enum Cached {
@@ -54,6 +55,17 @@ pub fn get(
     }
 }
 
+fn trim(map: &mut HashMap<String, Cached>) {
+    if map.len() <= CACHE_MAX {
+        return;
+    }
+    let overflow = map.len() - CACHE_MAX;
+    let keys: Vec<String> = map.keys().take(overflow).cloned().collect();
+    for key in keys {
+        map.remove(&key);
+    }
+}
+
 pub fn put_ok(channel_id: &str, user_id: &str, channel: Channel) {
     if let Ok(mut guard) = CACHE.lock() {
         guard.insert(
@@ -63,6 +75,7 @@ pub fn put_ok(channel_id: &str, user_id: &str, channel: Channel) {
                 channel,
             },
         );
+        trim(&mut guard);
     }
 }
 
@@ -75,6 +88,7 @@ pub fn put_err(channel_id: &str, user_id: &str, reason: AccessDeniedReason) {
                 reason,
             },
         );
+        trim(&mut guard);
     }
 }
 

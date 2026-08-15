@@ -9,7 +9,6 @@
 use actix_web::{
     body::{BoxBody, MessageBody},
     dev::{ServiceRequest, ServiceResponse},
-    http::Method,
     HttpResponse,
 };
 use actix_web_lab::middleware::Next;
@@ -17,44 +16,27 @@ use actix_web_lab::middleware::Next;
 use crate::middlewares::ip_blocker::IPBlockerArc;
 use crate::utils::client_ip::client_ip_from_service_request;
 use crate::utils::security::client_id::{
-    is_valid_client_identifier, query_client_valid, CLIENT_HEADER_NAME,
+    official_client_presented, CLIENT_HEADER_NAME,
 };
 
 /// Ścieżki zwolnione z wymogu identyfikatora klienta:
 /// - publiczny endpoint informacyjny / health-check (`/api`, `/api/`),
 /// - webhook bezpieczeństwa server-to-server (`/api/security/*`, chroniony Bearer).
-fn is_exempt(path: &str) -> bool {
-    path == "/api" || path == "/api/" || path.starts_with("/api/security")
-}
-
 pub async fn client_guard_middleware(
     req: ServiceRequest,
     next: Next<impl MessageBody + 'static>,
 ) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
     // Preflight CORS nie może nieść nagłówków niestandardowych — przepuszczamy.
-    if req.method() == Method::OPTIONS {
-        return Ok(next.call(req).await?.map_into_boxed_body());
-    }
-
-    let path = req.path();
-    let guarded = path.starts_with("/api") || path.starts_with("/whitelist");
-    if !guarded || is_exempt(path) {
-        return Ok(next.call(req).await?.map_into_boxed_body());
-    }
-
-    let valid = req
+    let path = req.path().to_string();
+    let method = req.method().as_str().to_string();
+    let query = req.query_string();
+    let query = (!query.is_empty()).then_some(query);
+    let header_value = req
         .headers()
         .get(CLIENT_HEADER_NAME)
-        .and_then(|v| v.to_str().ok())
-        .map(is_valid_client_identifier)
-        .unwrap_or(false);
+        .and_then(|v| v.to_str().ok());
 
-    if valid {
-        return Ok(next.call(req).await?.map_into_boxed_body());
-    }
-
-    // Nawigacja przeglądarki (np. OAuth connect) nie może nieść nagłówków — akceptuj ?client=
-    if req.method() == Method::GET && query_client_valid(Some(req.query_string())) {
+    if official_client_presented(&method, &path, query, header_value) {
         return Ok(next.call(req).await?.map_into_boxed_body());
     }
 

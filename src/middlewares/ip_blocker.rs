@@ -47,6 +47,9 @@ impl IPBlockerArc {
 
         let should_block = {
             let mut map = self.suspicious_activity.lock().unwrap_or_else(|e| e.into_inner());
+            if map.len() >= 20_000 {
+                map.retain(|_, entry| now.duration_since(entry.last_activity) <= block_duration);
+            }
             let entry = map.entry(ip.to_string()).or_insert(SuspiciousActivity {
                 count: 0,
                 last_activity: now,
@@ -62,8 +65,10 @@ impl IPBlockerArc {
         };
 
         if should_block {
-            self.block_ip_arc(ip, None);
-            log::warn!("IP {} blocked due to suspicious activity", ip);
+            if !self.is_blocked(ip) {
+                self.block_ip_arc(ip, None);
+                log::warn!("IP {} blocked due to suspicious activity", ip);
+            }
         }
     }
 
@@ -72,7 +77,13 @@ impl IPBlockerArc {
         let ip_owned = ip.to_string();
         let blocked_arc = Arc::clone(&self.blocked_ips);
 
-        self.blocked_ips.lock().unwrap_or_else(|e| e.into_inner()).insert(ip_owned.clone());
+        {
+            let mut set = self.blocked_ips.lock().unwrap_or_else(|e| e.into_inner());
+            if set.len() >= 10_000 && !set.contains(&ip_owned) {
+                return;
+            }
+            set.insert(ip_owned.clone());
+        }
 
         tokio::spawn(async move {
             sleep(duration).await;

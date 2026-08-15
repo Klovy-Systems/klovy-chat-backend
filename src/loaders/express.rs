@@ -23,9 +23,13 @@ use crate::middlewares::{
 };
 
 use crate::utils::ratelimit::{
-    auth_rate_limiter, global_limiter, send_limiter,
+    auth_rate_limiter, edge_http_allowed, global_limiter, send_limiter, try_acquire_http_slot,
+    HTTP_EDGE_TIMEOUT,
 };
-use crate::utils::upload_limits::{MAX_HTTP_BODY_BYTES, MAX_JSON_PAYLOAD_BYTES};
+use actix_multipart::form::MultipartFormConfig;
+use crate::utils::upload_limits::{
+    max_proxy_body_bytes, MAX_HTTP_BODY_BYTES, MAX_JSON_PAYLOAD_BYTES, MAX_PROXY_URI_BYTES,
+};
 
 use crate::utils::validators::{
     sanitize_input::sanitize_input_middleware,
@@ -229,6 +233,11 @@ pub fn create_app(
         .app_data(
             web::FormConfig::default()
                 .limit(MAX_JSON_PAYLOAD_BYTES as usize), 
+        )
+        .app_data(
+            MultipartFormConfig::default()
+                .total_limit(MAX_HTTP_BODY_BYTES)
+                .memory_limit(1024 * 1024),
         )
         .wrap(Compress::default())                     
         .wrap(from_fn(security_headers_middleware))        
@@ -503,6 +512,7 @@ pub async fn run_server() -> std::io::Result<()> {
     let socket_state = crate::ws::state::SocketState::new();
     let registry = crate::ws::registry::ConnectionRegistry::new();
     crate::ws::init(registry.clone());
+    let ip_blocker_http = ip_blocker.clone();
     let ws_state = crate::ws::WsAppState {
         socket_state,
         registry,
@@ -558,10 +568,19 @@ pub async fn run_server() -> std::io::Result<()> {
     let client2 = client.clone();
     let base2 = internal_base.clone();
 
+    fn proxy_json(status: http::StatusCode, body: String) -> Response<Body> {
+        Response::builder()
+            .status(status)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap_or_else(|_| Response::new(Body::empty()))
+    }
+
     async fn proxy_to_actix(
         req: Request<Body>,
         client: reqwest::Client,
         internal_base: String,
+        ip_blocker: std::sync::Arc<IPBlockerArc>,
     ) -> Result<Response<Body>, Infallible> {
         let method = req.method().clone();
         let path = req
@@ -569,6 +588,13 @@ pub async fn run_server() -> std::io::Result<()> {
             .path_and_query()
             .map(|x| x.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
+        if path.len() > MAX_PROXY_URI_BYTES {
+            return Ok(proxy_json(
+                http::StatusCode::URI_TOO_LONG,
+                r#"{"error":"URI too long"}"#.to_string(),
+            ));
+        }
+
         let url = format!("{internal_base}{path}");
 
         let (parts, body) = req.into_parts();
@@ -578,7 +604,72 @@ pub async fn run_server() -> std::io::Result<()> {
             .map(|info| info.0);
         let client_ip = crate::utils::client_ip::client_ip_from_headers(&parts.headers, peer);
 
-        let body_bytes = match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
+        if ip_blocker.is_blocked(&client_ip) {
+            return Ok(proxy_json(
+                http::StatusCode::FORBIDDEN,
+                r#"{"error":"Access denied"}"#.to_string(),
+            ));
+        }
+
+        if let Err(retry_after) = edge_http_allowed(&client_ip) {
+            let mut response = proxy_json(
+                http::StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    r#"{{"error":"Too many requests from this IP, please try again later.","retryAfter":{retry_after}}}"#
+                ),
+            );
+            if let Ok(value) = http::HeaderValue::from_str(&retry_after.to_string()) {
+                response.headers_mut().insert(http::header::RETRY_AFTER, value);
+            }
+            return Ok(response);
+        }
+
+        let path_only = parts.uri.path();
+        let client_header = parts
+            .headers
+            .get(crate::utils::security::client_id::CLIENT_HEADER_NAME)
+            .and_then(|value| value.to_str().ok());
+        if !crate::utils::security::client_id::official_client_presented(
+            method.as_str(),
+            path_only,
+            parts.uri.query(),
+            client_header,
+        ) {
+            ip_blocker.add_suspicious_activity(&client_ip);
+            return Ok(proxy_json(
+                http::StatusCode::BAD_REQUEST,
+                r#"{"error":"Unsupported client"}"#.to_string(),
+            ));
+        }
+
+        let content_type = parts
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        let max_body = max_proxy_body_bytes(method.as_str(), content_type);
+        if let Some(declared) = parts
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            if declared > max_body {
+                return Ok(proxy_json(
+                    http::StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"Payload too large"}"#.to_string(),
+                ));
+            }
+        }
+
+        let Some(_http_slot) = try_acquire_http_slot() else {
+            return Ok(proxy_json(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"Server busy"}"#.to_string(),
+            ));
+        };
+
+        let proxy_work = async {
+        let body_bytes = match axum::body::to_bytes(body, max_body).await {
             Ok(bytes) => bytes,
             Err(_) => {
                 return Ok(Response::builder()
@@ -646,7 +737,27 @@ pub async fn run_server() -> std::io::Result<()> {
             Ok(resp) => {
                 let status = resp.status();
                 let headers = resp.headers().clone();
-                let bytes = resp.bytes().await.unwrap_or_default();
+                let bytes = match crate::utils::http_limits::read_response_limited(
+                    resp,
+                    crate::utils::http_limits::MAX_PROXY_RESPONSE_BYTES,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(crate::utils::http_limits::LimitedBodyError::TooLarge) => {
+                        log::error!(
+                            "HTTP proxy response too large path={path} body_bytes={body_len}"
+                        );
+                        return Ok(Response::builder()
+                            .status(http::StatusCode::BAD_GATEWAY)
+                            .header(http::header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                r#"{"error":"Bad Gateway","detail":"internal proxy"}"#,
+                            ))
+                            .unwrap_or_else(|_| Response::new(Body::empty())));
+                    }
+                    Err(_) => Vec::new(),
+                };
                 let mut builder = Response::builder().status(status);
                 for (k, v) in headers.iter() {
                     if k == http::header::TRANSFER_ENCODING {
@@ -674,6 +785,18 @@ pub async fn run_server() -> std::io::Result<()> {
                     .unwrap_or_else(|_| Response::new(Body::empty())))
             }
         }
+        };
+
+        match tokio::time::timeout(HTTP_EDGE_TIMEOUT, proxy_work).await {
+            Ok(response) => response,
+            Err(_) => {
+                log::warn!("HTTP proxy timed out path={path}");
+                Ok(proxy_json(
+                    http::StatusCode::REQUEST_TIMEOUT,
+                    r#"{"error":"Request timeout"}"#.to_string(),
+                ))
+            }
+        }
     }
 
     let app = Router::new()
@@ -682,7 +805,8 @@ pub async fn run_server() -> std::io::Result<()> {
         .fallback(move |req: Request<Body>| {
             let c = client2.clone();
             let b = base2.clone();
-            async move { proxy_to_actix(req, c, b).await }
+            let blocker = ip_blocker_http.clone();
+            async move { proxy_to_actix(req, c, b, blocker).await }
         })
         .layer(middleware::from_fn(public_security_headers))
         .with_state(ws_state);

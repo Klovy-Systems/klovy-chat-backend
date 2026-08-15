@@ -58,3 +58,155 @@ pub fn query_param(raw_query: Option<&str>, name: &str) -> Option<String> {
         }
     })
 }
+
+fn from_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_loose(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push((high << 4) | low);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+pub(crate) fn canonicalize_request_path(path: &str) -> String {
+    let decoded = percent_decode_loose(path);
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in decoded.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            segments.pop();
+            continue;
+        }
+        segments.push(segment);
+    }
+    if segments.is_empty() {
+        return "/".to_string();
+    }
+    let mut out = String::from("/");
+    out.push_str(&segments.join("/").to_ascii_lowercase());
+    out
+}
+
+pub(crate) fn is_security_webhook_path(path: &str) -> bool {
+    path == "/api/security" || path.starts_with("/api/security/")
+}
+
+fn is_public_info_path(path: &str) -> bool {
+    path == "/" || path == "/api"
+}
+
+/// True when this HTTP path must present `X-Klovy-Client` (or `?client=` on GET).
+pub fn requires_client_identifier(path: &str) -> bool {
+    let path = canonicalize_request_path(path);
+    !is_public_info_path(&path) && !is_security_webhook_path(&path)
+}
+
+/// Cheap official-client check for Axum (before body) and Actix (defense in depth).
+pub fn official_client_presented(
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    header_value: Option<&str>,
+) -> bool {
+    if method.eq_ignore_ascii_case("OPTIONS") {
+        return true;
+    }
+    let path = canonicalize_request_path(path);
+    let method_upper = method.to_ascii_uppercase();
+    if matches!(method_upper.as_str(), "GET" | "HEAD")
+        && (is_public_info_path(&path) || is_security_webhook_path(&path))
+    {
+        return true;
+    }
+    if header_value.is_some_and(is_valid_client_identifier) {
+        return true;
+    }
+    method_upper == "GET" && query_client_valid(query)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_mutations_require_client_header() {
+        assert!(!official_client_presented("POST", "/api/auth/login", None, None));
+        assert!(official_client_presented(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some("KlovyChatApp/1.0.0"),
+        ));
+    }
+
+    #[test]
+    fn health_and_preflight_are_exempt() {
+        assert!(official_client_presented("GET", "/api", None, None));
+        assert!(official_client_presented("GET", "/api/", None, None));
+        assert!(official_client_presented("OPTIONS", "/api/messages", None, None));
+        assert!(official_client_presented(
+            "GET",
+            "/api/auth/oauth",
+            Some("client=KlovyChatApp"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn odd_paths_still_require_client_header() {
+        assert!(!official_client_presented("POST", "/", None, None));
+        assert!(!official_client_presented(
+            "POST",
+            "//api/auth/login",
+            None,
+            None,
+        ));
+        assert!(!official_client_presented("POST", "/API/auth/login", None, None));
+        assert!(official_client_presented(
+            "POST",
+            "//API/auth/login",
+            None,
+            Some("KlovyChatApp/1.0.0"),
+        ));
+        assert!(!official_client_presented(
+            "POST",
+            "/api/security",
+            None,
+            None,
+        ));
+        assert!(!official_client_presented(
+            "POST",
+            "/api/securityfoo",
+            None,
+            None,
+        ));
+        assert!(official_client_presented("GET", "/api/security/report", None, None));
+        assert!(!official_client_presented(
+            "POST",
+            "/%2e%2e/api/auth/login",
+            None,
+            None,
+        ));
+        assert!(official_client_presented("GET", "/%61pi", None, None));
+    }
+}

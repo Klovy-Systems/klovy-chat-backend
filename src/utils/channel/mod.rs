@@ -72,7 +72,6 @@ fn user_to_list_admin(db_value: Option<&Value>, admin_id: ObjectId) -> Value {
 }
 
 /// Slim channel payload for sidebar list / channel-added WS (no member roster).
-/// Returns `None` when mute lookup or unread enrich fails — callers must not invent unmuted/zero.
 pub async fn serialize_channel_list_item(
     db: &Database,
     channel: &Channel,
@@ -83,9 +82,7 @@ pub async fn serialize_channel_list_item(
     let ch_id = channel.id.map(|o| o.to_hex()).unwrap_or_default();
     let is_muted = match User::find_by_id(db, viewer_id).await {
         Ok(Some(u)) => u.muted_channels.iter().any(|id| Some(*id) == channel.id),
-        // Missing user — fail closed (do not invent unmuted).
         Ok(None) => return None,
-        // Fail closed — do not report unmuted on lookup Err.
         Err(_) => return None,
     };
     let (unread, last) = enrich_channel_unread(db, viewer_id, channel).await?;
@@ -247,7 +244,6 @@ pub async fn get_channel_ban_mute_lists(
 }
 
 /// Tip + unread for one channel. Tip is resolved before unread trust.
-/// Returns `None` on read-state / tip-query failure (callers must not invent 0).
 pub async fn enrich_channel_unread(
     db: &Database,
     user_id: ObjectId,
@@ -289,7 +285,6 @@ pub async fn enrich_channel_unread(
 
     let state = match ChannelReadState::find(db, user_id, channel_id).await {
         Ok(s) => s,
-        // Mongo Err ≠ missing row — fail closed (batch path returns None).
         Err(_) => return None,
     };
 
@@ -318,13 +313,11 @@ pub async fn enrich_channel_unread(
             // behind_tip / stale_high: always recount.
             match crate::utils::unread::try_count_channel_unread(db, user_id, channel_id).await {
                 Some(n) => n,
-                // Sticky positive denorm over undercount; never invent 0 when verify required.
                 None if s.unread_count > 0 => s.unread_count,
                 None => return None,
             }
         }
     } else if tip.is_some() {
-        // Tip present + no read-state — never invent caught-up 0 (failed seed).
         return None;
     } else {
         // Empty channel (no tip, no row) — truly caught up.
@@ -336,7 +329,6 @@ pub async fn enrich_channel_unread(
 
 /// Batch last-message + unread for many channels (one read-state query + unread agg).
 /// Last-message prefers denormalized channel tip fields when present.
-/// Returns `None` when read-state stream fails — callers must not invent all-zero.
 pub async fn enrich_channels_batch(
     db: &Database,
     user_id: ObjectId,
@@ -401,7 +393,6 @@ pub async fn enrich_channels_batch(
                             }
                         }
                         Ok(None) => break,
-                        // Mid-stream Err — fail closed (parity with contacts tip 503).
                         Err(_) => return None,
                     }
                 }
@@ -424,7 +415,6 @@ pub async fn enrich_channels_batch(
         Ok(cursor) => {
             let states: Vec<ChannelReadState> = match cursor.try_collect().await {
                 Ok(s) => s,
-                // Fail closed — partial state would leave missing channels at init 0.
                 Err(_) => return None,
             };
             for s in states {
@@ -453,7 +443,6 @@ pub async fn enrich_channels_batch(
                     missing_unread.push(s.channel_id);
                 }
             }
-            // Tip present but no read-state — fail closed (parity single enrich; no epoch invent).
             for cid in &channel_ids {
                 if last_reads.contains_key(cid) {
                     continue;
@@ -464,7 +453,6 @@ pub async fn enrich_channels_batch(
             }
         }
         Err(_) => {
-            // Query failed — do not invent all-zero badges.
             return None;
         }
     }
@@ -520,7 +508,6 @@ pub async fn enrich_channels_batch(
                 }
             }
             Err(_) => {
-                // Recount failed — fail closed (parity with contacts tip 503).
                 return None;
             }
         }

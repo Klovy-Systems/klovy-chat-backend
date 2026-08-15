@@ -69,7 +69,8 @@ struct IncomingFrame {
 const PING_INTERVAL: Duration = Duration::from_secs(45);
 const PONG_TIMEOUT: Duration = Duration::from_secs(90);
 const AUTH_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
-const MAX_PAYLOAD: usize = 1_000_000;
+const MAX_PAYLOAD: usize = 64 * 1024;
+const MAX_PING_PAYLOAD: usize = 1024;
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -78,6 +79,11 @@ pub async fn ws_handler(
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
+    if raw_query.as_deref().is_some_and(|q| q.len() > crate::utils::upload_limits::MAX_PROXY_URI_BYTES)
+    {
+        return (StatusCode::URI_TOO_LONG, "URI too long").into_response();
+    }
+
     if !is_origin_header_allowed(&headers) {
         log::warn!("WebSocket rejected — invalid origin");
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
@@ -101,9 +107,24 @@ pub async fn ws_handler(
         return (StatusCode::BAD_REQUEST, "Unsupported client").into_response();
     }
 
-    if !crate::utils::ratelimit::ws_handshake_allowed(&client_ip) {
+    if let Err(retry_after) = crate::utils::ratelimit::ws_handshake_allowed(&client_ip) {
         log::warn!("WebSocket rejected — handshake rate limit for IP {}", client_ip);
-        return (StatusCode::TOO_MANY_REQUESTS, "Too many requests").into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            "Too many requests",
+        )
+            .into_response();
+    }
+
+    if !app_state.socket_state.can_accept_ip_connection(&client_ip) {
+        log::warn!("WebSocket rejected — too many connections from IP {}", client_ip);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "60")],
+            "Too many connections",
+        )
+            .into_response();
     }
 
     let cookie_header = headers
@@ -176,31 +197,17 @@ pub async fn ws_handler(
         None
     };
 
-    if !app_state
-        .socket_state
-        .register_ip_connection(&client_ip)
-    {
-        log::warn!("WebSocket rejected — too many connections from IP {}", client_ip);
-        return (StatusCode::TOO_MANY_REQUESTS, "Too many connections").into_response();
-    }
-
     let encryption_required = ws_frame_encryption_required();
     let crypto_token = query_param(raw_query.as_deref(), WS_CRYPTO_QUERY_PARAM);
     let frame_key = if encryption_required {
         let Some(token) = crypto_token.as_deref() else {
             log::warn!("WebSocket rejected — missing frame encryption token for user {}", user_id);
-            app_state
-                .socket_state
-                .unregister_ip_connection(&client_ip);
             return (StatusCode::FORBIDDEN, "Encryption required").into_response();
         };
         match consume_ws_crypto_key(token, &user_id) {
             Some(key) => Some(key),
             None => {
                 log::warn!("WebSocket rejected — invalid frame encryption token for user {}", user_id);
-                app_state
-                    .socket_state
-                    .unregister_ip_connection(&client_ip);
                 return (StatusCode::FORBIDDEN, "Invalid encryption token").into_response();
             }
         }
@@ -261,6 +268,11 @@ async fn handle_socket(
     frame_key: Option<[u8; 32]>,
     app_state: WsAppState,
 ) {
+    if !app_state.socket_state.register_ip_connection(&client_ip) {
+        log::warn!("WebSocket dropped after upgrade — connection cap for {}", client_ip);
+        return;
+    }
+
     let Some(is_first_connection) = app_state.socket_state.register_connection(&user_id)
     else {
         log::warn!("Too many connections for user {}", user_id);
@@ -451,6 +463,9 @@ async fn handle_socket(
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
+                        if data.len() > MAX_PING_PAYLOAD {
+                            continue;
+                        }
                         if ws_sender.send(Message::Pong(data)).await.is_err() {
                             break;
                         }

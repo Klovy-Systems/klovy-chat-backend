@@ -88,31 +88,49 @@ pub async fn verify_turnstile_token(
         .send()
         .await
     {
-        Ok(resp) => match resp.json::<TurnstileResponse>().await {
-            Ok(data) if data.success == Some(true) => TurnstileOutcome::Verified,
-            Ok(data) => {
-                log::warn!(
-                    "Turnstile verification failed: error-codes={:?}",
-                    data.error_codes
-                );
-                let res = HttpResponse::BadRequest()
-                    .json(serde_json::json!({ "error": "Invalid Turnstile token" }));
-                return Ok(ServiceResponse::new(http_req, res));
-            }
-            Err(e) => {
-                // Could not parse Cloudflare's response — fall back to the guard
-                // instead of hard-failing legitimate users.
-                log::warn!("Turnstile response parse error: {e}");
-                if is_production() && is_signup_path(http_req.path()) {
-                    let res = HttpResponse::ServiceUnavailable().json(serde_json::json!({
-                        "error": "Captcha verification is temporarily unavailable. Try again later.",
-                        "code": "TURNSTILE_UNAVAILABLE"
-                    }));
-                    return Ok(ServiceResponse::new(http_req, res));
+        Ok(resp) => {
+            match crate::utils::http_limits::read_response_limited(
+                resp,
+                crate::utils::http_limits::MAX_TURNSTILE_BYTES,
+            )
+            .await
+            {
+                Ok(bytes) => match serde_json::from_slice::<TurnstileResponse>(&bytes) {
+                    Ok(data) if data.success == Some(true) => TurnstileOutcome::Verified,
+                    Ok(data) => {
+                        log::warn!(
+                            "Turnstile verification failed: error-codes={:?}",
+                            data.error_codes
+                        );
+                        let res = HttpResponse::BadRequest()
+                            .json(serde_json::json!({ "error": "Invalid Turnstile token" }));
+                        return Ok(ServiceResponse::new(http_req, res));
+                    }
+                    Err(e) => {
+                        log::warn!("Turnstile response parse error: {e}");
+                        if is_production() && is_signup_path(http_req.path()) {
+                            let res = HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                                "error": "Captcha verification is temporarily unavailable. Try again later.",
+                                "code": "TURNSTILE_UNAVAILABLE"
+                            }));
+                            return Ok(ServiceResponse::new(http_req, res));
+                        }
+                        TurnstileOutcome::Bypassed
+                    }
+                },
+                Err(e) => {
+                    log::warn!("Turnstile response body error: {e:?}");
+                    if is_production() && is_signup_path(http_req.path()) {
+                        let res = HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                            "error": "Captcha verification is temporarily unavailable. Try again later.",
+                            "code": "TURNSTILE_UNAVAILABLE"
+                        }));
+                        return Ok(ServiceResponse::new(http_req, res));
+                    }
+                    TurnstileOutcome::Bypassed
                 }
-                TurnstileOutcome::Bypassed
             }
-        },
+        }
         Err(e) => {
             log::warn!("Turnstile siteverify request error: {e}");
             if is_production() && is_signup_path(http_req.path()) {

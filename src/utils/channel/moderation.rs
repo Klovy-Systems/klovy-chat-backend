@@ -154,7 +154,6 @@ pub async fn populate_moderation_user_list(
     out
 }
 
-/// `None` when channel lookup fails under Mongo Err (callers must not invent empty lists).
 pub async fn get_channel_ban_mute_lists(
     db: &Database,
     channel_id: ObjectId,

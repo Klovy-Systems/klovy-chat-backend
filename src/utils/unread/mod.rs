@@ -198,7 +198,6 @@ fn dm_only() -> mongodb::bson::Document {
     doc! { "$or": [ { "channel": mongodb::bson::Bson::Null }, { "channel": { "$exists": false } } ] }
 }
 
-/// Prefer `try_count_dm_unread` — never invents 0 on Mongo failure.
 pub async fn count_dm_unread(
     db: &Database,
     user_id: ObjectId,
@@ -235,7 +234,6 @@ pub async fn try_count_dm_unread(
     }
 }
 
-/// Prefer `try_count_channel_unread` — never invents 0 on Mongo failure.
 pub async fn count_channel_unread(
     db: &Database,
     user_id: ObjectId,
@@ -253,7 +251,6 @@ pub async fn try_count_channel_unread(
     // with a stale lastReadAt. Epoch lastReadAt falls back to createdAt so legacy
     // bump-before-seed rows cannot explode the badge to full history.
     for _ in 0..3 {
-        // Mongo Err ≠ missing row — never invent caught-up 0 under pressure.
         let state = match ChannelReadState::find(db, user_id, channel_id).await {
             Ok(s) => s,
             Err(_) => return None,
@@ -261,7 +258,6 @@ pub async fn try_count_channel_unread(
         let last_read = match state.as_ref() {
             Some(s) if s.last_read_at.timestamp_millis() <= 0 => s.created_at,
             Some(s) => s.last_read_at,
-            // Missing row ≠ caught up — fail closed (sync must not emit absolute 0).
             None => return None,
         };
 
@@ -292,11 +288,9 @@ pub async fn try_count_channel_unread(
             return Some(n);
         }
     }
-    // Watermark never stabilized — fail closed (do not invent stable count).
     None
 }
 
-/// `Ok(Some(n))` denorm present · `Ok(None)` missing row · `Err(())` DB fail.
 async fn channel_unread_denorm(
     db: &Database,
     user_id: ObjectId,
@@ -309,7 +303,6 @@ async fn channel_unread_denorm(
     }
 }
 
-/// Returns `false` when the denorm write fails (callers must not treat as stable).
 pub async fn set_channel_unread_denorm(
     db: &Database,
     user_id: ObjectId,
@@ -344,7 +337,6 @@ pub async fn set_channel_unread_denorm(
 }
 
 /// Recount + denorm until stable (parity with `sync_dm_tip_unread`).
-/// Returns `None` when count fails — callers must not emit absolute 0 from that.
 pub async fn try_sync_channel_unread(
     db: &Database,
     user_id: ObjectId,
@@ -357,12 +349,10 @@ pub async fn try_sync_channel_unread(
         if !set_channel_unread_denorm(db, user_id, channel_id, n).await {
             return None;
         }
-        // Denorm read Err / missing row must not invent denorm == n (false stable).
         let denorm = match channel_unread_denorm(db, user_id, channel_id).await {
             Ok(Some(v)) => v,
             Ok(None) | Err(()) => return None,
         };
-        // Recount Err — do not invent denorm-stable (would emit absolute under pressure).
         let Some(n2) = try_count_channel_unread(db, user_id, channel_id).await else {
             return None;
         };
@@ -374,7 +364,6 @@ pub async fn try_sync_channel_unread(
     if !set_channel_unread_denorm(db, user_id, channel_id, n).await {
         return None;
     }
-    // Final path: denorm + recount must both match — no invent-stable under churn.
     match channel_unread_denorm(db, user_id, channel_id).await {
         Ok(Some(v)) if v == n => {}
         _ => return None,
@@ -385,7 +374,6 @@ pub async fn try_sync_channel_unread(
     }
 }
 
-/// Prefer `try_sync_channel_unread` — this alias never invents 0 on count failure.
 pub async fn sync_channel_unread(
     db: &Database,
     user_id: ObjectId,

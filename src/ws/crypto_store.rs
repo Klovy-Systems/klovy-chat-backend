@@ -8,6 +8,7 @@ use rand::RngCore;
 use uuid::Uuid;
 
 const TOKEN_TTL: Duration = Duration::from_secs(30);
+const MAX_PENDING_KEYS: usize = 4_096;
 
 struct PendingKey {
     key: [u8; 32],
@@ -29,6 +30,15 @@ pub fn issue_ws_crypto_key(user_id: &str) -> (String, String) {
 
     let mut map = STORE.lock().unwrap_or_else(|e| e.into_inner());
     purge_expired(&mut map);
+    if map.len() >= MAX_PENDING_KEYS {
+        if let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, entry)| entry.expires_at)
+            .map(|(token, _)| token.clone())
+        {
+            map.remove(&oldest);
+        }
+    }
     map.insert(
         token.clone(),
         PendingKey {

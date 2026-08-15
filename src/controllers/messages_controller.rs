@@ -546,7 +546,6 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
 
     let mentions_bson = match mongodb::bson::to_bson(&mentions) {
         Ok(b) => b,
-        // Fail closed — empty array would wipe stored mentions.
         Err(_) => {
             return HttpResponse::InternalServerError().json(json!({
                 "error": "Internal server error",
@@ -669,7 +668,6 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
                             Err(_) => None,
                         }
                     } else {
-                        // Channel missing or find Err — fail closed (no mention spam).
                         None
                     }
                 } else if let Some(recipient) = updated.recipient {
@@ -698,7 +696,6 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
                                 Some(std::collections::HashSet::new())
                             }
                         }
-                        // Missing user — fail closed (do not invent unmuted for mentions).
                         Ok(None) => None,
                         Err(_) => None,
                     }

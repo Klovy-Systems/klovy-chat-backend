@@ -131,7 +131,6 @@ pub async fn hash_backup_codes(codes: &[String]) -> Result<Vec<String>, String> 
     Ok(hashed)
 }
 
-/// `Ok(Some(i))` matched · `Ok(None)` no match · `Err(())` verify runtime failure.
 pub async fn verify_and_consume_backup_code(
     code: &str,
     stored_hashes: &[String],

@@ -124,7 +124,6 @@ pub async fn user_from_jwt_with_refresh(
         return Err(JwtUserError::Denied);
     }
 
-    // Key/config failure ≠ bad credentials — WS must not treat as 401 Denied.
     let key = jwt_decoding_key().map_err(|_| JwtUserError::Unavailable)?;
     let payload = decode::<TokenPayload>(token, &key, &hs256_validation())
         .map_err(|_| JwtUserError::Denied)?

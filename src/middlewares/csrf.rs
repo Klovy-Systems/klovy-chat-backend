@@ -8,6 +8,8 @@ use actix_web_lab::middleware::Next;
 
 use crate::utils::security::csrf::{constant_time_eq, CSRF_COOKIE_NAME, CSRF_HEADER_NAME};
 
+use crate::utils::security::client_id::canonicalize_request_path;
+
 fn is_exempt(path: &str) -> bool {
     const EXACT: &[&str] = &[
         "/api/auth/login",
@@ -19,11 +21,8 @@ fn is_exempt(path: &str) -> bool {
         "/api/auth/refresh",
     ];
 
-    if EXACT.iter().any(|p| path == *p) {
-        return true;
-    }
-
-    path.starts_with("/api/security")
+    let path = canonicalize_request_path(path);
+    EXACT.iter().any(|p| path == *p)
 }
 
 pub async fn csrf_middleware(

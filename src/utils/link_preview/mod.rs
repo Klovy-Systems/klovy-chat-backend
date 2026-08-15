@@ -8,7 +8,7 @@ use serde::Serialize;
 
 static PREVIEW_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
-        .redirect(Policy::limited(3))
+        .redirect(Policy::none())
         .timeout(Duration::from_secs(6))
         .user_agent("KlovyChatLinkPreview/1.0")
         .build()
@@ -16,6 +16,7 @@ static PREVIEW_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 });
 
 const MAX_HTML_BYTES: usize = 512 * 1024;
+const MAX_PREVIEW_REDIRECTS: usize = 3;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,15 +32,25 @@ pub struct LinkPreview {
     pub site_name: Option<String>,
 }
 
-fn is_private_ip(ip: IpAddr) -> bool {
+fn canonicalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        other => other,
+    }
+}
+
+fn ip_is_disallowed(ip: IpAddr) -> bool {
+    match canonicalize_ip(ip) {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
-                || v4.octets()[0] == 0
+                || o[0] == 0
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+                || (o[0] == 198 && matches!(o[1], 18 | 19))
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -62,15 +73,32 @@ fn host_is_blocked(host: &str) -> bool {
         return true;
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return is_private_ip(ip);
+        return ip_is_disallowed(ip);
     }
     if let Ok(v4) = host.parse::<Ipv4Addr>() {
-        return is_private_ip(IpAddr::V4(v4));
+        return ip_is_disallowed(IpAddr::V4(v4));
     }
     if let Ok(v6) = host.parse::<Ipv6Addr>() {
-        return is_private_ip(IpAddr::V6(v6));
+        return ip_is_disallowed(IpAddr::V6(v6));
     }
     false
+}
+
+async fn host_resolves_public(host: &str) -> bool {
+    if host_is_blocked(host) {
+        return false;
+    }
+    let Ok(addrs) = tokio::net::lookup_host((host, 443)).await else {
+        return false;
+    };
+    let mut saw_any = false;
+    for addr in addrs {
+        saw_any = true;
+        if ip_is_disallowed(addr.ip()) {
+            return false;
+        }
+    }
+    saw_any
 }
 
 pub fn is_safe_preview_target(url: &str) -> bool {
@@ -175,61 +203,112 @@ fn extract_title(html: &str) -> Option<String> {
 }
 
 pub async fn fetch_link_preview(url: &str) -> Result<LinkPreview, &'static str> {
-    if !is_safe_preview_target(url) {
-        return Err("Invalid preview URL.");
+    let mut current = reqwest::Url::parse(url.trim()).map_err(|_| "Invalid preview URL.")?;
+    let mut hops = 0usize;
+
+    loop {
+        if !is_safe_preview_target(current.as_str()) {
+            return Err("Invalid preview URL.");
+        }
+        let Some(host) = current.host_str().map(str::to_string) else {
+            return Err("Invalid preview URL.");
+        };
+        if !host_resolves_public(&host).await {
+            return Err("Invalid preview URL.");
+        }
+
+        let response = PREVIEW_CLIENT
+            .get(current.clone())
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .map_err(|_| "Failed to fetch preview.")?;
+
+        if response.status().is_redirection() {
+            if hops >= MAX_PREVIEW_REDIRECTS {
+                return Err("Preview unavailable.");
+            }
+            hops += 1;
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or("Preview unavailable.")?;
+            current = current
+                .join(location)
+                .or_else(|_| reqwest::Url::parse(location))
+                .map_err(|_| "Invalid preview URL.")?;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            return Err("Preview unavailable.");
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        if !content_type.contains("text/html") && !content_type.contains("application/xhtml") {
+            return Err("Preview unavailable.");
+        }
+
+        let bytes = crate::utils::http_limits::read_response_limited(response, MAX_HTML_BYTES)
+            .await
+            .map_err(|err| match err {
+                crate::utils::http_limits::LimitedBodyError::TooLarge => "Preview too large.",
+                crate::utils::http_limits::LimitedBodyError::ReadFailed => {
+                    "Failed to read preview."
+                }
+            })?;
+
+        let html = String::from_utf8_lossy(&bytes);
+        let title = extract_title(&html);
+        let description = meta_content(&html, "og:description")
+            .or_else(|| meta_content(&html, "twitter:description"))
+            .or_else(|| meta_content(&html, "description"));
+        let site_name = meta_content(&html, "og:site_name");
+        let image = meta_content(&html, "og:image")
+            .or_else(|| meta_content(&html, "twitter:image"))
+            .or_else(|| meta_content(&html, "twitter:image:src"))
+            .and_then(|raw| normalize_preview_image(&current, &raw));
+
+        if title.is_none() && description.is_none() && image.is_none() {
+            return Err("Preview unavailable.");
+        }
+
+        return Ok(LinkPreview {
+            url: current.to_string(),
+            title,
+            description,
+            image,
+            site_name,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_loopback_and_cgnat_ips() {
+        assert!(ip_is_disallowed("127.0.0.1".parse().unwrap()));
+        assert!(ip_is_disallowed("10.0.0.1".parse().unwrap()));
+        assert!(ip_is_disallowed("100.64.0.1".parse().unwrap()));
+        assert!(ip_is_disallowed("::1".parse().unwrap()));
+        assert!(ip_is_disallowed("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!ip_is_disallowed("1.1.1.1".parse().unwrap()));
     }
 
-    let parsed = reqwest::Url::parse(url.trim()).map_err(|_| "Invalid preview URL.")?;
-    let response = PREVIEW_CLIENT
-        .get(parsed.clone())
-        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
-        .send()
-        .await
-        .map_err(|_| "Failed to fetch preview.")?;
-
-    if !response.status().is_success() {
-        return Err("Preview unavailable.");
+    #[test]
+    fn hostname_literals_are_blocked() {
+        assert!(host_is_blocked("localhost"));
+        assert!(host_is_blocked("127.0.0.1"));
+        assert!(host_is_blocked("169.254.169.254"));
+        assert!(!host_is_blocked("example.com"));
     }
-
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    if !content_type.contains("text/html") && !content_type.contains("application/xhtml") {
-        return Err("Preview unavailable.");
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| "Failed to read preview.")?;
-    if bytes.len() > MAX_HTML_BYTES {
-        return Err("Preview too large.");
-    }
-
-    let html = String::from_utf8_lossy(&bytes);
-    let title = extract_title(&html);
-    let description = meta_content(&html, "og:description")
-        .or_else(|| meta_content(&html, "twitter:description"))
-        .or_else(|| meta_content(&html, "description"));
-    let site_name = meta_content(&html, "og:site_name");
-    let image = meta_content(&html, "og:image")
-        .or_else(|| meta_content(&html, "twitter:image"))
-        .or_else(|| meta_content(&html, "twitter:image:src"))
-        .and_then(|raw| normalize_preview_image(&parsed, &raw));
-
-    if title.is_none() && description.is_none() && image.is_none() {
-        return Err("Preview unavailable.");
-    }
-
-    Ok(LinkPreview {
-        url: parsed.to_string(),
-        title,
-        description,
-        image,
-        site_name,
-    })
 }

@@ -35,8 +35,6 @@ pub async fn validate_quote_target(
 }
 
 /// When `access_already_checked`, skip membership/friend gates (caller already gated send).
-/// `Ok(None)` = quote invalid/missing (send without quote). `Err(())` = transient DB —
-/// callers must fail the send, not invent "no quote".
 pub async fn validate_quote_target_with_access(
     db: &Database,
     user_id: &str,
@@ -103,7 +101,6 @@ pub async fn can_mark_message_as_read(db: &Database, user_id: &str, msg: &Messag
     matches!(try_can_mark_message_as_read(db, user_id, msg).await, Ok(true))
 }
 
-/// `Ok(true/false)` when gates resolve; `Err(())` on transient friend lookup failure.
 pub async fn try_can_mark_message_as_read(
     db: &Database,
     user_id: &str,

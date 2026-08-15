@@ -115,7 +115,6 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
             Some(q) => match Message::find_by_id(db, q).await {
                 Ok(Some(qm)) => Box::pin(serialize_message_inner(db, &qm, false)).await,
                 Ok(None) => Value::Null,
-                // Do not invent missing quote on Mongo Err.
                 Err(_) => json!({ "_id": q.to_hex(), "unavailable": true }),
             },
             None => Value::Null,
@@ -196,7 +195,6 @@ fn cached_user(users: &HashMap<ObjectId, Value>, id: ObjectId) -> Value {
 enum QuotedSer<'a> {
     None,
     Present(&'a Message),
-    /// Quote id known but load failed — never invent Null as "no quote".
     Unavailable(ObjectId),
 }
 

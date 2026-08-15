@@ -52,7 +52,7 @@ fn normalize_groups(groups: Vec<RawGroup>) -> EmojiDataset {
 async fn fetch_emoji_dataset() -> Result<EmojiDataset, HttpResponse> {
     let url = crate::utils::security::outbound_url::resolve_emoji_api_url();
 
-    let resp = match reqwest::Client::new()
+    let resp = match crate::utils::http_limits::outbound_http_client()
         .get(&url)
         .header("Accept", "application/json")
         .send()
@@ -72,7 +72,20 @@ async fn fetch_emoji_dataset() -> Result<EmojiDataset, HttpResponse> {
             .json(json!({ "error": "Nie udało się pobrać listy emotek." })));
     }
 
-    let raw = match resp.text().await {
+    let raw_bytes = match crate::utils::http_limits::read_response_limited(
+        resp,
+        crate::utils::http_limits::MAX_EMOJI_DATASET_BYTES,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!("Error reading emoji API response: {e:?}");
+            return Err(HttpResponse::BadGateway()
+                .json(json!({ "error": "Nie udało się pobrać listy emotek." })));
+        }
+    };
+    let raw = match String::from_utf8(raw_bytes) {
         Ok(t) => t,
         Err(e) => {
             log::error!("Error reading emoji API response: {}", e);

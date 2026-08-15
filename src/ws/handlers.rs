@@ -42,8 +42,6 @@ use crate::utils::unread::{
     mark_channel_as_read_for_user,
 };
 
-/// `Some(true)` active, `Some(false)` soft-deleted/missing, `None` probe Err
-/// (never treat Err as deleted — prefer bump/heal over skipping live unread).
 async fn message_still_active(db: &Database, id: ObjectId) -> Option<bool> {
     match Message::collection(db)
         .find_one(doc! { "_id": id, "deleted": { "$ne": true } })
@@ -83,7 +81,6 @@ fn reactions_json(msg: &Message) -> Value {
     Value::Object(map)
 }
 
-/// Returns whether the authoritative write landed (callers must not emit on false).
 async fn set_user_online(user_id: &str) -> bool {
     if !is_valid_object_id(user_id) {
         return false;
@@ -97,7 +94,6 @@ async fn set_user_online(user_id: &str) -> bool {
     )
 }
 
-/// Returns whether the authoritative write landed (callers must not emit on false).
 async fn set_user_offline(user_id: &str) -> bool {
     if !is_valid_object_id(user_id) {
         return false;
@@ -126,7 +122,6 @@ fn normalize_availability_status(status: &str) -> &'static str {
     }
 }
 
-/// `Some` after successful write + cache · `None` when write failed (do not emit).
 async fn set_availability(user_id: &str, status: &str) -> Option<&'static str> {
     let normalized = normalize_availability_status(status);
     if !is_valid_object_id(user_id) {
@@ -151,7 +146,6 @@ async fn set_availability(user_id: &str, status: &str) -> Option<&'static str> {
     }
 }
 
-/// `None` on DB/config failure — callers must not invent `"online"` in broadcasts.
 async fn availability_status_for_user(user_id: &str) -> Option<&'static str> {
     if let Some(cached) = crate::utils::user::availability_cache::get(user_id) {
         return Some(normalize_availability_status(&cached));
@@ -171,7 +165,6 @@ async fn availability_status_for_user(user_id: &str) -> Option<&'static str> {
             Some(status)
         }
         Ok(None) => None,
-        // Transient — do not invent online / poison cache.
         Err(_) => None,
     }
 }
@@ -468,9 +461,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
                         })
                     })
                     .unwrap_or(false)),
-                // Missing user — fail closed (do not invent unmuted for mentions).
                 Ok(None) => Err(()),
-                // Fail closed — uncertain mute must not ping mentions.
                 Err(_) => Err(()),
             }
         },
@@ -504,7 +495,6 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
                     Some(id) => message_still_active(&db_tip, id).await,
                     None => Some(false),
                 };
-                // Only confirmed deleted skips bump; probe Err → try bump/heal.
                 if still_active == Some(false) {
                     if let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
                         &db_tip, recipient_oid, sender_oid,
@@ -778,7 +768,6 @@ pub struct ChannelBroadcastInput {
     pub client_nonce: Option<String>,
 }
 
-/// Outcome of channel create+broadcast (callers record slowmode only on Created).
 pub enum ChannelBroadcastOutcome {
     Created(Value),
     IdempotentReplay(Value),
@@ -941,7 +930,6 @@ pub async fn create_and_broadcast_channel_message(
                         .into_iter()
                         .filter_map(|d| d.get_object_id("_id").ok().map(|id| id.to_hex()))
                         .collect::<std::collections::HashSet<String>>()),
-                    // Fail closed — empty set would spam muted users with mentions.
                     Err(_) => Err(()),
                 },
                 Err(_) => Err(()),
@@ -1769,7 +1757,6 @@ async fn heal_dm_unread_after_mark(
             });
         }
         None => {
-            // Recount unconfirmed — do NOT invent absolute/tip 0 (concurrent send race).
             // Fence stale deltas; spawn emits absolute only when sync recovers.
             crate::utils::unread::invalidate_unread_generation(user_id, "dm", peer);
             let db_tip = db.clone();
@@ -2048,7 +2035,6 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
 
     let mentions_bson = match mongodb::bson::to_bson(&mentions) {
         Ok(b) => b,
-        // Fail closed — empty array would wipe stored mentions.
         Err(_) => {
             registry::emit_to_user(
                 &user_id,
@@ -2163,7 +2149,6 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
             .unwrap_or(json!({ "_id": sender_id }));
         let preview_content = prepared_content.clone();
 
-        // Mute gates new mention pings on edit (same as send) — fail closed on Err.
         let muted_lookup: Option<std::collections::HashSet<String>> =
             if let (Some(channel_oid), Some(ref channel)) =
                 (updated.channel, channel_doc.as_ref())
@@ -2233,7 +2218,6 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
                             Some(std::collections::HashSet::new())
                         }
                     }
-                    // Missing user — fail closed (do not invent unmuted for mentions).
                     Ok(None) => None,
                     Err(_) => None,
                 }
@@ -2359,7 +2343,6 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
         let channel_id_hex = channel_id.to_hex();
         let channel = match Channel::find_by_id(&db, channel_id).await {
             Ok(Some(ch)) => Some(ch),
-            // Missing or transient — skip fanout (no invent via fake retry).
             Ok(None) | Err(_) => None,
         };
         if let Some(channel) = channel {
@@ -3723,7 +3706,6 @@ pub async fn dispatch_message(
                     };
                     let user = match User::find_by_id(&get_db(), oid).await {
                         Ok(Some(u)) => u,
-                        // Fail closed — do not invent presence from connectivity.
                         Ok(None) | Err(_) => return,
                     };
                     let last_seen = user

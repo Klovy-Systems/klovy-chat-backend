@@ -40,7 +40,6 @@ fn iso(dt: &DateTime) -> Option<String> {
 
 /// Fetch multiple users in a single query, keyed by id, to avoid N+1 lookups
 /// when rendering friend / request lists.
-/// `None` on Mongo Err — callers must not invent an empty friend roster.
 async fn fetch_users_map(
     db: &mongodb::Database,
     ids: &[ObjectId],
@@ -144,7 +143,6 @@ pub async fn send_friend_request(
         .await
     {
         Ok(v) => v,
-        // Fail closed — inventing None can create a reverse pending beside B→A.
         Err(_) => {
             return HttpResponse::ServiceUnavailable().json(json!({
                 "error": "Temporarily unavailable",

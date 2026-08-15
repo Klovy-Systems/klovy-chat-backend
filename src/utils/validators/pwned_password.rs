@@ -61,10 +61,13 @@ pub async fn is_password_pwned(password: &str) -> Result<bool, PwnedPasswordErro
         return Err(PwnedPasswordError::RequestFailed);
     }
 
-    let body = response
-        .text()
-        .await
-        .map_err(|_| PwnedPasswordError::RequestFailed)?;
+    let body_bytes = crate::utils::http_limits::read_response_limited(
+        response,
+        crate::utils::http_limits::MAX_HIBP_RANGE_BYTES,
+    )
+    .await
+    .map_err(|_| PwnedPasswordError::RequestFailed)?;
+    let body = String::from_utf8_lossy(&body_bytes);
 
     let pwned = body.lines().any(|line| {
         line.split_once(':')

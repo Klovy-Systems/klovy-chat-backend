@@ -107,7 +107,7 @@ fn validate_pdf_document(path: &Path) -> bool {
         Err(_) => return false,
     };
 
-    if len < 8 {
+    if len < 8 || len > crate::utils::upload_limits::MAX_HTTP_BODY_BYTES as u64 {
         return false;
     }
 

@@ -302,7 +302,6 @@ pub async fn rotate_refresh_token(
     })
 }
 
-/// `Ok(Some)` active family · `Ok(None)` missing/revoked/invalid · `Err(Unavailable)` Mongo.
 pub async fn family_id_from_refresh_token(
     raw_token: &str,
 ) -> Result<Option<String>, RefreshAuthError> {
@@ -323,7 +322,6 @@ pub async fn family_id_from_refresh_token(
     Ok(Some(stored.family_id))
 }
 
-/// `Ok(Some(uid))` revoked · `Ok(None)` no matching token · `Err` transient (do not claim logout).
 pub async fn revoke_refresh_token_family(
     raw_token: &str,
 ) -> Result<Option<ObjectId>, RefreshAuthError> {
