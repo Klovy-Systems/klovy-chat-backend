@@ -82,14 +82,7 @@ pub async fn ws_handler(
     let ws = match ws {
         Ok(ws) => ws,
         Err(_) => {
-            return (
-                StatusCode::UPGRADE_REQUIRED,
-                json!({
-                    "error": "websocket_required",
-                    "message": "This is a WebSocket endpoint. Open it from the app (wss://), not as a page in the browser."
-                }),
-            )
-                .into_response();
+            return (StatusCode::UPGRADE_REQUIRED, "WebSocket required").into_response();
         }
     };
 
