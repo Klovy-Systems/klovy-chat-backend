@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{rejection::WebSocketUpgradeRejection, Message, WebSocket, WebSocketUpgrade},
         ConnectInfo, RawQuery, State,
     },
     http::{header, HeaderMap, StatusCode},
@@ -73,12 +73,26 @@ const MAX_PAYLOAD: usize = 64 * 1024;
 const MAX_PING_PAYLOAD: usize = 1024;
 
 pub async fn ws_handler(
-    ws: WebSocketUpgrade,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     State(app_state): State<WsAppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(_) => {
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                json!({
+                    "error": "websocket_required",
+                    "message": "This is a WebSocket endpoint. Open it from the app (wss://), not as a page in the browser."
+                }),
+            )
+                .into_response();
+        }
+    };
+
     if raw_query.as_deref().is_some_and(|q| q.len() > crate::utils::upload_limits::MAX_PROXY_URI_BYTES)
     {
         return (StatusCode::URI_TOO_LONG, "URI too long").into_response();
