@@ -64,6 +64,7 @@ fn is_critical_event(msg_type: &str) -> bool {
             | "conversation-deleted"
             | "session:revoked"
             | "user-status-changed"
+            | "announcement:published"
     ) || msg_type.starts_with("call:")
         || msg_type.starts_with("channel-voice:")
 }
@@ -140,15 +141,6 @@ impl ConnectionRegistry {
         }
     }
 
-    async fn send_to_user(&self, user_id: &str, msg_type: &str, payload: Value) {
-        let msg = match serde_json::to_string(&json!({ "type": msg_type, "payload": payload })) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        self.send_prebuilt_to_user(user_id, &msg, is_critical_event(msg_type))
-            .await;
-    }
-
     async fn send_prebuilt_to_user(&self, user_id: &str, msg: &str, critical: bool) {
         let senders: Vec<WsSender> = self
             .connections
@@ -212,10 +204,12 @@ impl ConnectionRegistry {
     }
 
     pub async fn broadcast_to_all(&self, msg_type: &str, payload: Value) {
+        let Ok(msg) = serde_json::to_string(&json!({ "type": msg_type, "payload": payload })) else {
+            return;
+        };
         let user_ids: Vec<String> = self.connections.lock().await.keys().cloned().collect();
-        for uid in user_ids {
-            self.send_to_user(&uid, msg_type, payload.clone()).await;
-        }
+        self.send_prebuilt_to_users(&user_ids, Arc::new(msg), is_critical_event(msg_type))
+            .await;
     }
 }
 
@@ -268,14 +262,6 @@ pub fn emit_to_user(user_id: &str, event: &str, data: impl Serialize + Send + Sy
     });
 }
 
-pub async fn user_is_connected(user_id: &str) -> bool {
-    let Some(reg) = registry() else {
-        return false;
-    };
-    let map = reg.connections.lock().await;
-    map.get(user_id).is_some_and(|entries| !entries.is_empty())
-}
-
 /// Serialize once, fan out to many users (channel broadcast hot path).
 pub fn emit_to_users(user_ids: &[String], event: &str, data: Value) {
     if user_ids.is_empty() {
@@ -300,22 +286,19 @@ pub fn emit_to_all_connected(event: &str, data: impl Serialize + Send + Sync + '
     let Some(reg) = registry() else {
         return;
     };
-    let Ok(msg) = serde_json::to_string(&json!({ "type": event, "payload": data })) else {
+    let Ok(payload) = serde_json::to_value(&data) else {
         return;
     };
-    let msg = Arc::new(msg);
-    let critical = is_critical_event(event);
+    let event = event.to_string();
     let reg = reg.clone();
     tokio::spawn(async move {
-        let user_ids: Vec<String> = reg.connections.lock().await.keys().cloned().collect();
-        reg.send_prebuilt_to_users(&user_ids, msg, critical).await;
+        reg.broadcast_to_all(&event, payload).await;
     });
 }
 
-// UWAGA: usunięto `broadcast_to_others` i `emit_broadcast`. Rozgłaszanie do
-// wszystkich zalogowanych klientów wyciekało obecność/profil do nie-znajomych.
-// Do zdarzeń obecności/profilu używaj `crate::utils::friends::emit_to_friends`,
-// a do kanałów `emit_to_users(&channel_recipient_ids(...), ...)`.
+// Ogłoszenia i inne zdarzenia globalne: `emit_to_all_connected`.
+// Obecność/profil: `crate::utils::friends::emit_to_friends`.
+// Kanały: `emit_to_users(&channel_recipient_ids(...), ...)`.
 
 pub fn channel_recipient_ids(channel: &Channel) -> Vec<String> {
     let mut ids: Vec<String> = channel.members.iter().map(|m| m.to_hex()).collect();

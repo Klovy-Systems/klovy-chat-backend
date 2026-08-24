@@ -5,7 +5,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 
-use crate::utils::file_hash::sha256_hex;
+use super::storage_keys::attachment_prefers_download;
 
 #[derive(Debug)]
 pub enum StorageError {
@@ -75,13 +75,18 @@ impl R2Storage {
         body: Vec<u8>,
         content_type: &str,
     ) -> Result<(), StorageError> {
-        self.client
+        let mut request = self
+            .client
             .put_object()
             .bucket(&self.public_bucket)
             .key(key)
             .body(ByteStream::from(body))
             .content_type(content_type)
-            .cache_control("public, max-age=31536000, immutable")
+            .cache_control("public, max-age=31536000, immutable");
+        if attachment_prefers_download(key) {
+            request = request.content_disposition("attachment");
+        }
+        request
             .send()
             .await
             .map_err(|e| StorageError::OperationFailed(format!("put_public {key}: {e}")))?;
@@ -97,10 +102,6 @@ impl R2Storage {
             .await
             .map_err(|e| StorageError::OperationFailed(format!("delete_public {key}: {e}")))?;
         Ok(())
-    }
-
-    pub async fn head_public(&self, key: &str) -> Result<bool, StorageError> {
-        Ok(self.head_public_content_length(key).await?.is_some())
     }
 
     pub async fn head_public_content_length(&self, key: &str) -> Result<Option<u64>, StorageError> {
@@ -190,31 +191,6 @@ impl R2Storage {
         }
 
         Ok(objects)
-    }
-
-    pub async fn verify_public_sha256(&self, key: &str, expected_hex: &str) -> Result<bool, StorageError> {
-        let expected = expected_hex.trim().to_ascii_lowercase();
-        if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Ok(false);
-        }
-
-        let output = self
-            .client
-            .get_object()
-            .bucket(&self.public_bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| StorageError::OperationFailed(format!("get_public {key}: {e}")))?;
-
-        let bytes = output
-            .body
-            .collect()
-            .await
-            .map_err(|e| StorageError::OperationFailed(format!("read_public {key}: {e}")))?
-            .into_bytes();
-
-        Ok(sha256_hex(&bytes) == expected)
     }
 }
 

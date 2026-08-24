@@ -55,16 +55,6 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserBadge {
-    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    pub id: Option<ObjectId>,
-    #[serde(rename = "badgeId")]
-    pub badge_id: ObjectId,
-    #[serde(rename = "assignedAt")]
-    pub assigned_at: DateTime,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
@@ -145,12 +135,6 @@ pub struct User {
 
     #[serde(rename = "blockedContacts", default)]
     pub blocked_contacts: Vec<ObjectId>,
-
-    #[serde(default)]
-    pub badges: Vec<UserBadge>,
-
-    #[serde(rename = "featuredBadgeIds", default)]
-    pub featured_badge_ids: Vec<ObjectId>,
 
     #[serde(rename = "tokenVersion", default)]
     pub token_version: i32,
@@ -310,8 +294,6 @@ impl User {
             muted_channels: vec![],
             muted_contacts: vec![],
             blocked_contacts: vec![],
-            badges: vec![],
-            featured_badge_ids: vec![],
             token_version: 0,
             two_factor_enabled: false,
             totp_secret: None,

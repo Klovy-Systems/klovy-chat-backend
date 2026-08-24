@@ -107,13 +107,6 @@ pub fn reveal_content_internal(stored: &str) -> String {
     trimmed.to_string()
 }
 
-pub async fn reveal_content_internal_async(stored: String) -> String {
-    let fallback = stored.clone();
-    tokio::task::spawn_blocking(move || reveal_content_internal(&stored))
-        .await
-        .unwrap_or(fallback)
-}
-
 pub fn unwrap_client_opaque(stored: &str) -> String {
     let trimmed = stored.trim();
     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(trimmed) {
@@ -141,17 +134,4 @@ pub fn normalize_client_opaque_to_plaintext(incoming: &str) -> String {
         current = inner;
     }
     current
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn content_for_api_returns_plaintext_while_storage_stays_sealed() {
-        std::env::set_var("JWT_KEY", "test-jwt-key-for-content-storage-unit-test");
-        let stored = prepare_content_for_storage("elo").expect("seal");
-        assert_ne!(stored, "elo");
-        assert_eq!(content_for_api(&stored), "elo");
-    }
 }

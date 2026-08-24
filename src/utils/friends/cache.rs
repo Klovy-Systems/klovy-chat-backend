@@ -155,14 +155,6 @@ pub fn get_cached_block_pair(user_a: &str, user_b: &str) -> Option<bool> {
     get_cached_block_flags(user_a, user_b).map(|(a, b)| a || b)
 }
 
-pub fn put_cached_block_pair(user_a: &str, user_b: &str, blocked: bool) {
-    if blocked {
-        // Direction unknown — do not poison the directional cache.
-        return;
-    }
-    put_cached_block_flags(user_a, user_b, false, false);
-}
-
 pub fn invalidate_block_pair(user_a: &str, user_b: &str) {
     let key = block_pair_key(user_a, user_b);
     if let Ok(mut guard) = BLOCK_PAIR_CACHE.lock() {

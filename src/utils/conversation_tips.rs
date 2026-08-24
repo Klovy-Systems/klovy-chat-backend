@@ -252,6 +252,9 @@ async fn tip_unread_field(db: &Database, viewer: ObjectId, peer: ObjectId) -> Re
     })
 }
 
+/// Recount tip unread and re-check until stable (max 3) so a concurrent send
+/// cannot be clobbered by a stale mark-read `set_dm_unread(0)`.
+/// Also re-reads the tip field so a late `$inc` after `$set` cannot stick.
 pub async fn try_sync_dm_tip_unread(
     db: &Database,
     viewer: ObjectId,
@@ -287,35 +290,6 @@ pub async fn try_sync_dm_tip_unread(
         Some(n2) if n2 == n => Some(n),
         _ => None,
     }
-}
-
-/// Recount tip unread and re-check until stable (max 3) so a concurrent send
-/// cannot be clobbered by a stale mark-read `set_dm_unread(0)`.
-/// Also re-reads the tip field so a late `$inc` after `$set` cannot stick.
-pub async fn sync_dm_tip_unread(
-    db: &Database,
-    viewer: ObjectId,
-    peer: ObjectId,
-) -> Option<u64> {
-    try_sync_dm_tip_unread(db, viewer, peer).await
-}
-
-pub async fn dec_dm_unread(db: &Database, viewer: ObjectId, peer: ObjectId) {
-    let (pair_key, user_a, _) = dm_pair_key(viewer, peer);
-    let field = if viewer == user_a {
-        "unreadA"
-    } else {
-        "unreadB"
-    };
-    let _ = DmConversationTip::collection(db)
-        .update_one(
-            doc! { "pairKey": &pair_key, field: { "$gt": 0 } },
-            doc! {
-                "$inc": { field: -1i64 },
-                "$set": { "updatedAt": DateTime::now() },
-            },
-        )
-        .await;
 }
 
 pub async fn refresh_dm_tip_after_delete(

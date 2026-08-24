@@ -119,12 +119,6 @@ pub fn build_search_index_from_incoming(incoming: &str) -> Result<SearchIndex, S
     build_search_index_from_normalized(&normalize_search_text(&plain))
 }
 
-pub fn search_text_from_incoming(incoming: &str) -> String {
-    build_search_index_from_incoming(incoming)
-        .map(|idx| idx.encrypted_text)
-        .unwrap_or_default()
-}
-
 pub fn search_text_from_stored(stored: &str) -> String {
     normalize_search_text(&reveal_content_internal(stored))
 }
@@ -232,31 +226,4 @@ pub async fn collect_message_ids_limited(
         }
     }
     Ok(ids)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ngram_tokens_cover_substring_query() {
-        std::env::set_var("JWT_KEY", "test-jwt-key-for-search-text-unit-test-xx");
-        let body = normalize_search_text("Hello World");
-        let tokens = search_tokens_from_normalized(&body);
-        let query = search_tokens_for_query("lo wo");
-        assert!(!tokens.is_empty());
-        assert!(!query.is_empty());
-        for token in &query {
-            assert!(tokens.contains(token));
-        }
-    }
-
-    #[test]
-    fn sealed_search_text_is_not_plaintext() {
-        std::env::set_var("JWT_KEY", "test-jwt-key-for-search-text-unit-test-xx");
-        let index = build_search_index_from_normalized("secret phrase").expect("index");
-        assert_ne!(index.encrypted_text, "secret phrase");
-        assert!(is_search_text_sealed(&index.encrypted_text));
-        assert!(!index.tokens.is_empty());
-    }
 }

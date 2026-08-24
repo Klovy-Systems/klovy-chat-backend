@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::user_model::User;
 use crate::utils::auth::jwt_auth::{
-    jwt_decoding_key, user_from_jwt_with_refresh, user_from_token_payload, JwtUserError,
+    jwt_decoding_key, user_from_jwt, user_from_jwt_with_refresh, user_from_token_payload,
+    JwtUserError,
 };
 use crate::utils::auth::refresh_token::REFRESH_COOKIE;
 use crate::utils::auth::jwt_validation::hs256_validation;
@@ -172,7 +173,10 @@ pub async fn resolve_authenticated_user(req: &ServiceRequest) -> Result<User, Jw
         .map(|c| c.value().to_string())
         .ok_or(JwtUserError::Denied)?;
     let refresh_token = req.cookie(REFRESH_COOKIE).map(|c| c.value().to_string());
-    user_from_jwt_with_refresh(&token, refresh_token.as_deref()).await
+    match refresh_token.as_deref() {
+        Some(refresh) => user_from_jwt_with_refresh(&token, Some(refresh)).await,
+        None => user_from_jwt(&token).await,
+    }
 }
 
 pub async fn require_active_account(

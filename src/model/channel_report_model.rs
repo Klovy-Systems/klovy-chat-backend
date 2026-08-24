@@ -144,39 +144,4 @@ impl ChannelReport {
 
         Ok(ChannelReport { id, ..report })
     }
-
-    pub async fn find_by_id(
-        db: &Database,
-        id: ObjectId,
-    ) -> mongodb::error::Result<Option<ChannelReport>> {
-        Self::collection(db).find_one(doc! { "_id": id }).await
-    }
-
-    pub async fn delete_by_id(db: &Database, id: ObjectId) -> mongodb::error::Result<bool> {
-        let result = Self::collection(db).delete_one(doc! { "_id": id }).await?;
-        Ok(result.deleted_count > 0)
-    }
-
-    pub async fn update_status(
-        db: &Database,
-        id: ObjectId,
-        status: ChannelReportStatus,
-    ) -> mongodb::error::Result<()> {
-        let status_str = serde_json::to_value(&status)
-            .ok()
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_default();
-
-        Self::collection(db)
-            .update_one(
-                doc! { "_id": id },
-                doc! { "$set": {
-                    "status": status_str,
-                    "reviewedAt": DateTime::now(),
-                }},
-            )
-            .await?;
-
-        Ok(())
-    }
 }

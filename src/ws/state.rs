@@ -49,7 +49,6 @@ pub struct SocketState {
 
 struct TypingJob {
     chat_id: String,
-    #[allow(dead_code)]
     is_typing: Option<bool>,
     job: UserJob,
 }
@@ -252,16 +251,24 @@ impl SocketState {
             last_used_ms: now,
         });
         slot.last_used_ms = now;
-        // Coalesce: drop prior jobs for the same chat (latest wins).
-        slot.queue.retain(|j| j.chat_id != chat_id);
-        if slot.queue.len() >= TYPING_QUEUE_MAX {
-            slot.queue.pop_front();
+        // Same chat + same is_typing: replace in place (heartbeat). Else latest wins.
+        if let Some(existing) = slot
+            .queue
+            .iter_mut()
+            .find(|j| j.chat_id == chat_id && j.is_typing == is_typing)
+        {
+            existing.job = job;
+        } else {
+            slot.queue.retain(|j| j.chat_id != chat_id);
+            if slot.queue.len() >= TYPING_QUEUE_MAX {
+                slot.queue.pop_front();
+            }
+            slot.queue.push_back(TypingJob {
+                chat_id,
+                is_typing,
+                job,
+            });
         }
-        slot.queue.push_back(TypingJob {
-            chat_id,
-            is_typing,
-            job,
-        });
         if slot.running {
             return;
         }

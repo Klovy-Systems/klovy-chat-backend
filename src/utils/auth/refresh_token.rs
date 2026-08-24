@@ -8,8 +8,10 @@ use crate::model::refresh_token_model::RefreshToken;
 use crate::model::user_model::User;
 use crate::utils::auth::session_client::{normalize_browser_name, resolved_os_label};
 use crate::utils::auth::session_metadata::SessionClientMetadata;
+use crate::utils::crypto::keyed_hash::verify_hmac_sha256_hex;
 use crate::utils::crypto::token_hash::{
     hash_refresh_token_for_storage, is_legacy_refresh_hash, legacy_refresh_token_hash,
+    refresh_token_hmac_key,
 };
 use crate::utils::auth::token_utils::REFRESH_MAX_AGE_MS;
 use crate::utils::db::get_db;
@@ -50,6 +52,14 @@ pub async fn find_stored_refresh_token(
         .await
         .map_err(|e| e.to_string())?
     {
+        let stored_hex = found
+            .token_hash
+            .strip_prefix("v2:")
+            .unwrap_or(found.token_hash.as_str());
+        let key = refresh_token_hmac_key()?;
+        if !verify_hmac_sha256_hex(&key, raw_token, stored_hex) {
+            return Ok(None);
+        }
         return Ok(Some(found));
     }
 

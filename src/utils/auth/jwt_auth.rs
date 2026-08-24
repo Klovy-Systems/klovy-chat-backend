@@ -51,23 +51,6 @@ pub fn parse_refresh_from_cookie_header(cookie_header: &str) -> Option<String> {
     None
 }
 
-pub fn user_id_from_jwt_token(token: &str) -> Option<String> {
-    if token.is_empty() || token.len() > 1000 {
-        return None;
-    }
-
-    let key = jwt_decoding_key().ok()?;
-    let payload = decode::<TokenPayload>(token, &key, &hs256_validation())
-        .ok()?
-        .claims;
-
-    if payload.user_id.is_empty() || ObjectId::parse_str(&payload.user_id).is_err() {
-        return None;
-    }
-
-    Some(payload.user_id)
-}
-
 pub async fn resolve_session_family_id(
     payload: &TokenPayload,
     refresh_token: Option<&str>,

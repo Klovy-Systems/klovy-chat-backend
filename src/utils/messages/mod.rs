@@ -13,7 +13,6 @@ use std::collections::{HashMap, HashSet};
 use crate::model::channel_model::Channel;
 use crate::model::messages_model::Message;
 use crate::model::user_model::User;
-use crate::utils::access::membership_gate::require_channel_access;
 use crate::utils::channel::{can_access_channel, is_channel_admin};
 use crate::utils::access::membership_gate::require_dm_access;
 use crate::utils::user::serialize_user::resolve_display_name;
@@ -422,16 +421,4 @@ pub async fn validate_dm_history_before_cursor(
     } else {
         Err(CursorValidateError::Invalid)
     }
-}
-
-pub async fn can_access_dm_messages(db: &Database, user_id: &str, contact_id: &str) -> bool {
-    require_dm_access(db, user_id, contact_id).await.is_ok()
-}
-
-pub async fn can_access_channel_messages(
-    db: &Database,
-    user_id: &str,
-    channel_id: &str,
-) -> Option<Channel> {
-    require_channel_access(db, channel_id, user_id).await.ok()
 }

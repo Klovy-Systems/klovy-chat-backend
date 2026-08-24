@@ -24,16 +24,20 @@ use crate::utils::image_reencode::{
 };
 use crate::utils::messages::{
     access::cleanup_attachment_if_unreferenced,
-    try_can_pin_message, dm_conversation_base_clauses,
+    can_pin_message, try_can_pin_message, dm_conversation_base_clauses,
     serialize_message, serialize_messages_batch, validate_dm_history_before_cursor,
     message_belongs_to_dm_conversation,
 };
+use crate::utils::channel::is_channel_admin;
+use crate::utils::friends::are_friends;
 use crate::utils::messages::content_storage::inbound_plaintext_for_processing;
 use crate::utils::messages::search_text::{build_search_index_from_incoming, search_tokens_for_query};
 use crate::utils::storage::{
     attachment_dm_key, attachment_group_key, attachment_thumb_key, storage,
 };
-use crate::utils::ratelimit::try_consume_chat_attachment_quota;
+use crate::utils::ratelimit::{
+    chat_attachment_retry_after_secs, try_consume_chat_attachment_quota,
+};
 use crate::utils::upload_limits::{
     file_bytes_within_limit, is_image_extension, local_file_size, MAX_ATTACHMENT_BYTES,
     MAX_CHAT_ATTACHMENTS_PER_WINDOW, MAX_IMAGE_ATTACHMENT_BYTES, CHAT_ATTACHMENT_WINDOW_SECS,
@@ -259,7 +263,10 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     let db = get_db();
 
     if matches!(context_type.as_str(), "dm" | "channel") {
-        if let Err(retry_after) = try_consume_chat_attachment_quota(&user_id) {
+        if let Err(mut retry_after) = try_consume_chat_attachment_quota(&user_id) {
+            if retry_after == 0 {
+                retry_after = chat_attachment_retry_after_secs(&user_id);
+            }
             let window_minutes = CHAT_ATTACHMENT_WINDOW_SECS / 60;
             return HttpResponse::TooManyRequests().json(json!({
                 "error": "CHAT_ATTACHMENT_LIMIT",
@@ -1283,8 +1290,8 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
     let db = get_db();
 
     if let Some(channel_id) = body.channel_id.as_deref().filter(|s| !s.is_empty()) {
-        match require_channel_access(&db, channel_id, &user_id).await {
-            Ok(_) => {}
+        let channel = match require_channel_access(&db, channel_id, &user_id).await {
+            Ok(ch) => ch,
             Err(AccessDeniedReason::Unavailable) => {
                 return HttpResponse::ServiceUnavailable().json(json!({
                     "error": "Temporarily unavailable",
@@ -1294,7 +1301,7 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
             Err(_) => {
                 return HttpResponse::Forbidden().json(json!({ "error": "Access denied" }));
             }
-        }
+        };
         let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
             return HttpResponse::BadRequest().json(json!({ "error": "Invalid channel id" }));
         };
@@ -1320,8 +1327,13 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
                 }));
             }
         };
+        let can_pin = if let Some(m) = messages.first() {
+            can_pin_message(&db, &user_id, m).await
+        } else {
+            is_channel_admin(&channel, Some(&user_id))
+        };
         let out = serialize_all(&db, &messages).await;
-        return HttpResponse::Ok().json(json!({ "messages": out }));
+        return HttpResponse::Ok().json(json!({ "messages": out, "canPin": can_pin }));
     }
 
     if let Some(contact_id) = body.contact_id.as_deref().filter(|s| !s.is_empty()) {
@@ -1371,8 +1383,13 @@ pub async fn get_pinned_messages(req: HttpRequest, body: web::Json<PinnedBody>) 
         };
         let mut messages = messages;
         messages.retain(|m| message_belongs_to_dm_conversation(m, uid, cid));
+        let can_pin = if let Some(m) = messages.first() {
+            can_pin_message(&db, &user_id, m).await
+        } else {
+            are_friends(&db, &user_id, contact_id).await
+        };
         let out = serialize_all(&db, &messages).await;
-        return HttpResponse::Ok().json(json!({ "messages": out }));
+        return HttpResponse::Ok().json(json!({ "messages": out, "canPin": can_pin }));
     }
 
     HttpResponse::BadRequest().json(json!({ "error": "contactId or channelId required" }))

@@ -3,8 +3,7 @@ use mongodb::Database;
 use serde_json::{json, Value};
 
 use crate::model::channel_moderation::{
-    active_moderation_entries, remove_entry_for_user, upsert_entry,
-    ChannelModerationEntry,
+    active_moderation_entries, ChannelModerationEntry,
 };
 use crate::model::channel_model::Channel;
 
@@ -176,56 +175,6 @@ pub fn build_moderation_entry(
         Some(0) | None => ChannelModerationEntry::permanent(user_id),
         Some(seconds) => ChannelModerationEntry::timed(user_id, seconds),
     }
-}
-
-pub fn prepare_ban_lists(
-    channel: &Channel,
-    target_id: ObjectId,
-    duration_seconds: Option<u64>,
-) -> (Vec<ChannelModerationEntry>, Vec<ChannelModerationEntry>, Vec<ObjectId>) {
-    let banned = upsert_entry(
-        &channel.banned_members,
-        build_moderation_entry(target_id, duration_seconds),
-    );
-    let muted = remove_entry_for_user(&channel.muted_members, target_id);
-    let members = channel
-        .members
-        .iter()
-        .copied()
-        .filter(|member| *member != target_id)
-        .collect();
-    (banned, muted, members)
-}
-
-pub fn prepare_mute_lists(
-    channel: &Channel,
-    target_id: ObjectId,
-    duration_seconds: Option<u64>,
-) -> (Vec<ChannelModerationEntry>, Vec<ChannelModerationEntry>) {
-    let muted = upsert_entry(
-        &channel.muted_members,
-        build_moderation_entry(target_id, duration_seconds),
-    );
-    let banned = remove_entry_for_user(&channel.banned_members, target_id);
-    (muted, banned)
-}
-
-pub fn prepare_unban_lists(
-    channel: &Channel,
-    target_id: ObjectId,
-) -> Vec<ChannelModerationEntry> {
-    remove_entry_for_user(&channel.banned_members, target_id)
-}
-
-pub fn prepare_unmute_lists(
-    channel: &Channel,
-    target_id: ObjectId,
-) -> Vec<ChannelModerationEntry> {
-    remove_entry_for_user(&channel.muted_members, target_id)
-}
-
-pub fn active_entries(entries: &[ChannelModerationEntry]) -> Vec<ChannelModerationEntry> {
-    active_moderation_entries(entries)
 }
 
 pub fn active_moderation_user_ids(entries: &[ChannelModerationEntry]) -> Vec<String> {

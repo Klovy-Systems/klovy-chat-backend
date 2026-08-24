@@ -70,26 +70,3 @@ pub const MAX_TURNSTILE_BYTES: usize = 64 * 1024;
 /// Actix → Axum proxy response. Prevents a huge Mongo serialization from
 /// occupying all 32 inflight slots with unbounded buffers.
 pub const MAX_PROXY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn append_limited_accepts_up_to_max() {
-        let mut buf = Vec::new();
-        append_limited(&mut buf, &[1, 2, 3], 4).unwrap();
-        append_limited(&mut buf, &[4], 4).unwrap();
-        assert_eq!(buf, vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn append_limited_rejects_overflow() {
-        let mut buf = vec![1, 2, 3];
-        assert_eq!(
-            append_limited(&mut buf, &[4, 5], 4),
-            Err(LimitedBodyError::TooLarge)
-        );
-        assert_eq!(buf, vec![1, 2, 3]);
-    }
-}

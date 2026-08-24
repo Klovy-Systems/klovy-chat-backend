@@ -6,7 +6,7 @@ use crate::controllers::auth_controller::{
     acknowledge_my_warnings, add_profile_banner, add_profile_image, change_password,
     change_username, disable_account, disable_two_factor, enable_two_factor, get_my_warnings, get_user_info, list_sessions, login,
     logout, refresh_session, registration_status, issue_ws_crypto_key, remove_profile_banner, remove_profile_image, request_account_deletion, cancel_account_deletion, revoke_other_sessions, revoke_session, setup_two_factor, signup,
-    update_availability_status, update_featured_badges, update_language, update_profile, verify_two_factor_login,
+    update_availability_status, update_language, update_profile, verify_two_factor_login,
 };
 use crate::middlewares::registration_guard::registration_guard;
 use crate::controllers::announcement_controller::{dismiss_announcements, get_my_announcements};
@@ -278,13 +278,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .wrap(from_fn(require_active_account))
             .wrap(from_fn(verify_token))
             .route(web::delete().to(remove_profile_banner)),
-    );
-
-    cfg.service(
-        web::resource("/featured-badges")
-            .wrap(from_fn(require_active_account))
-            .wrap(from_fn(verify_token))
-            .route(web::patch().to(update_featured_badges)),
     );
 
     cfg.service(

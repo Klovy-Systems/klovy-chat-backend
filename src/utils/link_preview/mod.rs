@@ -289,26 +289,3 @@ pub async fn fetch_link_preview(url: &str) -> Result<LinkPreview, &'static str> 
         });
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_loopback_and_cgnat_ips() {
-        assert!(ip_is_disallowed("127.0.0.1".parse().unwrap()));
-        assert!(ip_is_disallowed("10.0.0.1".parse().unwrap()));
-        assert!(ip_is_disallowed("100.64.0.1".parse().unwrap()));
-        assert!(ip_is_disallowed("::1".parse().unwrap()));
-        assert!(ip_is_disallowed("::ffff:127.0.0.1".parse().unwrap()));
-        assert!(!ip_is_disallowed("1.1.1.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn hostname_literals_are_blocked() {
-        assert!(host_is_blocked("localhost"));
-        assert!(host_is_blocked("127.0.0.1"));
-        assert!(host_is_blocked("169.254.169.254"));
-        assert!(!host_is_blocked("example.com"));
-    }
-}

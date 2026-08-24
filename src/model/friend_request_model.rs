@@ -92,25 +92,4 @@ impl FriendRequest {
 
         Ok(FriendRequest { id, ..doc })
     }
-
-    pub async fn update_status(
-        db: &Database,
-        id: ObjectId,
-        status: FriendRequestStatus,
-    ) -> mongodb::error::Result<()> {
-        let status_str = match status {
-            FriendRequestStatus::Pending  => "pending",
-            FriendRequestStatus::Accepted => "accepted",
-            FriendRequestStatus::Rejected => "rejected",
-        };
-
-        Self::collection(db)
-            .update_one(
-                doc! { "_id": id },
-                doc! { "$set": { "status": status_str, "updatedAt": DateTime::now() } },
-            )
-            .await?;
-
-        Ok(())
-    }
 }

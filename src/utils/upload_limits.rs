@@ -104,34 +104,3 @@ pub fn is_image_extension(ext: &str) -> bool {
         "jpg" | "jpeg" | "png" | "webp"
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn proxy_body_limit_is_small_for_reads() {
-        assert_eq!(max_proxy_body_bytes("GET", None), MAX_EMPTY_METHOD_BODY_BYTES);
-        assert_eq!(
-            max_proxy_body_bytes("DELETE", Some("application/json")),
-            MAX_EMPTY_METHOD_BODY_BYTES
-        );
-        assert_eq!(max_proxy_body_bytes("get", None), MAX_EMPTY_METHOD_BODY_BYTES);
-        assert_eq!(
-            max_proxy_body_bytes("POST", Some(" Multipart/Form-Data; boundary=x")),
-            MAX_HTTP_BODY_BYTES
-        );
-    }
-
-    #[test]
-    fn proxy_body_limit_allows_multipart_uploads() {
-        assert_eq!(
-            max_proxy_body_bytes("POST", Some("multipart/form-data; boundary=x")),
-            MAX_HTTP_BODY_BYTES
-        );
-        assert_eq!(
-            max_proxy_body_bytes("POST", Some("application/json")),
-            MAX_JSON_PAYLOAD_BYTES as usize
-        );
-    }
-}

@@ -184,25 +184,4 @@ impl ChannelReadState {
             .await?;
         Ok(())
     }
-
-    pub async fn dec_unread(
-        db: &Database,
-        user_id: ObjectId,
-        channel_id: ObjectId,
-    ) -> mongodb::error::Result<()> {
-        Self::collection(db)
-            .update_one(
-                doc! {
-                    "userId": user_id,
-                    "channelId": channel_id,
-                    "unreadCount": { "$gt": 0 },
-                },
-                doc! {
-                    "$inc": { "unreadCount": -1i64 },
-                    "$set": { "updatedAt": DateTime::now() },
-                },
-            )
-            .await?;
-        Ok(())
-    }
 }

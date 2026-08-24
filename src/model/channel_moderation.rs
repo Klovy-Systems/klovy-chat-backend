@@ -81,25 +81,3 @@ pub fn has_active_entry(entries: &[ChannelModerationEntry], user_id: &str) -> bo
         .iter()
         .any(|entry| entry.is_active() && entry.user_id.to_hex() == user_id)
 }
-
-pub fn remove_entry_for_user(
-    entries: &[ChannelModerationEntry],
-    user_id: ObjectId,
-) -> Vec<ChannelModerationEntry> {
-    entries
-        .iter()
-        .filter(|entry| entry.user_id != user_id)
-        .cloned()
-        .collect()
-}
-
-pub fn upsert_entry(
-    entries: &[ChannelModerationEntry],
-    new_entry: ChannelModerationEntry,
-) -> Vec<ChannelModerationEntry> {
-    let mut next = remove_entry_for_user(entries, new_entry.user_id);
-    if new_entry.is_active() {
-        next.push(new_entry);
-    }
-    next
-}

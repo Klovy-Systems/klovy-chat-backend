@@ -419,25 +419,6 @@ impl Message {
         Self::collection(db).find_one(doc! { "_id": id }).await
     }
 
-    pub async fn soft_delete(
-        db: &Database,
-        id: ObjectId,
-    ) -> mongodb::error::Result<()> {
-        let _ = Self::soft_delete_if_active(db, id).await?;
-        Ok(())
-    }
-
-    /// Soft-delete only if not already deleted. Returns true when this call flipped the row.
-    pub async fn soft_delete_if_active(
-        db: &Database,
-        id: ObjectId,
-    ) -> mongodb::error::Result<bool> {
-        match Self::soft_delete_active(db, id).await? {
-            SoftDeleteOutcome::AlreadyDeleted => Ok(false),
-            SoftDeleteOutcome::Deleted { .. } => Ok(true),
-        }
-    }
-
     /// Soft-delete with unread claim for DM race vs mark-read.
     /// `was_unread: true` only when this call deleted a still-unread row.
     pub async fn soft_delete_active(

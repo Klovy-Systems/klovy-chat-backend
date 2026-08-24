@@ -1,5 +1,4 @@
 pub mod archive_validation;
-pub mod badge;
 pub mod external_url;
 pub mod file_magic;
 pub mod normalize_username;

@@ -5,6 +5,7 @@ use mongodb::{
     Collection, Database, IndexModel,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 pub const ANNOUNCEMENT_TITLE_MAX: usize = 120;
 pub const ANNOUNCEMENT_BODY_MAX: usize = 8000;
@@ -54,9 +55,24 @@ pub struct AnnouncementDismissal {
     pub dismissed_at: DateTime,
 }
 
+fn iso(dt: &DateTime) -> Option<String> {
+    dt.try_to_rfc3339_string().ok()
+}
+
 impl Announcement {
     pub fn collection(db: &Database) -> Collection<Announcement> {
         db.collection("announcements")
+    }
+
+    pub fn to_api_json(&self) -> Value {
+        json!({
+            "id": self.id.map(|o| o.to_hex()),
+            "title": self.title,
+            "body": self.body,
+            "active": self.active,
+            "createdAt": iso(&self.created_at),
+            "updatedAt": iso(&self.updated_at),
+        })
     }
 
     pub async fn create_indexes(db: &Database) -> mongodb::error::Result<()> {
@@ -88,6 +104,9 @@ impl Announcement {
         db: &Database,
         input: CreateAnnouncementInput,
     ) -> mongodb::error::Result<Announcement> {
+        validate_announcement(&input.title, &input.body)
+            .map_err(mongodb::error::Error::custom)?;
+
         let now = DateTime::now();
         let announcement = Announcement {
             id: None,
@@ -99,27 +118,17 @@ impl Announcement {
         };
 
         let result = Self::collection(db).insert_one(&announcement).await?;
-        Ok(Announcement {
+        let created = Announcement {
             id: result.inserted_id.as_object_id(),
             ..announcement
-        })
-    }
-
-    pub async fn find_by_id(
-        db: &Database,
-        id: ObjectId,
-    ) -> mongodb::error::Result<Option<Announcement>> {
-        Self::collection(db).find_one(doc! { "_id": id }).await
-    }
-
-    pub async fn list_all(db: &Database) -> mongodb::error::Result<Vec<Announcement>> {
-        Self::collection(db)
-            .find(doc! {})
-            .sort(doc! { "createdAt": -1 })
-            .limit(200)
-            .await?
-            .try_collect()
-            .await
+        };
+        if created.active {
+            crate::ws::registry::emit_to_all_connected(
+                "announcement:published",
+                json!({ "announcement": created.to_api_json() }),
+            );
+        }
+        Ok(created)
     }
 
     pub async fn list_active(db: &Database) -> mongodb::error::Result<Vec<Announcement>> {
@@ -130,34 +139,6 @@ impl Announcement {
             .await?
             .try_collect()
             .await
-    }
-
-    pub async fn update_fields(
-        db: &Database,
-        id: ObjectId,
-        set: mongodb::bson::Document,
-    ) -> mongodb::error::Result<Option<Announcement>> {
-        use mongodb::options::FindOneAndUpdateOptions;
-        use mongodb::options::ReturnDocument;
-
-        let options = FindOneAndUpdateOptions::builder()
-            .return_document(ReturnDocument::After)
-            .build();
-
-        Self::collection(db)
-            .find_one_and_update(doc! { "_id": id }, doc! { "$set": set })
-            .with_options(options)
-            .await
-    }
-
-    pub async fn delete_by_id(db: &Database, id: ObjectId) -> mongodb::error::Result<bool> {
-        let result = Self::collection(db)
-            .delete_one(doc! { "_id": id })
-            .await?;
-        AnnouncementDismissal::collection(db)
-            .delete_many(doc! { "announcementId": id })
-            .await?;
-        Ok(result.deleted_count > 0)
     }
 }
 

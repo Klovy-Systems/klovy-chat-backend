@@ -30,11 +30,8 @@ use crate::utils::auth::two_factor_token::{
 };
 use crate::utils::crypto::credential_hash::verify_user_password;
 use crate::ws::registry::{disconnect_user, revoke_session_remotely};
-use crate::utils::friends::{emit_profile_event, emit_status_event, emit_to_friends};
+use crate::utils::friends::{emit_profile_event, emit_status_event};
 use crate::utils::db::get_db;
-use crate::utils::user::badges::{
-    featured_badge_ids_for_response, populate_user_badges, BadgeVisibility,
-};
 use crate::utils::user::serialize_user::{resolve_display_name, serialize_user, BIO_MAX_LENGTH, DISPLAY_NAME_MAX_LENGTH};
 use crate::utils::upload_limits::{
     file_bytes_within_limit, local_file_size, MAX_AVATAR_BYTES, MAX_BANNER_BYTES,
@@ -1450,16 +1447,7 @@ pub async fn get_user_info(req: HttpRequest) -> HttpResponse {
     };
 
     let whitelist_enabled = is_whitelist_enabled();
-    let badges = populate_user_badges(&db, &user, BadgeVisibility::All).await;
-
     let mut payload = serialize_user(&user, Some(whitelist_enabled));
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("badges".to_string(), json!(badges));
-        obj.insert(
-            "featuredBadgeIds".to_string(),
-            json!(featured_badge_ids_for_response(&user)),
-        );
-    }
 
     let (csrf, csrf_cookie) = csrf_token_for_response(&req);
     if let Some(obj) = payload.as_object_mut() {
@@ -1911,122 +1899,6 @@ pub async fn remove_profile_banner(req: HttpRequest) -> HttpResponse {
     }
 
     HttpResponse::Ok().json(json!({ "message": "Profile banner removed successfully" }))
-}
-
-#[derive(Deserialize)]
-pub struct UpdateFeaturedBadgesBody {
-    #[serde(rename = "featuredBadgeIds", default)]
-    pub featured_badge_ids: Vec<String>,
-}
-
-pub async fn update_featured_badges(
-    req: HttpRequest,
-    body: web::Json<UpdateFeaturedBadgesBody>,
-) -> HttpResponse {
-    let Some(user_id) = req_user_id(&req) else {
-        return HttpResponse::Unauthorized().body("User not authenticated.");
-    };
-    let Ok(oid) = ObjectId::parse_str(&user_id) else {
-        return HttpResponse::NotFound().body("User with the given id not found.");
-    };
-
-    let db = get_db();
-    let user = match User::find_by_id(&db, oid).await {
-        Ok(Some(u)) => u,
-        Ok(None) => return HttpResponse::NotFound().body("User with the given id not found."),
-        Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
-    };
-
-    let mut badges = user.badges.clone();
-    let badges_changed = crate::utils::user::badges::ensure_badge_ids(&mut badges);
-
-    let owned_ids: std::collections::HashSet<String> = badges
-        .iter()
-        .filter_map(|badge| badge.id.map(|id| id.to_hex()))
-        .collect();
-
-    let mut featured_ids = Vec::new();
-    for raw_id in &body.featured_badge_ids {
-        let trimmed = raw_id.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if !owned_ids.contains(trimmed) {
-            return HttpResponse::BadRequest().json(json!({
-                "success": false,
-                "message": "Invalid featured badge selection",
-            }));
-        }
-        if let Ok(parsed) = ObjectId::parse_str(trimmed) {
-            if !featured_ids.iter().any(|id: &ObjectId| *id == parsed) {
-                featured_ids.push(parsed);
-            }
-        }
-    }
-
-    let featured_bson = match mongodb::bson::to_bson(&featured_ids) {
-        Ok(b) => b,
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(json!({
-                "success": false,
-                "message": "Failed to update featured badges",
-            }));
-        }
-    };
-    let update_doc = if badges_changed {
-        let badges_bson = match mongodb::bson::to_bson(&badges) {
-            Ok(b) => b,
-            Err(_) => {
-                return HttpResponse::InternalServerError().json(json!({
-                    "success": false,
-                    "message": "Failed to update featured badges",
-                }));
-            }
-        };
-        doc! { "badges": badges_bson, "featuredBadgeIds": featured_bson }
-    } else {
-        doc! { "featuredBadgeIds": featured_bson }
-    };
-
-    if User::set_fields(&db, oid, update_doc).await.is_err() {
-        return HttpResponse::InternalServerError().json(json!({
-            "success": false,
-            "message": "Failed to update featured badges",
-        }));
-    }
-
-    let updated = match User::find_by_id(&db, oid).await {
-        Ok(Some(u)) => u,
-        _ => return HttpResponse::InternalServerError().body("Internal Server Error"),
-    };
-
-    let all_badges = populate_user_badges(&db, &updated, BadgeVisibility::All).await;
-    let featured_badges = populate_user_badges(&db, &updated, BadgeVisibility::Featured).await;
-    let featured_ids_response = featured_badge_ids_for_response(&updated);
-
-    emit_to_friends(
-        &db,
-        &user_id,
-        "badge:updated",
-        json!({
-            "userId": user_id,
-            "badges": featured_badges,
-        }),
-    )
-    .await;
-
-    let whitelist_enabled = is_whitelist_enabled();
-    let mut payload = serialize_user(&updated, Some(whitelist_enabled));
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("badges".to_string(), json!(all_badges));
-        obj.insert("featuredBadgeIds".to_string(), json!(featured_ids_response));
-    }
-
-    HttpResponse::Ok().json(json!({
-        "success": true,
-        "message": "Featured badges updated",
-        "user": payload,
-    }))
 }
 
 pub async fn disable_account(

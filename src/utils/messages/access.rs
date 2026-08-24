@@ -4,7 +4,7 @@ use mongodb::Database;
 use crate::model::pending_upload_model::PendingUpload;
 use crate::model::messages_model::Message;
 use crate::utils::access::membership_gate::{
-    require_channel_message_access, require_dm_access, require_message_participant,
+    require_channel_message_access, require_dm_access,
 };
 use crate::utils::friends::try_are_friends;
 use crate::utils::storage::{
@@ -23,15 +23,6 @@ pub enum QuoteContext {
 pub enum AttachmentSendContext {
     Dm { recipient_id: String },
     Channel { channel_id: String },
-}
-
-pub async fn validate_quote_target(
-    db: &Database,
-    user_id: &str,
-    quoted_message_id: &str,
-    context: QuoteContext,
-) -> Result<Option<Message>, ()> {
-    validate_quote_target_with_access(db, user_id, quoted_message_id, context, false).await
 }
 
 /// When `access_already_checked`, skip membership/friend gates (caller already gated send).
@@ -91,14 +82,6 @@ pub async fn validate_quote_target_with_access(
             Ok(Some(quoted))
         }
     }
-}
-
-pub async fn can_react_to_message(db: &Database, user_id: &str, msg: &Message) -> bool {
-    require_message_participant(db, user_id, msg).await.is_ok()
-}
-
-pub async fn can_mark_message_as_read(db: &Database, user_id: &str, msg: &Message) -> bool {
-    matches!(try_can_mark_message_as_read(db, user_id, msg).await, Ok(true))
 }
 
 pub async fn try_can_mark_message_as_read(

@@ -17,9 +17,6 @@ use crate::utils::messages::{
     dm_only_or_clause,
 };
 use crate::utils::messages::escape_regex;
-use crate::utils::user::badges::{
-    load_badges_by_ids, populate_user_badges, populate_user_badges_from_map, BadgeVisibility,
-};
 use crate::utils::user::serialize_user::resolve_display_name;
 use crate::utils::whitelist::is_whitelist_enabled;
 
@@ -112,10 +109,7 @@ pub struct SearchBody {
     pub search_term: Option<String>,
 }
 
-fn friend_profile_json_with_badges(
-    friend: &User,
-    badges: Vec<serde_json::Value>,
-) -> serde_json::Value {
+fn friend_profile_json(friend: &User) -> serde_json::Value {
     json!({
         "_id": friend.id.map(|o| o.to_hex()).unwrap_or_default(),
         "username": friend.username,
@@ -127,14 +121,8 @@ fn friend_profile_json_with_badges(
         "isOnline": friend.is_online,
         "lastSeen": friend.last_seen.as_ref().and_then(|d| d.try_to_rfc3339_string().ok()),
         "availabilityStatus": crate::utils::user::serialize_user::availability_status_str(&friend.availability_status),
-        "badges": badges,
         "createdAt": friend.created_at.try_to_rfc3339_string().ok(),
     })
-}
-
-async fn friend_profile_json(db: &mongodb::Database, friend: &User) -> serde_json::Value {
-    let badges = populate_user_badges(db, friend, BadgeVisibility::All).await;
-    friend_profile_json_with_badges(friend, badges)
 }
 
 pub async fn get_contact_profile(req: HttpRequest) -> HttpResponse {
@@ -174,7 +162,7 @@ pub async fn get_contact_profile(req: HttpRequest) -> HttpResponse {
     };
 
     HttpResponse::Ok().json(json!({
-        "contact": friend_profile_json(&db, &friend).await,
+        "contact": friend_profile_json(&friend),
     }))
 }
 
@@ -218,26 +206,12 @@ pub async fn search_contacts(req: HttpRequest, body: web::Json<SearchBody>) -> H
         }
     };
 
-    let friend_matches: Vec<&User> = matches
-        .iter()
-        .filter(|c| {
-            c.id
-                .map(|id| friend_set.contains(&id.to_hex()))
-                .unwrap_or(false)
-        })
-        .collect();
-    let badge_ids = friend_matches
-        .iter()
-        .flat_map(|u| u.badges.iter().map(|b| b.badge_id));
-    let badge_map = load_badges_by_ids(&db, badge_ids).await;
-
     let mut results = Vec::with_capacity(matches.len());
     for c in &matches {
         let Some(candidate_id) = c.id.map(|o| o.to_hex()) else {
             continue;
         };
         if friend_set.contains(&candidate_id) {
-            let badges = populate_user_badges_from_map(c, BadgeVisibility::All, &badge_map);
             results.push(json!({
                 "_id": candidate_id,
                 "username": c.username,
@@ -247,7 +221,6 @@ pub async fn search_contacts(req: HttpRequest, body: web::Json<SearchBody>) -> H
                 "banner": c.banner,
                 "color": c.color,
                 "createdAt": c.created_at.try_to_rfc3339_string().ok(),
-                "badges": badges,
             }));
         } else {
             results.push(json!({
@@ -484,11 +457,6 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
         }
     }
 
-    let badge_ids = friend_map
-        .values()
-        .flat_map(|u| u.badges.iter().map(|b| b.badge_id));
-    let badge_map = load_badges_by_ids(&db, badge_ids).await;
-
     let blocked_set: HashSet<String> = blocked.into_iter().collect();
     let muted_set: HashSet<String> = muted.into_iter().collect();
 
@@ -534,7 +502,6 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
         let Some(friend) = friend_map.get(&other_id) else {
             continue;
         };
-        let badges = populate_user_badges_from_map(friend, BadgeVisibility::All, &badge_map);
         let fid_hex = other_id.to_hex();
         let (last, unread) = if blocked_set.contains(&fid_hex) {
             (None, 0)
@@ -558,7 +525,7 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
         };
 
         let last_time_ms = last.as_ref().map(|(t, _, _)| t.timestamp_millis()).unwrap_or(0);
-        let mut profile = friend_profile_json_with_badges(friend, badges);
+        let mut profile = friend_profile_json(friend);
         if let Some(obj) = profile.as_object_mut() {
             obj.insert(
                 "lastMessageTime".to_string(),
@@ -701,24 +668,17 @@ pub async fn get_blocked_contacts(req: HttpRequest) -> HttpResponse {
         }
     }
 
-    let badge_ids = blocked_map
-        .values()
-        .flat_map(|u| u.badges.iter().map(|b| b.badge_id));
-    let badge_map = load_badges_by_ids(&db, badge_ids).await;
-
     let mut blocked = Vec::new();
     for contact_oid in &user.blocked_contacts {
         let Some(friend) = blocked_map.get(contact_oid) else {
             continue;
         };
-        let badges = populate_user_badges_from_map(friend, BadgeVisibility::All, &badge_map);
         blocked.push(json!({
             "_id": contact_oid.to_hex(),
             "username": friend.username,
             "displayName": resolve_display_name(friend),
             "image": friend.image,
             "color": friend.color,
-            "badges": badges,
         }));
     }
 

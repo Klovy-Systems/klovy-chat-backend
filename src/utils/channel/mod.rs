@@ -10,9 +10,6 @@ use crate::model::channel_model::Channel;
 use crate::model::channel_read_state_model::ChannelReadState;
 use crate::model::messages_model::Message;
 use crate::model::user_model::User;
-use crate::utils::user::badges::{
-    load_badges_by_ids, populate_user_badges, populate_user_badges_from_map, BadgeVisibility,
-};
 use crate::utils::user::serialize_user::resolve_display_name;
 
 pub mod moderation;
@@ -114,7 +111,7 @@ pub async fn serialize_channel_list_item(
     }))
 }
 
-fn user_to_channel_json(user: &User, badges: Vec<Value>) -> Value {
+fn user_to_channel_json(user: &User) -> Value {
     json!({
         "_id": user.id.map(|o| o.to_hex()),
         "username": user.username,
@@ -123,7 +120,6 @@ fn user_to_channel_json(user: &User, badges: Vec<Value>) -> Value {
         "image": user.image,
         "banner": user.banner,
         "color": user.color,
-        "badges": badges,
     })
 }
 
@@ -137,7 +133,7 @@ fn user_to_channel_json_slim(user: &User) -> Value {
     })
 }
 
-/// Batch-load slim profiles for channel list (no badges / bio / banner).
+/// Batch-load slim profiles for channel list (no bio / banner).
 pub async fn fetch_users_map_slim(db: &Database, ids: &[ObjectId]) -> HashMap<ObjectId, Value> {
     let mut seen = HashSet::new();
     let unique: Vec<ObjectId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
@@ -175,15 +171,12 @@ pub async fn fetch_users_map_slim(db: &Database, ids: &[ObjectId]) -> HashMap<Ob
 
 pub async fn populate_channel_user(db: &Database, id: ObjectId) -> Value {
     match User::find_by_id(db, id).await {
-        Ok(Some(u)) => {
-            let badges = populate_user_badges(db, &u, BadgeVisibility::All).await;
-            user_to_channel_json(&u, badges)
-        }
+        Ok(Some(u)) => user_to_channel_json(&u),
         _ => json!({ "_id": id.to_hex() }),
     }
 }
 
-/// Batch-load channel member/admin profiles (one users query + one badges query).
+/// Batch-load channel member/admin profiles (one users query).
 pub async fn fetch_users_map(db: &Database, ids: &[ObjectId]) -> HashMap<ObjectId, Value> {
     let mut seen = HashSet::new();
     let unique: Vec<ObjectId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
@@ -205,15 +198,11 @@ pub async fn fetch_users_map(db: &Database, ids: &[ObjectId]) -> HashMap<ObjectI
         }
     };
 
-    let badge_ids = users.iter().flat_map(|u| u.badges.iter().map(|b| b.badge_id));
-    let badge_map = load_badges_by_ids(db, badge_ids).await;
-
     let mut found = HashSet::new();
     for user in &users {
         let Some(id) = user.id else { continue };
         found.insert(id);
-        let badges = populate_user_badges_from_map(user, BadgeVisibility::All, &badge_map);
-        out.insert(id, user_to_channel_json(user, badges));
+        out.insert(id, user_to_channel_json(user));
     }
     for id in unique {
         if !found.contains(&id) {
@@ -268,13 +257,13 @@ pub async fn enrich_channel_unread(
                 .await
             {
                 Ok(mut cursor) => match cursor.try_next().await {
-                    Ok(Some(m)) => m.id.map(|id| {
-                        (
-                            m.timestamp,
-                            crate::utils::messages::content_storage::content_for_api(&m.content),
-                            id,
+                    Ok(Some(m)) => {
+                        let content = crate::utils::messages::content_storage::content_for_api_async(
+                            m.content.clone(),
                         )
-                    }),
+                        .await;
+                        m.id.map(|id| (m.timestamp, content, id))
+                    }
                     Ok(None) => None,
                     Err(_) => return None,
                 },

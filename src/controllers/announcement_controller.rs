@@ -7,19 +7,8 @@ use crate::middlewares::auth_middleware::request_user_id;
 use crate::model::announcement_model::{Announcement, AnnouncementDismissal};
 use crate::utils::db::get_db;
 
-fn iso(dt: &mongodb::bson::DateTime) -> Option<String> {
-    dt.try_to_rfc3339_string().ok()
-}
-
 fn serialize_announcement(a: &Announcement) -> serde_json::Value {
-    json!({
-        "id": a.id.map(|o| o.to_hex()),
-        "title": a.title,
-        "body": a.body,
-        "active": a.active,
-        "createdAt": iso(&a.created_at),
-        "updatedAt": iso(&a.updated_at),
-    })
+    a.to_api_json()
 }
 
 pub async fn get_my_announcements(req: HttpRequest) -> HttpResponse {

@@ -55,7 +55,7 @@ pub struct PurgeRemovedSchemaReport {
     pub e2e_keys_dropped: bool,
 }
 
-/// Strip obsolete E2E / panel-admin fields left in Mongo after those features were removed.
+/// Strip obsolete E2E / panel-admin / badge fields left in Mongo after those features were removed.
 pub async fn purge_removed_schema_fields(
     db: &Database,
 ) -> Result<PurgeRemovedSchemaReport, mongodb::error::Error> {
@@ -71,6 +71,8 @@ pub async fn purge_removed_schema_fields(
                     { "listeningActivity": { "$exists": true } },
                     { "shareListening": { "$exists": true } },
                     { "connectedAccounts": { "$exists": true } },
+                    { "badges": { "$exists": true } },
+                    { "featuredBadgeIds": { "$exists": true } },
                 ]
             },
             doc! {
@@ -81,6 +83,8 @@ pub async fn purge_removed_schema_fields(
                     "listeningActivity": "",
                     "shareListening": "",
                     "connectedAccounts": "",
+                    "badges": "",
+                    "featuredBadgeIds": "",
                 }
             },
         )
@@ -105,7 +109,7 @@ pub async fn purge_removed_schema_fields(
         .await?;
     report.messages_modified = messages.modified_count;
 
-    for collection_name in ["e2e_keys", "oauth_tokens", "push_tokens"] {
+    for collection_name in ["e2e_keys", "oauth_tokens", "push_tokens", "badges"] {
         let collection = db.collection::<mongodb::bson::Document>(collection_name);
         match collection.drop().await {
             Ok(()) => {
@@ -328,10 +332,7 @@ pub async fn purge_user_data(
         .await?;
 
     // Member channels: notify peers + invalidate before pull.
-    let member_channels: Vec<Channel> = Channel::collection(db)
-        .find(doc! { "members": user_id })
-        .await?
-        .try_collect()
+    let member_channels: Vec<Channel> = Channel::find_by_member(db, user_id)
         .await
         .unwrap_or_default();
 

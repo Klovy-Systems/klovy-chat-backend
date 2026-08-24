@@ -6,9 +6,8 @@ use serde_json::{json, Value};
 use crate::model::friend_request_model::FriendRequest;
 use crate::model::user_model::User;
 use crate::utils::friends::cache::{
-    get_cached_friend_ids, get_cached_friend_set, put_cached_friend_ids,
+    get_cached_block_pair, get_cached_friend_ids, get_cached_friend_set, put_cached_friend_ids,
 };
-use crate::utils::user::badges::{populate_user_badges, BadgeVisibility};
 use crate::utils::user::serialize_user::resolve_display_name;
 
 pub mod cache;
@@ -81,24 +80,14 @@ pub async fn try_dm_block_flags(
     Ok((viewer_blocks, peer_blocks))
 }
 
-pub async fn dm_block_flags(db: &Database, viewer: &str, peer: &str) -> (bool, bool) {
-    try_dm_block_flags(db, viewer, peer)
-        .await
-        .unwrap_or((false, false))
-}
-
-pub async fn is_dm_blocked(db: &Database, user_id1: &str, user_id2: &str) -> bool {
-    matches!(
-        try_is_dm_blocked(db, user_id1, user_id2).await,
-        Ok(true)
-    )
-}
-
 pub async fn try_is_dm_blocked(
     db: &Database,
     user_id1: &str,
     user_id2: &str,
 ) -> Result<bool, ()> {
+    if let Some(blocked) = get_cached_block_pair(user_id1, user_id2) {
+        return Ok(blocked);
+    }
     let (a, b) = try_dm_block_flags(db, user_id1, user_id2).await?;
     Ok(a || b)
 }
@@ -129,13 +118,7 @@ pub async fn try_are_friends(db: &Database, user_id1: &str, user_id2: &str) -> R
     }
 }
 
-/// Zwraca listę identyfikatorów (hex) zaakceptowanych znajomych użytkownika.
-/// Używane do rozgłaszania zdarzeń obecności/profilu tylko do znajomych,
-/// zamiast do wszystkich zalogowanych klientów.
-pub async fn friend_ids(db: &Database, user_id: &str) -> Vec<String> {
-    try_friend_ids(db, user_id).await.unwrap_or_default()
-}
-
+/// Lista hex-id zaakceptowanych znajomych (cache + DB). Błąd bazy → Err, nie pusta lista.
 pub async fn try_friend_ids(db: &Database, user_id: &str) -> Result<Vec<String>, ()> {
     if let Some(cached) = get_cached_friend_ids(user_id) {
         return Ok(cached);
@@ -244,27 +227,5 @@ pub fn map_friend_user(user: &User) -> Value {
         "banner": user.banner,
         "color": user.color,
         "createdAt": user.created_at.try_to_rfc3339_string().ok(),
-    })
-}
-
-pub async fn map_friend_user_profile(db: &Database, user: &User) -> Value {
-    let badges = populate_user_badges(db, user, BadgeVisibility::All).await;
-    map_friend_user_profile_from_map(user, badges)
-}
-
-pub fn map_friend_user_profile_from_map(
-    user: &User,
-    badges: Vec<Value>,
-) -> Value {
-    json!({
-        "_id": user.id.map(|o| o.to_hex()).unwrap_or_default(),
-        "username": user.username,
-        "displayName": resolve_display_name(user),
-        "bio": user.bio,
-        "image": user.image,
-        "banner": user.banner,
-        "color": user.color,
-        "createdAt": user.created_at.try_to_rfc3339_string().ok(),
-        "badges": badges,
     })
 }

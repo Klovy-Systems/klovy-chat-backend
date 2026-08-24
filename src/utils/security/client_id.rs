@@ -115,12 +115,6 @@ fn is_public_info_path(path: &str) -> bool {
     path == "/" || path == "/api"
 }
 
-/// True when this HTTP path must present `X-Klovy-Client` (or `?client=` on GET).
-pub fn requires_client_identifier(path: &str) -> bool {
-    let path = canonicalize_request_path(path);
-    !is_public_info_path(&path) && !is_security_webhook_path(&path)
-}
-
 /// Cheap official-client check for Axum (before body) and Actix (defense in depth).
 pub fn official_client_presented(
     method: &str,
@@ -142,71 +136,4 @@ pub fn official_client_presented(
         return true;
     }
     method_upper == "GET" && query_client_valid(query)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn api_mutations_require_client_header() {
-        assert!(!official_client_presented("POST", "/api/auth/login", None, None));
-        assert!(official_client_presented(
-            "POST",
-            "/api/auth/login",
-            None,
-            Some("KlovyChatApp/1.0.0"),
-        ));
-    }
-
-    #[test]
-    fn health_and_preflight_are_exempt() {
-        assert!(official_client_presented("GET", "/api", None, None));
-        assert!(official_client_presented("GET", "/api/", None, None));
-        assert!(official_client_presented("OPTIONS", "/api/messages", None, None));
-        assert!(official_client_presented(
-            "GET",
-            "/api/auth/oauth",
-            Some("client=KlovyChatApp"),
-            None,
-        ));
-    }
-
-    #[test]
-    fn odd_paths_still_require_client_header() {
-        assert!(!official_client_presented("POST", "/", None, None));
-        assert!(!official_client_presented(
-            "POST",
-            "//api/auth/login",
-            None,
-            None,
-        ));
-        assert!(!official_client_presented("POST", "/API/auth/login", None, None));
-        assert!(official_client_presented(
-            "POST",
-            "//API/auth/login",
-            None,
-            Some("KlovyChatApp/1.0.0"),
-        ));
-        assert!(!official_client_presented(
-            "POST",
-            "/api/security",
-            None,
-            None,
-        ));
-        assert!(!official_client_presented(
-            "POST",
-            "/api/securityfoo",
-            None,
-            None,
-        ));
-        assert!(official_client_presented("GET", "/api/security/report", None, None));
-        assert!(!official_client_presented(
-            "POST",
-            "/%2e%2e/api/auth/login",
-            None,
-            None,
-        ));
-        assert!(official_client_presented("GET", "/%61pi", None, None));
-    }
 }

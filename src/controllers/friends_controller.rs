@@ -9,10 +9,8 @@ use crate::model::friend_request_model::{FriendRequest, FriendRequestStatus};
 use crate::model::user_model::User;
 use crate::utils::db::get_db;
 use crate::utils::friends::{
-    invalidate_friend_ids_pair, map_friend_user, map_friend_user_profile,
-    map_friend_user_profile_from_map, try_are_friends,
+    invalidate_friend_ids_pair, map_friend_user, try_are_friends,
 };
-use crate::utils::user::badges::{load_badges_by_ids, populate_user_badges_from_map, BadgeVisibility};
 use crate::ws::typing_access_cache;
 use crate::utils::validators::normalize_username::normalize_username;
 use crate::utils::whitelist::is_whitelist_enabled;
@@ -185,7 +183,7 @@ pub async fn send_friend_request(
                     return HttpResponse::Ok().json(json!({
                         "message": "Wzajemne zaproszenie — jesteście teraz znajomymi.",
                         "autoAccepted": true,
-                        "friend": map_friend_user_profile(&db, &recipient).await,
+                        "friend": map_friend_user(&recipient),
                     }));
                 }
                 return HttpResponse::BadRequest().json(json!({
@@ -407,11 +405,10 @@ pub async fn accept_friend_request(req: HttpRequest) -> HttpResponse {
     let from_hex = request.from.to_hex();
     let (friend_for_accepter, friend_for_requester) = match (from_user, accepter) {
         (Ok(Some(from_user)), Ok(Some(accepter))) => {
-            let (a, b) = tokio::join!(
-                map_friend_user_profile(&db, &from_user),
-                map_friend_user_profile(&db, &accepter),
-            );
-            (a, b)
+            (
+                map_friend_user(&from_user),
+                map_friend_user(&accepter),
+            )
         }
         _ => (
             json!({ "_id": from_hex }),
@@ -563,18 +560,13 @@ pub async fn get_friends(req: HttpRequest) -> HttpResponse {
         return HttpResponse::ServiceUnavailable()
             .json(json!({ "error": "Friends temporarily unavailable. Please retry." }));
     };
-    let badge_ids = user_map
-        .values()
-        .flat_map(|u| u.badges.iter().map(|b| b.badge_id));
-    let badge_map = load_badges_by_ids(&db, badge_ids).await;
 
     let mut friends = Vec::with_capacity(ordered_ids.len());
     for id in &ordered_ids {
         let Some(user) = user_map.get(id) else {
             continue;
         };
-        let badges = populate_user_badges_from_map(user, BadgeVisibility::All, &badge_map);
-        friends.push(map_friend_user_profile_from_map(user, badges));
+        friends.push(map_friend_user(user));
     }
 
     HttpResponse::Ok().json(json!({ "friends": friends }))
