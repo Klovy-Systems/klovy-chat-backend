@@ -19,7 +19,7 @@ pub fn hmac_sha256_hex(key: &[u8], message: &str) -> String {
     hex::encode(hmac_sha256(key, message))
 }
 
-pub fn hmac_sha256(key: &[u8], message: &str) -> [u8; 32] {
+fn hmac_sha256(key: &[u8], message: &str) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts arbitrary key length");
     mac.update(message.as_bytes());
     let digest = mac.finalize().into_bytes();
