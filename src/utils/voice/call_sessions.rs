@@ -242,6 +242,16 @@ pub fn active_session_for_user(user_id: &str) -> Option<CallSession> {
         .cloned()
 }
 
+pub fn clear_ringing_sessions_for_user(user_id: &str) {
+    let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    sessions.retain(|_, session| {
+        if session.caller_id != user_id && session.callee_id != user_id {
+            return true;
+        }
+        session.phase != CallPhase::Ringing
+    });
+}
+
 fn connection_owns_side(session: &CallSession, user_id: &str, conn_id: u64) -> bool {
     if session.caller_id == user_id {
         return session.caller_conn_id == Some(conn_id);
@@ -326,4 +336,8 @@ pub fn take_session_for_pair(a: &str, b: &str) -> Option<CallSession> {
     let key = pair_key(a, b);
     let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     sessions.remove(&key)
+}
+
+pub fn clear_sessions_for_user(user_id: &str) {
+    let _ = take_sessions_for_user(user_id);
 }

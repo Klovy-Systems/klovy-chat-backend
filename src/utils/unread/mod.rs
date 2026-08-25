@@ -320,7 +320,7 @@ pub async fn set_channel_unread_denorm(
         .is_ok()
 }
 
-/// Recount + denorm until stable (parity with `try_sync_dm_tip_unread`).
+/// Recount + denorm until stable (parity with `sync_dm_tip_unread`).
 pub async fn try_sync_channel_unread(
     db: &Database,
     user_id: ObjectId,
@@ -360,6 +360,11 @@ pub async fn try_sync_channel_unread(
 
 pub fn emit_unread_updated(user_id: &str, event: UnreadUpdatedEvent) {
     registry::emit_to_user(user_id, "unread-updated", event);
+}
+
+pub fn emit_unread_delta(user_id: &str, kind: &str, id: &str, delta: i64) {
+    let generation = current_generation(user_id, kind, id);
+    emit_unread_delta_at(user_id, kind, id, delta, generation);
 }
 
 /// Emit a delta pinned to a generation snapshot (capture before Message::create
@@ -407,6 +412,36 @@ pub fn emit_unread_absolute(user_id: &str, kind: &str, id: &str, unread_count: u
             generation,
         },
     );
+}
+
+pub async fn emit_dm_unread_updated(
+    db: &Database,
+    user_id: &str,
+    contact_id: &str,
+) -> Option<u64> {
+    let (Ok(uid), Ok(cid)) = (ObjectId::parse_str(user_id), ObjectId::parse_str(contact_id)) else {
+        return None;
+    };
+    let Some(unread) = try_count_dm_unread(db, uid, cid).await else {
+        return None;
+    };
+    emit_unread_absolute(user_id, "dm", contact_id, unread);
+    Some(unread)
+}
+
+pub async fn emit_channel_unread_updated(
+    db: &Database,
+    user_id: &str,
+    channel_id: &str,
+) -> Option<u64> {
+    let (Ok(uid), Ok(cid)) = (ObjectId::parse_str(user_id), ObjectId::parse_str(channel_id)) else {
+        return None;
+    };
+    let Some(unread) = try_count_channel_unread(db, uid, cid).await else {
+        return None;
+    };
+    emit_unread_absolute(user_id, "channel", channel_id, unread);
+    Some(unread)
 }
 
 pub async fn mark_channel_as_read_for_user(

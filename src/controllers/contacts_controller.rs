@@ -74,7 +74,6 @@ async fn search_users_by_term(
         "isBanned": { "$ne": true },
         "isDisabled": { "$ne": true },
         "deletionScheduledAt": { "$exists": false },
-        "isBot": { "$ne": true },
         "$or": [
             { "username": { "$regex": format!("^{escaped}") } },
             { "displayName": { "$regex": format!("^{escaped}"), "$options": "i" } },

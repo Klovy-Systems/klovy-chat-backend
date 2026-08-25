@@ -115,6 +115,12 @@ fn is_public_info_path(path: &str) -> bool {
     path == "/" || path == "/api"
 }
 
+/// True when this HTTP path must present `X-Klovy-Client` (or `?client=` on GET).
+pub fn requires_client_identifier(path: &str) -> bool {
+    let path = canonicalize_request_path(path);
+    !is_public_info_path(&path) && !is_security_webhook_path(&path)
+}
+
 /// Cheap official-client check for Axum (before body) and Actix (defense in depth).
 pub fn official_client_presented(
     method: &str,

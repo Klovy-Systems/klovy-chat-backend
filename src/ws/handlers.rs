@@ -773,8 +773,7 @@ pub enum ChannelBroadcastOutcome {
     IdempotentReplay(Value),
 }
 
-/// Rdzeń tworzenia i rozgłaszania wiadomości kanałowej — współdzielony przez
-/// gniazdo WS (użytkownicy) oraz runtime HTTP botów. Zakłada, że dostęp do
+/// Rdzeń tworzenia i rozgłaszania wiadomości kanałowej. Zakłada, że dostęp do
 /// kanału został już zweryfikowany przez wywołującego. Zwraca zserializowaną
 /// wiadomość (z polem `channelId`).
 pub async fn create_and_broadcast_channel_message(

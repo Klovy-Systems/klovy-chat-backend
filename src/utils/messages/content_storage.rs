@@ -107,6 +107,13 @@ pub fn reveal_content_internal(stored: &str) -> String {
     trimmed.to_string()
 }
 
+pub async fn reveal_content_internal_async(stored: String) -> String {
+    let fallback = stored.clone();
+    tokio::task::spawn_blocking(move || reveal_content_internal(&stored))
+        .await
+        .unwrap_or(fallback)
+}
+
 pub fn unwrap_client_opaque(stored: &str) -> String {
     let trimmed = stored.trim();
     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(trimmed) {

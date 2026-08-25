@@ -131,6 +131,23 @@ impl Announcement {
         Ok(created)
     }
 
+    pub async fn find_by_id(
+        db: &Database,
+        id: ObjectId,
+    ) -> mongodb::error::Result<Option<Announcement>> {
+        Self::collection(db).find_one(doc! { "_id": id }).await
+    }
+
+    pub async fn list_all(db: &Database) -> mongodb::error::Result<Vec<Announcement>> {
+        Self::collection(db)
+            .find(doc! {})
+            .sort(doc! { "createdAt": -1 })
+            .limit(200)
+            .await?
+            .try_collect()
+            .await
+    }
+
     pub async fn list_active(db: &Database) -> mongodb::error::Result<Vec<Announcement>> {
         Self::collection(db)
             .find(doc! { "active": true })
@@ -139,6 +156,34 @@ impl Announcement {
             .await?
             .try_collect()
             .await
+    }
+
+    pub async fn update_fields(
+        db: &Database,
+        id: ObjectId,
+        set: mongodb::bson::Document,
+    ) -> mongodb::error::Result<Option<Announcement>> {
+        use mongodb::options::FindOneAndUpdateOptions;
+        use mongodb::options::ReturnDocument;
+
+        let options = FindOneAndUpdateOptions::builder()
+            .return_document(ReturnDocument::After)
+            .build();
+
+        Self::collection(db)
+            .find_one_and_update(doc! { "_id": id }, doc! { "$set": set })
+            .with_options(options)
+            .await
+    }
+
+    pub async fn delete_by_id(db: &Database, id: ObjectId) -> mongodb::error::Result<bool> {
+        let result = Self::collection(db)
+            .delete_one(doc! { "_id": id })
+            .await?;
+        AnnouncementDismissal::collection(db)
+            .delete_many(doc! { "announcementId": id })
+            .await?;
+        Ok(result.deleted_count > 0)
     }
 }
 

@@ -334,7 +334,6 @@ impl User {
         Self::collection(db)
             .find_one(doc! {
                 "username": normalize_username(username),
-                "isBot": { "$ne": true },
             })
             .await
     }

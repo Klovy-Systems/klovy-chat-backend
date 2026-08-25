@@ -119,6 +119,12 @@ pub fn build_search_index_from_incoming(incoming: &str) -> Result<SearchIndex, S
     build_search_index_from_normalized(&normalize_search_text(&plain))
 }
 
+pub fn search_text_from_incoming(incoming: &str) -> String {
+    build_search_index_from_incoming(incoming)
+        .map(|idx| idx.encrypted_text)
+        .unwrap_or_default()
+}
+
 pub fn search_text_from_stored(stored: &str) -> String {
     normalize_search_text(&reveal_content_internal(stored))
 }

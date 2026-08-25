@@ -25,6 +25,15 @@ pub enum AttachmentSendContext {
     Channel { channel_id: String },
 }
 
+pub async fn validate_quote_target(
+    db: &Database,
+    user_id: &str,
+    quoted_message_id: &str,
+    context: QuoteContext,
+) -> Result<Option<Message>, ()> {
+    validate_quote_target_with_access(db, user_id, quoted_message_id, context, false).await
+}
+
 /// When `access_already_checked`, skip membership/friend gates (caller already gated send).
 pub async fn validate_quote_target_with_access(
     db: &Database,

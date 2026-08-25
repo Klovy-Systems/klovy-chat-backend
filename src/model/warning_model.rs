@@ -15,7 +15,7 @@ pub enum WarningSeverity {
 
 impl Default for WarningSeverity {
     fn default() -> Self {
-        WarningSeverity::Medium
+        parse_severity(None)
     }
 }
 
@@ -26,6 +26,16 @@ pub fn severity_str(severity: &WarningSeverity) -> &'static str {
         WarningSeverity::High => "high",
     }
 }
+
+pub fn parse_severity(value: Option<&str>) -> WarningSeverity {
+    match value.map(|s| s.trim().to_lowercase()).as_deref() {
+        Some("low") => WarningSeverity::Low,
+        Some("high") => WarningSeverity::High,
+        _ => WarningSeverity::Medium,
+    }
+}
+
+pub const WARNING_REASON_MAX_LENGTH: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Warning {
@@ -59,6 +69,12 @@ fn default_issued_by() -> String {
     "admin".to_string()
 }
 
+pub struct CreateWarningInput {
+    pub user_id: ObjectId,
+    pub reason: String,
+    pub severity: WarningSeverity,
+}
+
 impl Warning {
     pub fn collection(db: &Database) -> Collection<Warning> {
         db.collection("warnings")
@@ -84,6 +100,41 @@ impl Warning {
         Ok(())
     }
 
+    pub async fn create(
+        db: &Database,
+        input: CreateWarningInput,
+    ) -> mongodb::error::Result<Warning> {
+        let reason = input
+            .reason
+            .trim()
+            .chars()
+            .take(WARNING_REASON_MAX_LENGTH)
+            .collect::<String>();
+
+        let warning = Warning {
+            id: None,
+            user_id: input.user_id,
+            reason,
+            severity: parse_severity(Some(severity_str(&input.severity))),
+            issued_by: default_issued_by(),
+            acknowledged: false,
+            acknowledged_at: None,
+            created_at: DateTime::now(),
+        };
+
+        let result = Self::collection(db).insert_one(&warning).await?;
+        let id = result.inserted_id.as_object_id();
+
+        Ok(Warning { id, ..warning })
+    }
+
+    pub async fn find_by_id(
+        db: &Database,
+        id: ObjectId,
+    ) -> mongodb::error::Result<Option<Warning>> {
+        Self::collection(db).find_one(doc! { "_id": id }).await
+    }
+
     pub async fn list_for_user(
         db: &Database,
         user_id: ObjectId,
@@ -98,6 +149,15 @@ impl Warning {
             .await
     }
 
+    pub async fn count_for_user(
+        db: &Database,
+        user_id: ObjectId,
+    ) -> mongodb::error::Result<u64> {
+        Self::collection(db)
+            .count_documents(doc! { "userId": user_id })
+            .await
+    }
+
     pub async fn acknowledge_all_for_user(
         db: &Database,
         user_id: ObjectId,
@@ -109,5 +169,16 @@ impl Warning {
             )
             .await?;
         Ok(result.modified_count)
+    }
+
+    pub async fn delete_one(
+        db: &Database,
+        id: ObjectId,
+        user_id: ObjectId,
+    ) -> mongodb::error::Result<bool> {
+        let result = Self::collection(db)
+            .delete_one(doc! { "_id": id, "userId": user_id })
+            .await?;
+        Ok(result.deleted_count > 0)
     }
 }
