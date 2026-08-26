@@ -1,3 +1,11 @@
+// whitelist.rs
+// Blokuje pending userów przed czatem/WS.
+// Zakres:
+//  - isWhitelisted
+//  - pending user nie wchodzi na czat/WS
+// PendingApproval na FE pollingiem, nie WS.
+// Przy zmianach: utils/whitelist/mod.rs, ws/mod.rs.
+
 use actix_web::{
     body::{BoxBody, MessageBody},
     dev::{ServiceRequest, ServiceResponse},
@@ -5,8 +13,8 @@ use actix_web::{
 };
 use actix_web_lab::middleware::Next;
 
-use crate::middlewares::auth_middleware::resolve_authenticated_user;
-use crate::utils::auth::jwt_auth::JwtUserError;
+use crate::middlewares::auth::resolve_authenticated_user;
+use crate::utils::auth::jwt::JwtUserError;
 use crate::utils::whitelist::is_whitelist_enabled;
 
 pub async fn whitelist_check(

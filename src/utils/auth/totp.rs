@@ -1,9 +1,17 @@
+// totp.rs
+// Weryfikacja kodu TOTP (okno, replay).
+// Zakres:
+//  - login 2FA
+//  - okno czasowe i replay; nie loguj kodu
+// Nie loguj kodu.
+// Przy zmianach: two_factor.rs, controllers/auth.rs.
+
 use rand::Rng;
 use totp_rs::{Algorithm, Secret, TOTP};
 
 use crate::utils::crypto::{
-    credential_hash::{hash_reset_token, verify_reset_token},
-    field_encrypt::{decrypt_field, encrypt_field},
+    passwords::{hash_reset_token, verify_reset_token},
+    encrypt::{decrypt_field, encrypt_field},
 };
 
 pub const BACKUP_CODE_COUNT: usize = 8;

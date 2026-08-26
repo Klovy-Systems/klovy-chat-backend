@@ -1,3 +1,11 @@
+// moderation.rs
+// Atomowy $pull mute/ban, prune wygasłych timed.
+// Zakres:
+//  - bez rewrite tablicy ze snapshotu
+//  - atomowy $pull mute/ban, prune timed; nie rewrite tablicy
+// Kick/ban kolejność: ban upsert, potem pull member (komentarze w channels.rs).
+// Przy zmianach: controllers/channels.rs, model/channels.rs.
+
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
 use serde_json::{json, Value};
@@ -5,9 +13,8 @@ use serde_json::{json, Value};
 use crate::model::channel_moderation::{
     active_moderation_entries, ChannelModerationEntry,
 };
-use crate::model::channel_model::Channel;
+use crate::model::channels::Channel;
 
-/// Atomic mute-list remove — avoids rewriting full arrays from a stale snapshot.
 pub async fn pull_muted_member(
     db: &Database,
     channel_id: ObjectId,
@@ -25,7 +32,6 @@ pub async fn pull_muted_member(
     Ok(())
 }
 
-/// Atomic ban-list remove.
 pub async fn pull_banned_member(
     db: &Database,
     channel_id: ObjectId,
@@ -43,7 +49,6 @@ pub async fn pull_banned_member(
     Ok(())
 }
 
-/// Upsert one ban entry without clobbering the rest of the list (single pipeline update).
 pub async fn upsert_banned_member(
     db: &Database,
     channel_id: ObjectId,
@@ -78,7 +83,6 @@ pub async fn upsert_banned_member(
     Ok(())
 }
 
-/// Upsert one mute entry without clobbering the rest of the list (single pipeline update).
 pub async fn upsert_muted_member(
     db: &Database,
     channel_id: ObjectId,
@@ -184,7 +188,6 @@ pub fn active_moderation_user_ids(entries: &[ChannelModerationEntry]) -> Vec<Str
         .collect()
 }
 
-/// ISO expiry for the viewer's active timed mute (if any).
 pub fn viewer_mute_expires_at(channel: &Channel, viewer_id: &str) -> Option<String> {
     channel
         .muted_members
@@ -211,7 +214,7 @@ pub async fn maybe_prune_channel_moderation(db: &Database, channel: &Channel) ->
         .collect();
 
     if let Some(channel_id) = channel.id {
-        // Pull only expired timed entries — never rewrite full arrays (races upsert).
+
         let now = DateTime::now();
         let _ = Channel::collection(db)
             .update_one(
@@ -226,8 +229,8 @@ pub async fn maybe_prune_channel_moderation(db: &Database, channel: &Channel) ->
             )
             .await;
         let channel_id_hex = channel_id.to_hex();
-        crate::ws::typing_access_cache::invalidate_channel(&channel_id_hex);
-        crate::utils::access::channel_access_cache::invalidate_channel(&channel_id_hex);
+        crate::ws::typing::invalidate_channel(&channel_id_hex);
+        crate::utils::access::cache::invalidate_channel(&channel_id_hex);
         for user_id in expired_mute_users {
             crate::ws::registry::emit_to_user(
                 &user_id,

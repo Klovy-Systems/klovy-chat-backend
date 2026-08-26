@@ -1,8 +1,16 @@
+// mod.rs
+// Reeksport access/search/mentions/storage.
+// Zakres:
+//  - ścieżka send
+//  - access, search, mentions, storage — nowy aspekt = podplik
+// Nowy aspekt wiadomości: podplik tutaj.
+// Przy zmianach: handlers.rs.
+
 pub mod access;
-pub mod content_storage;
+pub mod storage;
 pub mod mentions;
-pub mod seal_legacy_content;
-pub mod search_text;
+pub mod encrypt_old;
+pub mod search;
 
 use futures::stream::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime};
@@ -10,12 +18,12 @@ use mongodb::Database;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
-use crate::model::channel_model::Channel;
-use crate::model::messages_model::Message;
-use crate::model::user_model::User;
+use crate::model::channels::Channel;
+use crate::model::messages::Message;
+use crate::model::users::User;
 use crate::utils::channel::{can_access_channel, is_channel_admin};
-use crate::utils::access::membership_gate::require_dm_access;
-use crate::utils::user::serialize_user::resolve_display_name;
+use crate::utils::access::members::require_dm_access;
+use crate::utils::user::json::resolve_display_name;
 
 pub fn dm_only_or_clause() -> Bson {
     Bson::Array(vec![
@@ -65,7 +73,7 @@ fn reactions_to_json(msg: &Message) -> Value {
 fn message_content_for_api(msg: &Message, content_cache: &HashMap<ObjectId, String>) -> String {
     msg.id
         .and_then(|id| content_cache.get(&id).cloned())
-        .unwrap_or_else(|| crate::utils::messages::content_storage::content_for_api(&msg.content))
+        .unwrap_or_else(|| crate::utils::messages::storage::content_for_api(&msg.content))
 }
 
 async fn build_content_cache(msgs: &[Message], quoted: &HashMap<ObjectId, Message>) -> HashMap<ObjectId, String> {
@@ -82,7 +90,7 @@ async fn build_content_cache(msgs: &[Message], quoted: &HashMap<ObjectId, Messag
     }
     let contents: Vec<String> = pairs.iter().map(|(_, c)| c.clone()).collect();
     let decrypted =
-        crate::utils::messages::content_storage::contents_for_api_batch_async(contents).await;
+        crate::utils::messages::storage::contents_for_api_batch_async(contents).await;
     pairs
         .into_iter()
         .zip(decrypted)
@@ -154,8 +162,7 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
 }
 
 pub async fn serialize_message(db: &Database, msg: &Message) -> Value {
-    // Prefer the batched path even for a single message so WS send/edit avoids
-    // per-field User::find_by_id N+1 lookups.
+
     let mut batch = serialize_messages_batch(db, std::slice::from_ref(msg)).await;
     if let Some(value) = batch.pop() {
         return value;
@@ -253,15 +260,11 @@ fn serialize_message_cached(
     })
 }
 
-/// Serialize a batch of messages with only three DB round-trips (quoted
-/// messages, then all referenced users), instead of the previous N+1 pattern
-/// that issued several `find_one` calls per message.
 pub async fn serialize_messages_batch(db: &Database, msgs: &[Message]) -> Vec<Value> {
     if msgs.is_empty() {
         return Vec::new();
     }
 
-    // 1. Fetch all quoted messages in one query.
     let quoted_ids: Vec<ObjectId> = msgs.iter().filter_map(|m| m.quoted_message).collect();
     let mut quoted_map: HashMap<ObjectId, Message> = HashMap::new();
     let mut quotes_unavailable = false;
@@ -284,7 +287,6 @@ pub async fn serialize_messages_batch(db: &Database, msgs: &[Message]) -> Vec<Va
         }
     }
 
-    // 2. Gather every referenced user id (from messages and their quotes).
     let mut user_ids: HashSet<ObjectId> = HashSet::new();
     for m in msgs {
         collect_message_user_ids(m, &mut user_ids);
@@ -293,7 +295,6 @@ pub async fn serialize_messages_batch(db: &Database, msgs: &[Message]) -> Vec<Va
         collect_message_user_ids(m, &mut user_ids);
     }
 
-    // 3. Fetch all users in one query and build a lookup cache.
     let mut user_map: HashMap<ObjectId, Value> = HashMap::new();
     if !user_ids.is_empty() {
         let ids: Vec<ObjectId> = user_ids.into_iter().collect();
@@ -310,7 +311,6 @@ pub async fn serialize_messages_batch(db: &Database, msgs: &[Message]) -> Vec<Va
         }
     }
 
-    // 4. Decrypt sealed contents on the blocking pool (one batch per response).
     let content_cache = build_content_cache(msgs, &quoted_map).await;
 
     msgs.iter()
@@ -336,8 +336,8 @@ pub async fn try_can_pin_message(
     db: &Database,
     user_id: &str,
     msg: &Message,
-) -> Result<bool, crate::utils::access::membership_gate::AccessDeniedReason> {
-    use crate::utils::access::membership_gate::AccessDeniedReason;
+) -> Result<bool, crate::utils::access::members::AccessDeniedReason> {
+    use crate::utils::access::members::AccessDeniedReason;
     if msg.deleted {
         return Ok(false);
     }
@@ -401,7 +401,6 @@ pub enum CursorValidateError {
     Unavailable,
 }
 
-/// Kursor paginacji musi wskazywać wiadomość z tej samej rozmowy DM.
 pub async fn validate_dm_history_before_cursor(
     db: &Database,
     user: ObjectId,

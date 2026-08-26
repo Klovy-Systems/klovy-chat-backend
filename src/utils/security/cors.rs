@@ -1,18 +1,17 @@
-//! Dozwolone nagłówki żądań cross-origin (preflight CORS).
-//!
-//! Trzymaj listę zsynchronizowaną z frontendem (`src/utils/env/clientId.ts`
-//! oraz nagłówki wysyłane z `src/api/client.ts`).
-//!
-//! Metadane środowiska klienta (browser/os) są kodowane w `x-klovy-user-agent`,
-//! żeby nie wymagać dodatkowych nagłówków CORS przy deployu frontu przed backendem.
+// cors.rs
+// Allowlist nagłówków (X-Klovy-*, CSRF) zsynchronizowana z FE.
+// Zakres:
+//  - preflight
+//  - X-Klovy-* i CSRF na allowliście; nowy header = tu + FE
+// Nowy custom header bez wpisu tutaj = cichy fail przeglądarki.
+// Przy zmianach: clientId.ts, clientInfo.ts, api/client.ts.
 
 use http::header::HeaderName;
 
-use super::client_id::CLIENT_HEADER_NAME;
-use super::client_user_agent::CLIENT_USER_AGENT_HEADER;
+use super::id::CLIENT_HEADER_NAME;
+use super::user_agent::CLIENT_USER_AGENT_HEADER;
 use super::csrf::CSRF_HEADER_NAME;
 
-/// Nagłówki dozwolone w preflight CORS (Axum `CorsLayer::allow_headers`).
 pub const CORS_ALLOWED_REQUEST_HEADERS: [HeaderName; 10] = [
     HeaderName::from_static("content-type"),
     HeaderName::from_static("authorization"),

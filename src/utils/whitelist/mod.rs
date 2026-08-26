@@ -1,3 +1,11 @@
+// mod.rs
+// Czy nowe konto wymaga akceptacji.
+// Zakres:
+//  - isWhitelisted
+//  - nowe konto wymaga akceptacji; pending bez WS
+// Pending nie dostaje WS.
+// Przy zmianach: signup, ws/mod.rs, PendingApproval.tsx.
+
 use std::env;
 
 fn env_flag(name: &str) -> bool {

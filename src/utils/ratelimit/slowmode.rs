@@ -1,3 +1,11 @@
+// slowmode.rs
+// Odstęp wiadomości na kanale; admin omija.
+// Zakres:
+//  - record po udanym send
+//  - odstęp na kanale; admin omija; UI ten sam interval
+// UI musi pokazać ten sam interval co tu.
+// Przy zmianach: handlers.rs, ChannelSettings.
+
 use std::time::Duration;
 
 use super::Store;
@@ -9,7 +17,6 @@ fn slowmode_key(user_id: &str, channel_id: &str) -> String {
     format!("slowmode:{user_id}:{channel_id}")
 }
 
-/// Peek only — does not burn the window. Call [`record_channel_slowmode`] after Created.
 pub async fn check_channel_slowmode(
     user_id: &str,
     channel_id: &str,
@@ -30,7 +37,6 @@ pub async fn check_channel_slowmode(
     }
 }
 
-/// Consume slowmode slot after a successful new message create (not replay/fail).
 pub fn record_channel_slowmode(user_id: &str, channel_id: &str, rate_limit_secs: u32, bypass: bool) {
     if bypass || rate_limit_secs == 0 {
         return;

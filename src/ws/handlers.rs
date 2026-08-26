@@ -1,18 +1,27 @@
+// handlers.rs
+// Obsługa ramek: send/edit/react/typing/call/presence/mark-read.
+// Zakres:
+//  - auth per ramka
+//  - Mongo + fan-out
+//  - unread absolute vs delta
+// Nowy type: match tutaj + FE protocol.ts. Idempotencja send = nonce w messages.rs.
+// Przy zmianach: ws/state.rs, model/messages.rs, utils/unread/mod.rs, api/ws.ts.
+
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::model::channel_model::Channel;
-use crate::model::messages_model::{
+use crate::model::channels::Channel;
+use crate::model::messages::{
     CreateMessageError, CreateMessageInput, CreateMessageOutcome, Message, MessageType,
 };
-use crate::model::user_model::{AvailabilityStatus, User};
+use crate::model::users::{AvailabilityStatus, User};
 use crate::ws::registry;
 use crate::ws::state::{is_valid_object_id, now_ms, SocketState};
-use crate::ws::typing_access_cache::{self, TypingAccess};
-use crate::utils::access::membership_gate::{
+use crate::ws::typing::{self, TypingAccess};
+use crate::utils::access::members::{
     channel_admin_bypasses_slowmode, require_channel_access, require_channel_message_access,
     require_dm_access, require_message_participant, AccessDeniedReason,
 };
@@ -20,12 +29,12 @@ use crate::utils::ratelimit::slowmode::{check_channel_slowmode, record_channel_s
 use crate::utils::db::get_db;
 use crate::utils::friends::try_is_dm_blocked;
 use crate::utils::channel::can_access_channel;
-use crate::utils::voice::call_sessions::{
+use crate::utils::voice::calls::{
     accept_session, cancel_session, create_ringing_session, drain_expired_sessions,
     end_session, reject_session, restore_sessions, ringing_sessions_for_callee,
     take_sessions_for_user, CallPhase, CallSession, CallSessionError,
 };
-use crate::utils::voice::channel_voice::{
+use crate::utils::voice::channels::{
     clear_user_from_all_channels, join_channel_voice, leave_channel_voice, participants_in_channel,
 };
 use crate::utils::messages::access::{
@@ -35,7 +44,7 @@ use crate::utils::messages::access::{
 };
 use crate::utils::messages::mentions::{has_everyone_mention, resolve_mentions};
 use crate::utils::messages::{dm_only_or_clause, serialize_message};
-use crate::utils::messages::content_storage::inbound_plaintext_for_processing;
+use crate::utils::messages::storage::inbound_plaintext_for_processing;
 use crate::utils::unread::{
     emit_unread_absolute,
     emit_unread_delta_at, peek_unread_generation,
@@ -53,7 +62,7 @@ async fn message_still_active(db: &Database, id: ObjectId) -> Option<bool> {
         Err(_) => None,
     }
 }
-use crate::utils::user::serialize_user::resolve_display_name;
+use crate::utils::user::json::resolve_display_name;
 
 fn parse_message_type(s: &str) -> MessageType {
     match s.to_uppercase().as_str() {
@@ -130,7 +139,7 @@ async fn set_availability(user_id: &str, status: &str) -> Option<&'static str> {
     let Ok(oid) = ObjectId::parse_str(user_id) else {
         return None;
     };
-    // Store as plain string (same as HTTP /availability-status).
+
     match User::set_fields(
         &get_db(),
         oid,
@@ -139,7 +148,7 @@ async fn set_availability(user_id: &str, status: &str) -> Option<&'static str> {
     .await
     {
         Ok(Some(_)) => {
-            crate::utils::user::availability_cache::put(user_id, normalized);
+            crate::utils::user::online::put(user_id, normalized);
             Some(normalized)
         }
         Ok(None) | Err(_) => None,
@@ -147,7 +156,7 @@ async fn set_availability(user_id: &str, status: &str) -> Option<&'static str> {
 }
 
 async fn availability_status_for_user(user_id: &str) -> Option<&'static str> {
-    if let Some(cached) = crate::utils::user::availability_cache::get(user_id) {
+    if let Some(cached) = crate::utils::user::online::get(user_id) {
         return Some(normalize_availability_status(&cached));
     }
     let Ok(oid) = ObjectId::parse_str(user_id) else {
@@ -161,7 +170,7 @@ async fn availability_status_for_user(user_id: &str) -> Option<&'static str> {
                 AvailabilityStatus::Dnd => "dnd",
                 AvailabilityStatus::Online => "online",
             };
-            crate::utils::user::availability_cache::put(user_id, status);
+            crate::utils::user::online::put(user_id, status);
             Some(status)
         }
         Ok(None) => None,
@@ -340,7 +349,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
     };
 
     let msg_type = parse_message_type(payload.message_type.as_deref().unwrap_or("TEXT"));
-    let content = crate::utils::validators::sanitize_input::sanitize_message_content(
+    let content = crate::utils::validators::sanitize::sanitize_message_content(
         payload.content.as_deref().unwrap_or(""),
     );
     let content = inbound_plaintext_for_processing(&content, false);
@@ -384,7 +393,6 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         read: None,
     };
 
-    // Snapshot before insert so concurrent mark-read bumps make this delta stale.
     let unread_gen = peek_unread_generation(&payload.recipient, "dm", &payload.sender);
 
     let (created, is_replay) = match Message::create(&db, input).await {
@@ -410,10 +418,9 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
             return;
         }
     };
-    // Claim only after create succeeds — otherwise a failed insert burns the pending row.
+
     claim_pending_upload(&payload.sender, &file_url).await;
 
-    // Replay: re-emit so FE can ack pending — heal tip/unread (no $inc/delta/mentions).
     if is_replay {
         let populated = serialize_message(&db, &created).await;
         registry::emit_to_user(&payload.recipient, "receiveMessage", populated.clone());
@@ -426,9 +433,9 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         let sender_id = payload.sender.clone();
         let bump = payload.sender != payload.recipient;
         tokio::spawn(async move {
-            crate::utils::conversation_tips::upsert_dm_tip(&db_tip, &tip_msg).await;
+            crate::utils::tips::upsert_dm_tip(&db_tip, &tip_msg).await;
             if bump {
-                if let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
+                if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
                     &db_tip, recipient_oid, sender_oid,
                 )
                 .await
@@ -488,15 +495,15 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         let mention_recipient = mentions.iter().any(|m| m.to_hex() == payload.recipient);
         let notify = muted_lookup_ok && !recipient_muted && bump;
         tokio::spawn(async move {
-            crate::utils::conversation_tips::upsert_dm_tip(&db_tip, &tip_msg).await;
+            crate::utils::tips::upsert_dm_tip(&db_tip, &tip_msg).await;
             if bump {
-                // Skip bump/delta if soft-deleted before we ran (delete×late-bump).
+
                 let still_active = match tip_mid {
                     Some(id) => message_still_active(&db_tip, id).await,
                     None => Some(false),
                 };
                 if still_active == Some(false) {
-                    if let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
+                    if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
                         &db_tip, recipient_oid, sender_oid,
                     )
                     .await
@@ -511,7 +518,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
                 } else if peek_unread_generation(&recipient_id_tip, "dm", &sender_id_tip)
                     == unread_gen_tip
                 {
-                    let bumped = crate::utils::conversation_tips::bump_dm_unread(
+                    let bumped = crate::utils::tips::bump_dm_unread(
                         &db_tip,
                         sender_oid,
                         recipient_oid,
@@ -533,7 +540,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
                             1,
                             unread_gen_tip,
                         );
-                    } else if let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
+                    } else if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
                         &db_tip, recipient_oid, sender_oid,
                     )
                     .await
@@ -545,7 +552,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
                             n,
                         );
                     }
-                } else if let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
+                } else if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
                     &db_tip, recipient_oid, sender_oid,
                 )
                 .await
@@ -751,12 +758,11 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
     }
 }
 
-/// Parametry współdzielonej wysyłki wiadomości kanałowej.
 pub struct ChannelBroadcastInput {
     pub channel: Channel,
     pub channel_oid: ObjectId,
     pub sender: ObjectId,
-    /// Surowa treść — zostanie zsanityzowana wewnątrz funkcji.
+
     pub content: String,
     pub message_type: MessageType,
     pub file_url: Option<String>,
@@ -773,9 +779,6 @@ pub enum ChannelBroadcastOutcome {
     IdempotentReplay(Value),
 }
 
-/// Rdzeń tworzenia i rozgłaszania wiadomości kanałowej. Zakłada, że dostęp do
-/// kanału został już zweryfikowany przez wywołującego. Zwraca zserializowaną
-/// wiadomość (z polem `channelId`).
 pub async fn create_and_broadcast_channel_message(
     db: &Database,
     input: ChannelBroadcastInput,
@@ -801,7 +804,7 @@ pub async fn create_and_broadcast_channel_message(
     let mut member_ids: Vec<String> = channel.members.iter().map(|m| m.to_hex()).collect();
     member_ids.push(channel.admin.to_hex());
 
-    let sanitized = crate::utils::validators::sanitize_input::sanitize_message_content(&content);
+    let sanitized = crate::utils::validators::sanitize::sanitize_message_content(&content);
     let prepared_content = inbound_plaintext_for_processing(&sanitized, false);
     let mention_plain = prepared_content.clone();
 
@@ -833,7 +836,6 @@ pub async fn create_and_broadcast_channel_message(
         read: None,
     };
 
-    // Snapshot per-recipient generation before insert (mark-read race).
     let unread_gens: std::collections::HashMap<String, u64> = member_ids
         .iter()
         .filter(|id| **id != sender_hex)
@@ -853,7 +855,7 @@ pub async fn create_and_broadcast_channel_message(
             return Err(e);
         }
     };
-    // Claim after insert so a failed create does not burn the pending upload.
+
     claim_pending_upload(&sender_hex, &created.file_url).await;
 
     let mut member_oids = channel.members.clone();
@@ -874,7 +876,6 @@ pub async fn create_and_broadcast_channel_message(
         }
     }
 
-    // Replay: re-emit for FE ack — heal tip/unread (no $inc/delta/mentions).
     if is_replay {
         let mut populated = serialize_message(db, &created).await;
         if let Some(obj) = populated.as_object_mut() {
@@ -886,7 +887,7 @@ pub async fn create_and_broadcast_channel_message(
         let channel_id_heal = channel_id_str.clone();
         let unread_targets_heal = unread_targets.clone();
         tokio::spawn(async move {
-            crate::utils::conversation_tips::upsert_channel_tip(
+            crate::utils::tips::upsert_channel_tip(
                 &db_tip, channel_oid, &tip_msg,
             )
             .await;
@@ -947,9 +948,6 @@ pub async fn create_and_broadcast_channel_message(
 
     registry::emit_to_users(&recipients, "receive-channel-message", populated.clone());
 
-    // Delta unread — badge for everyone (incl. muted); mute only gates mentions.
-    // Denorm bump only when the live +1 path wins (gen unchanged).
-    // Tip before unread (parity DM) — list tip must not lag badge fan-out.
     let channel_id_for_unread = channel_id_str.clone();
     let channel_name = channel.name.clone();
     let message_id = created.id.map(|o| o.to_hex()).unwrap_or_default();
@@ -959,15 +957,15 @@ pub async fn create_and_broadcast_channel_message(
     let tip_msg = created.clone();
     tokio::spawn(async move {
         let db = get_db();
-        crate::utils::conversation_tips::upsert_channel_tip(&db, channel_oid, &tip_msg).await;
-        use crate::model::channel_read_state_model::ChannelReadState;
+        crate::utils::tips::upsert_channel_tip(&db, channel_oid, &tip_msg).await;
+        use crate::model::read_state::ChannelReadState;
         let msg_oid = ObjectId::parse_str(&message_id).ok();
         let still_active = match msg_oid {
             Some(id) => message_still_active(&db, id).await,
             None => Some(false),
         };
         if still_active == Some(false) {
-            // Soft-deleted before unread fan-out — sync absolute for everyone, no delta.
+
             let futs: Vec<_> = unread_targets
                 .iter()
                 .filter_map(|member_id| ObjectId::parse_str(member_id).ok().map(|oid| (member_id.clone(), oid)))
@@ -1001,7 +999,7 @@ pub async fn create_and_broadcast_channel_message(
                     mismatch.push((member_id.clone(), oid));
                 }
             } else if let Ok(oid) = ObjectId::parse_str(member_id) {
-                // Emit delta only after denorm bump succeeds (DM parity).
+
                 bump_oids.push(oid);
             }
             let muted = muted_ids.contains(member_id);
@@ -1040,7 +1038,7 @@ pub async fn create_and_broadcast_channel_message(
             }
         }
         if !bump_oids.is_empty() {
-            // Re-check gen before denorm bump — mark-read may have zeroed unreadCount.
+
             let mut still_ok = Vec::new();
             let mut late_mismatch: Vec<ObjectId> = Vec::new();
             for oid in bump_oids {
@@ -1107,8 +1105,7 @@ pub async fn create_and_broadcast_channel_message(
                     message_ts,
                 )
                 .await;
-                // Post-bump: deleted, mark-read, or denorm bump fail → sync heal.
-                // Probe Err (None) is not treated as deleted — gen mismatch still heals.
+
                 let still_active = match msg_oid {
                     Some(id) => message_still_active(&db, id).await,
                     None => Some(false),
@@ -1129,7 +1126,7 @@ pub async fn create_and_broadcast_channel_message(
                         bumped_ok.push(*oid);
                     }
                 }
-                // DM parity — delta only after confirmed denorm bump.
+
                 for oid in &bumped_ok {
                     let mid = oid.to_hex();
                     let gen = unread_gens.get(&mid).copied().unwrap_or(0);
@@ -1158,7 +1155,7 @@ pub async fn create_and_broadcast_channel_message(
                             still_none.push(oid);
                         }
                     }
-                    // Dual failure (bump + recount) — retry heal.
+
                     if !still_none.is_empty() {
                         let db_retry = db.clone();
                         let channel_id_retry = channel_id_for_unread.clone();
@@ -1206,8 +1203,7 @@ async fn handle_typing(state: SocketState, connected: &str, payload: TypingPaylo
     let user_id = connected;
     let is_typing = payload.is_typing.unwrap_or(false);
 
-    // Hot path: reuse a short-TTL access decision so heartbeats do not hit Mongo.
-    let cached = typing_access_cache::get(user_id, &chat_id);
+    let cached = typing::get(user_id, &chat_id);
     let channel_recipients: Option<Vec<String>> = match cached {
         Some(TypingAccess::Denied { .. }) => return,
         Some(TypingAccess::Dm { .. }) => None,
@@ -1218,18 +1214,18 @@ async fn handle_typing(state: SocketState, connected: &str, payload: TypingPaylo
                 match require_channel_message_access(&get_db(), channel_id, user_id).await {
                     Ok(channel) => {
                         let recipients = registry::channel_recipient_ids(&channel);
-                        typing_access_cache::put(
+                        typing::put(
                             user_id,
                             &chat_id,
                             TypingAccess::Channel {
-                                checked_at_ms: typing_access_cache::now_access_ms(),
+                                checked_at_ms: typing::now_access_ms(),
                                 recipients: recipients.clone(),
                             },
                         );
                         Some(recipients)
                     }
                     Err(AccessDeniedReason::Unavailable) => {
-                        // Stop-typing: best-effort fan out so peers don't sticky-type.
+
                         if !is_typing {
                             state.touch_typing(&chat_id, user_id, false);
                             let db = get_db();
@@ -1250,11 +1246,11 @@ async fn handle_typing(state: SocketState, connected: &str, payload: TypingPaylo
                         return;
                     }
                     Err(_) => {
-                        typing_access_cache::put(
+                        typing::put(
                             user_id,
                             &chat_id,
                             TypingAccess::Denied {
-                                checked_at_ms: typing_access_cache::now_access_ms(),
+                                checked_at_ms: typing::now_access_ms(),
                             },
                         );
                         return;
@@ -1263,17 +1259,17 @@ async fn handle_typing(state: SocketState, connected: &str, payload: TypingPaylo
             } else {
                 match require_dm_access(&get_db(), user_id, &chat_id).await {
                     Ok(()) => {
-                        typing_access_cache::put(
+                        typing::put(
                             user_id,
                             &chat_id,
                             TypingAccess::Dm {
-                                checked_at_ms: typing_access_cache::now_access_ms(),
+                                checked_at_ms: typing::now_access_ms(),
                             },
                         );
                         None
                     }
                     Err(AccessDeniedReason::Unavailable) => {
-                        // Stop-typing: still clear local + fan out so peers don't sticky-type.
+
                         if !is_typing {
                             state.touch_typing(&chat_id, user_id, false);
                             registry::emit_to_user(
@@ -1285,11 +1281,11 @@ async fn handle_typing(state: SocketState, connected: &str, payload: TypingPaylo
                         return;
                     }
                     Err(_) => {
-                        typing_access_cache::put(
+                        typing::put(
                             user_id,
                             &chat_id,
                             TypingAccess::Denied {
-                                checked_at_ms: typing_access_cache::now_access_ms(),
+                                checked_at_ms: typing::now_access_ms(),
                             },
                         );
                         return;
@@ -1329,7 +1325,7 @@ async fn handle_reaction(connected: &str, payload: ReactionPayload) {
     if emoji.is_empty() || emoji.len() > 32 {
         return;
     }
-    // Mongo dotted paths cannot contain `.` or `$`.
+
     if emoji.contains('.') || emoji.contains('$') {
         return;
     }
@@ -1369,7 +1365,7 @@ async fn handle_reaction(connected: &str, payload: ReactionPayload) {
             );
             return;
         }
-        // Echo current reactions so optimistic FE toggle rolls back.
+
         let payload_json = json!({
             "messageId": message_id,
             "reactions": reactions_json(&msg),
@@ -1379,9 +1375,6 @@ async fn handle_reaction(connected: &str, payload: ReactionPayload) {
         return;
     }
 
-    // Atomic toggle without a stale snapshot: pull if present, else addToSet.
-    // Concurrent toggles may race on intent, but never "pull-fail → add" after
-    // deciding `already` from a loaded doc (re-add after concurrent remove).
     let users_path = format!("reactions.{emoji}.users");
     let emoji_path = format!("reactions.{emoji}.emoji");
     let now = DateTime::now();
@@ -1443,15 +1436,12 @@ async fn handle_reaction(connected: &str, payload: ReactionPayload) {
         }
     }
 
-    // Re-read after write so concurrent peer toggles are not clobbered by a
-    // stale in-memory snapshot on fan-out. Never echo pre-write after success
-    // (that would roll back a landed mutation on the FE).
     let fresh = match Message::find_by_id(&db, mid).await {
         Ok(Some(m)) => m,
         Ok(None) | Err(_) => match Message::find_by_id(&db, mid).await {
             Ok(Some(m)) => m,
             _ => {
-                // Write already landed — fan out best-effort so peers aren't silent.
+
                 let payload_json = json!({
                     "messageId": message_id,
                     "reactions": reactions_json(&msg),
@@ -1496,14 +1486,14 @@ async fn handle_reaction(connected: &str, payload: ReactionPayload) {
     if let Some(channel_id) = fresh.channel {
         let channel = match Channel::find_by_id(&db, channel_id).await {
             Ok(Some(ch)) => Some(ch),
-            // Missing or transient — skip member fanout.
+
             Ok(None) | Err(_) => None,
         };
         if let Some(channel) = channel {
             let recipients = registry::channel_recipient_ids(&channel);
             registry::emit_to_users(&recipients, "message-reaction", payload_json);
         } else {
-            use crate::model::channel_read_state_model::ChannelReadState;
+            use crate::model::read_state::ChannelReadState;
             let mut recipients = vec![user_id.clone()];
             if let Ok(cursor) = ChannelReadState::collection(&db)
                 .find(doc! { "channelId": channel_id })
@@ -1628,14 +1618,11 @@ async fn handle_mark_conversation_read(connected: &str, payload: MarkConversatio
         return;
     }
     let db = get_db();
-    // Marking own inbox unread does not require friendship/block checks —
-    // the update filter is already recipient-scoped to the connected user.
+
     let (Ok(uid), Ok(cid)) = (ObjectId::parse_str(&user_id), ObjectId::parse_str(&contact_id)) else {
         return;
     };
 
-    // Projection `_id` only — do not load sealed content for every unread message.
-    // Cap the collect so huge unread piles do not allocate/scan unbounded ids.
     const MAX_EMIT_IDS: usize = 500;
     let filter = doc! {
         "sender": cid,
@@ -1644,7 +1631,7 @@ async fn handle_mark_conversation_read(connected: &str, payload: MarkConversatio
         "deleted": { "$ne": true },
         "$or": dm_only_or_clause(),
     };
-    let ids = match crate::utils::messages::search_text::collect_message_ids_limited(
+    let ids = match crate::utils::messages::search::collect_message_ids_limited(
         &db,
         filter.clone(),
         Some((MAX_EMIT_IDS as i64) + 1),
@@ -1666,21 +1653,20 @@ async fn handle_mark_conversation_read(connected: &str, payload: MarkConversatio
         }
     };
     if ids.is_empty() {
-        // Already clear or race — heal badge; never emit stale tip on recount fail.
+
         heal_dm_unread_after_mark(&db, &user_id, &contact_id, uid, cid).await;
         return;
     }
 
     let conversation_read = ids.len() > MAX_EMIT_IDS;
     let now = DateTime::now();
-    // Under cap: mark only collected ids so concurrent arrivals stay unread and
-    // match messageIds receipts. Over cap: mark-all + conversationRead=true.
+
     let mark_filter = if conversation_read {
         filter
     } else {
         doc! { "_id": { "$in": &ids } }
     };
-    // Mark read only — do not $push readBy for every unread row (unbounded growth).
+
     if Message::collection(&db)
         .update_many(
             mark_filter,
@@ -1729,8 +1715,8 @@ async fn heal_dm_unread_after_mark(
     viewer: ObjectId,
     peer_oid: ObjectId,
 ) {
-    // Emit absolute only after tip sync verifies — never from bare count.
-    match crate::utils::conversation_tips::try_sync_dm_tip_unread(db, viewer, peer_oid).await {
+
+    match crate::utils::tips::try_sync_dm_tip_unread(db, viewer, peer_oid).await {
         Some(tip_n) => {
             emit_unread_absolute(user_id, "dm", peer, tip_n);
             let db_tip = db.clone();
@@ -1740,7 +1726,7 @@ async fn heal_dm_unread_after_mark(
             tokio::spawn(async move {
                 let mut n_prev = n_prev;
                 for _ in 0..3 {
-                    let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
+                    let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
                         &db_tip, viewer, peer_oid,
                     )
                     .await
@@ -1756,14 +1742,14 @@ async fn heal_dm_unread_after_mark(
             });
         }
         None => {
-            // Fence stale deltas; spawn emits absolute only when sync recovers.
+
             crate::utils::unread::invalidate_unread_generation(user_id, "dm", peer);
             let db_tip = db.clone();
             let user_id = user_id.to_string();
             let peer = peer.to_string();
             tokio::spawn(async move {
                 for _ in 0..3 {
-                    if let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
+                    if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
                         &db_tip, viewer, peer_oid,
                     )
                     .await
@@ -1824,7 +1810,7 @@ async fn handle_mark_channel_read(connected: &str, payload: MarkChannelReadPaylo
         );
         return;
     }
-    // Emit absolute only after denorm sync verifies — never from bare count.
+
     if let (Ok(uid), Ok(cid)) = (
         ObjectId::parse_str(&user_id),
         ObjectId::parse_str(&channel_id),
@@ -1853,8 +1839,7 @@ async fn handle_mark_channel_read(connected: &str, payload: MarkChannelReadPaylo
                 });
             }
             None => {
-                // Upsert already wrote unreadCount: 0 — skip absolute 0 (comment above).
-                // Fence deltas; spawn emits absolute only when recount recovers.
+
                 crate::utils::unread::invalidate_unread_generation(
                     &user_id, "channel", &channel_id,
                 );
@@ -1944,12 +1929,12 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
         return;
     }
 
-    let sanitized = crate::utils::validators::sanitize_input::sanitize_message_content(&content_raw);
+    let sanitized = crate::utils::validators::sanitize::sanitize_message_content(&content_raw);
     let prepared_content = inbound_plaintext_for_processing(&sanitized, false);
     if prepared_content.is_empty() {
         return;
     }
-    if !crate::model::messages_model::is_message_content_within_limit(&prepared_content)
+    if !crate::model::messages::is_message_content_within_limit(&prepared_content)
     {
         registry::emit_to_user(
             connected,
@@ -1970,7 +1955,7 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
     if let Some(channel_id) = msg.channel {
         channel_doc = match Channel::find_by_id(&db, channel_id).await {
             Ok(Some(ch)) => Some(ch),
-            // Missing or transient — edit path fails closed later if needed.
+
             Ok(None) | Err(_) => None,
         };
         if let Some(ref channel) = channel_doc {
@@ -2047,7 +2032,7 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
             return;
         }
     };
-    let stored_content = match crate::utils::messages::content_storage::prepare_content_for_storage_async(
+    let stored_content = match crate::utils::messages::storage::prepare_content_for_storage_async(
         prepared_content.trim().to_string(),
     )
     .await
@@ -2066,7 +2051,7 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
             return;
         }
     };
-    let search_index = match crate::utils::messages::search_text::build_search_index_from_incoming(
+    let search_index = match crate::utils::messages::search::build_search_index_from_incoming(
         prepared_content.trim(),
     ) {
         Ok(index) => index,
@@ -2137,9 +2122,9 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
     };
     {
         if let Some(cid) = updated.channel {
-            crate::utils::conversation_tips::upsert_channel_tip(&db, cid, &updated).await;
+            crate::utils::tips::upsert_channel_tip(&db, cid, &updated).await;
         } else {
-            crate::utils::conversation_tips::upsert_dm_tip(&db, &updated).await;
+            crate::utils::tips::upsert_dm_tip(&db, &updated).await;
         }
         let populated = serialize_message(&db, &updated).await;
         let from_user = populated
@@ -2317,7 +2302,7 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
         }
         return;
     }
-    // Soft-delete then sync+absolute (bumps generation) so late send $inc is ignored.
+
     let outcome = match Message::soft_delete_active(&db, mid).await {
         Ok(o) => o,
         Err(_) => {
@@ -2333,7 +2318,7 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
             return;
         }
     };
-    let crate::model::messages_model::SoftDeleteOutcome::Deleted { was_unread } = outcome else {
+    let crate::model::messages::SoftDeleteOutcome::Deleted { was_unread } = outcome else {
         return;
     };
     cleanup_attachment_if_unreferenced(&db, msg.file_url.as_deref()).await;
@@ -2351,13 +2336,13 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
             let msg_ts = msg.timestamp;
             let mut targets: Vec<String> = channel.members.iter().map(|m| m.to_hex()).collect();
             targets.push(channel.admin.to_hex());
-            // Tip refresh + member unread sync inline so denorm cannot sticky-high.
-            crate::utils::conversation_tips::refresh_channel_tip_after_delete(
+
+            crate::utils::tips::refresh_channel_tip_after_delete(
                 &db, channel_id, mid,
             )
             .await;
             {
-                use crate::model::channel_read_state_model::ChannelReadState;
+                use crate::model::read_state::ChannelReadState;
                 use futures_util::TryStreamExt;
                 let mut seen = std::collections::HashSet::new();
                 let member_oids: Vec<ObjectId> = targets
@@ -2396,16 +2381,15 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
                             return None;
                         }
                         let oid = ObjectId::parse_str(&member_id).ok()?;
-                        // Read-state load failed — heal everyone (avoid sticky-high denorm).
+
                         if !read_state_ok {
                             return Some((member_id, oid));
                         }
                         let Some(&(last, created)) = last_reads.get(&member_id) else {
-                            // No row (seed miss) — still heal so list denorm cannot stick high.
+
                             return Some((member_id, oid));
                         };
-                        // Epoch lastReadAt = never mark-read; use createdAt so historical
-                        // messages from before the first bump are not treated as badge hits.
+
                         let effective = if last.timestamp_millis() <= 0 {
                             created
                         } else {
@@ -2423,7 +2407,7 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
                         let db = db.clone();
                         let channel_id_hex = channel_id_hex.clone();
                         async move {
-                            // Skip absolute when recount fails (no false-zero).
+
                             if let Some(n) = crate::utils::unread::try_sync_channel_unread(
                                 &db, oid, channel_id,
                             )
@@ -2442,12 +2426,12 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
                 futures_util::future::join_all(sync_futs).await;
             }
         } else {
-            crate::utils::conversation_tips::refresh_channel_tip_after_delete(
+            crate::utils::tips::refresh_channel_tip_after_delete(
                 &db, channel_id, mid,
             )
             .await;
             registry::emit_to_user(&msg.sender.to_hex(), "message-deleted", body.clone());
-            // Channel doc unreadable — fanout degraded; tell actor to refresh.
+
             registry::emit_to_user(
                 &user_id,
                 "error",
@@ -2458,8 +2442,8 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
                     "messageId": message_id,
                 }),
             );
-            // Fallback: notify anyone with a read-state row and heal unread.
-            use crate::model::channel_read_state_model::ChannelReadState;
+
+            use crate::model::read_state::ChannelReadState;
             use futures_util::TryStreamExt;
             if let Ok(cursor) = ChannelReadState::collection(&db)
                 .find(doc! { "channelId": channel_id })
@@ -2512,11 +2496,11 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
         }
     } else if let Some(recipient) = msg.recipient {
         let recipient_hex = recipient.to_hex();
-        // Emit deleted promptly so FE drops the bubble before tip heal.
+
         registry::emit_to_user(&recipient_hex, "message-deleted", body.clone());
         registry::emit_to_user(&msg.sender.to_hex(), "message-deleted", body);
         let sender_oid = msg.sender;
-        crate::utils::conversation_tips::refresh_dm_tip_after_delete(
+        crate::utils::tips::refresh_dm_tip_after_delete(
             &db,
             sender_oid,
             recipient,
@@ -2524,12 +2508,12 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
         )
         .await;
         if was_unread {
-            // Only absolute when recount confirms — avoid false-zero on count Err.
+
             if crate::utils::unread::try_count_dm_unread(&db, recipient, sender_oid)
                 .await
                 .is_some()
             {
-                if let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
+                if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
                     &db, recipient, sender_oid,
                 )
                 .await
@@ -2556,7 +2540,7 @@ async fn finalize_expired_ringing_session(db: &Database, session: CallSession) {
         "call:cancelled",
         json!({ "from": session.caller_id }),
     );
-    // Mirror client-driven timeout so the caller UI clears ringing.
+
     registry::emit_to_user(
         &session.caller_id,
         "call:cancelled",
@@ -2589,7 +2573,6 @@ async fn finalize_expired_ringing_sessions() {
     }
 }
 
-/// Periodic sweeper entrypoint (invite/connect/timeout also drain opportunistically).
 pub async fn sweep_expired_call_sessions() {
     finalize_expired_ringing_sessions().await;
 }
@@ -2648,8 +2631,6 @@ async fn handle_call_invite(
         "audio"
     };
 
-    // Allow ringing even when the peer is offline / away — they may reconnect,
-    // and a missed-call log is written if nobody answers.
     let (session_id, replaced_expired) =
         match create_ringing_session(&from, &to, mode, conn_id) {
         Ok(result) => result,
@@ -2718,7 +2699,7 @@ async fn handle_call_simple(
     }
 
     let db = get_db();
-    // Hangup paths must tear down even if friendship lookup fails (Mongo miss → []).
+
     let teardown_only = matches!(
         incoming_event,
         "call:reject" | "call:cancel" | "call:end"
@@ -2793,10 +2774,10 @@ async fn handle_call_simple(
         "call:reject" => {
             match reject_session(&from, &to) {
                 Ok(()) => {
-                    // Callee declined → missed call for the caller.
+
                     create_missed_call_log_message(&db, &to, &from).await;
                     registry::emit_to_user(&to, outgoing, json!({ "from": from }));
-                    // Echo to callee's other tabs so multi-tab Incoming UI clears.
+
                     registry::emit_to_user(&from, outgoing, json!({ "from": from }));
                 }
                 Err(CallSessionError::Expired(expired)) => {
@@ -2819,11 +2800,11 @@ async fn handle_call_simple(
             }
         }
         "call:cancel" => {
-            // Caller hung up before answer — no chat log.
+
             match cancel_session(&from, &to) {
                 Ok(()) => {
                     registry::emit_to_user(&to, outgoing, json!({ "from": from }));
-                    // Echo to caller's other tabs so multi-tab outgoing UI clears.
+
                     registry::emit_to_user(&from, outgoing, json!({ "from": from }));
                 }
                 Err(CallSessionError::Expired(expired)) => {
@@ -2849,7 +2830,7 @@ async fn handle_call_simple(
             match end_session(&from, &to) {
                 Ok(session) => {
                     registry::emit_to_user(&to, outgoing, json!({ "from": from }));
-                    // Echo to ender's other tabs so multi-tab in-call UI clears.
+
                     registry::emit_to_user(&from, outgoing, json!({ "from": from }));
                     match session.phase {
                         CallPhase::Accepted => {
@@ -2864,7 +2845,7 @@ async fn handle_call_simple(
                                 .await;
                             }
                         }
-                        // call:end during ring: callee → missed; caller → cancel (no log).
+
                         CallPhase::Ringing => {
                             if from == session.callee_id {
                                 create_missed_call_log_message(
@@ -2897,7 +2878,6 @@ async fn handle_call_simple(
     }
 }
 
-/// Client signals that ringing timed out without an answer.
 async fn handle_call_timeout(connected: &str, payload: CallPayload) {
     finalize_expired_ringing_sessions().await;
     let Some(from) = payload.from else { return };
@@ -2906,11 +2886,11 @@ async fn handle_call_timeout(connected: &str, payload: CallPayload) {
         return;
     }
     let db = get_db();
-    // Timeout is hangup — do not gate on friendship (Mongo miss must not leave session).
+
     match cancel_session(&from, &to) {
         Ok(()) => {
             registry::emit_to_user(&to, "call:cancelled", json!({ "from": from }));
-            // Echo to caller's other tabs.
+
             registry::emit_to_user(&from, "call:cancelled", json!({ "from": from }));
             create_missed_call_log_message(&db, &from, &to).await;
         }
@@ -2947,7 +2927,7 @@ async fn emit_channel_voice_state(channel_id: &str, participants: &[String]) {
     });
     let db = get_db();
     let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
-        // Still notify known voice participants so peers do not keep a ghost roster.
+
         let recipients: Vec<String> = participants.to_vec();
         if !recipients.is_empty() {
             registry::emit_to_users(&recipients, "channel-voice:state", body);
@@ -2956,7 +2936,7 @@ async fn emit_channel_voice_state(channel_id: &str, participants: &[String]) {
     };
     let channel = match Channel::find_by_id(&db, channel_oid).await {
         Ok(Some(ch)) => Some(ch),
-        // Missing or transient — skip fanout.
+
         Ok(None) | Err(_) => None,
     };
     if let Some(channel) = channel {
@@ -3037,7 +3017,7 @@ async fn handle_channel_voice_leave(connected: &str, payload: ChannelVoicePayloa
         let Ok(Some(channel)) = Channel::find_by_id(&db, channel_oid).await else {
             return;
         };
-        // Strangers must not probe/spam voice state for channels they never joined.
+
         if !can_access_channel(&channel, Some(connected)) {
             return;
         }
@@ -3092,7 +3072,6 @@ async fn handle_channel_voice_state_request(connected: &str, payload: ChannelVoi
     );
 }
 
-/// Formats a call duration as `H:MM:SS` or `M:SS`.
 fn format_call_duration(total_secs: u64) -> String {
     let hours = total_secs / 3600;
     let minutes = (total_secs % 3600) / 60;
@@ -3104,8 +3083,6 @@ fn format_call_duration(total_secs: u64) -> String {
     }
 }
 
-/// Creates a system "voice call" log entry in the DM conversation and broadcasts
-/// it to both participants. Duration is authoritative (server-side).
 async fn create_call_log_message(db: &Database, caller_id: &str, callee_id: &str, duration_secs: u64) {
     persist_call_log(
         db,
@@ -3118,7 +3095,6 @@ async fn create_call_log_message(db: &Database, caller_id: &str, callee_id: &str
     .await;
 }
 
-/// Missed / unanswered call — `duration_ms = 0` so the client can render a distinct label.
 async fn create_missed_call_log_message(db: &Database, caller_id: &str, callee_id: &str) {
     persist_call_log(db, caller_id, callee_id, "Missed call".to_string(), 0, true).await;
 }
@@ -3153,11 +3129,10 @@ async fn persist_call_log(
         mentions: None,
         mentions_everyone: Some(false),
         client_nonce: None,
-        // Answered history must not resurface via recount (read:false + tip Some(0)).
+
         read: Some(!missed),
     };
 
-    // Peek before create (same as DM send) so concurrent mark-read bumps make +1 stale.
     let unread_gen = peek_unread_generation(callee_id, "dm", caller_id);
 
     let created = match Message::create(db, input).await {
@@ -3169,7 +3144,7 @@ async fn persist_call_log(
     };
 
     let populated = serialize_message(db, &created).await;
-    // Missed calls bump unread; answered call history is tip-only (phase-driven, not duration).
+
     let bump_unread = missed;
     {
         let db_tip = db.clone();
@@ -3179,8 +3154,8 @@ async fn persist_call_log(
         let caller_id = caller_id.to_string();
         let callee_id = callee_id.to_string();
         tokio::spawn(async move {
-            crate::utils::conversation_tips::upsert_dm_tip(&db_tip, &tip_msg).await;
-            // Answered calls: tip only — do not bump callee unread.
+            crate::utils::tips::upsert_dm_tip(&db_tip, &tip_msg).await;
+
             if !bump_unread {
                 return;
             }
@@ -3190,7 +3165,7 @@ async fn persist_call_log(
                 None => Some(false),
             };
             if still_active == Some(false) {
-                if let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
+                if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
                     &db_tip, callee_oid, caller_oid,
                 )
                 .await
@@ -3198,7 +3173,7 @@ async fn persist_call_log(
                     crate::utils::unread::emit_unread_absolute(&callee_id, "dm", &caller_id, n);
                 }
             } else if peek_unread_generation(&callee_id, "dm", &caller_id) == unread_gen {
-                let bumped = crate::utils::conversation_tips::bump_dm_unread(
+                let bumped = crate::utils::tips::bump_dm_unread(
                     &db_tip, caller_oid, callee_oid,
                 )
                 .await;
@@ -3211,14 +3186,14 @@ async fn persist_call_log(
                     && peek_unread_generation(&callee_id, "dm", &caller_id) == unread_gen
                 {
                     emit_unread_delta_at(&callee_id, "dm", &caller_id, 1, unread_gen);
-                } else if let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
+                } else if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
                     &db_tip, callee_oid, caller_oid,
                 )
                 .await
                 {
                     crate::utils::unread::emit_unread_absolute(&callee_id, "dm", &caller_id, n);
                 }
-            } else if let Some(n) = crate::utils::conversation_tips::try_sync_dm_tip_unread(
+            } else if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
                 &db_tip, callee_oid, caller_oid,
             )
             .await
@@ -3297,8 +3272,7 @@ pub async fn on_user_connected(user_id: &str) {
     if !set_user_online(user_id).await {
         return;
     }
-    // Preserve the user's chosen availability (dnd/away/brb) — only presence flips online.
-    // Skip invent-online broadcast on DB Err; still continue ringing redelivery below.
+
     if let Some(availability) = availability_status_for_user(user_id).await {
         broadcast_user_status(
             user_id,
@@ -3311,7 +3285,6 @@ pub async fn on_user_connected(user_id: &str) {
         .await;
     }
 
-    // Re-deliver active ringing invites so a reconnecting callee still sees Incoming UI.
     let ringing = ringing_sessions_for_callee(user_id);
     if ringing.is_empty() {
         return;
@@ -3368,14 +3341,14 @@ pub async fn finalize_taken_call_sessions(user_id: &str, call_sessions: Vec<Call
                         "call:cancelled",
                         json!({ "from": user_id }),
                     );
-                    // Clear ringing UI on any remaining tabs of the disconnecting user.
+
                     registry::emit_to_user(
                         user_id,
                         "call:cancelled",
                         json!({ "from": user_id, "reason": "TAB_CLOSED" }),
                     );
                 } else {
-                    // Callee dropped while ringing → missed call for caller.
+
                     registry::emit_to_user(
                         &peer,
                         "call:rejected",
@@ -3404,15 +3377,14 @@ pub async fn finalize_taken_call_sessions(user_id: &str, call_sessions: Vec<Call
 }
 
 pub async fn on_user_disconnected(user_id: &str, socket_state: &SocketState) {
-    // Multi-tab / reconnect gates — mirror set-offline so a late reconnect wins.
+
     if socket_state.is_user_connected(user_id) || socket_state.connection_count(user_id) > 0 {
         return;
     }
 
-    // Tear down any remaining DM call sessions (ringing + accepted) and notify peers.
     let call_sessions = take_sessions_for_user(user_id);
     if socket_state.is_user_connected(user_id) || socket_state.connection_count(user_id) > 0 {
-        // Late reconnect after take — put sessions back so ringing/accepted survive.
+
         restore_sessions(call_sessions);
         return;
     }
@@ -3422,7 +3394,6 @@ pub async fn on_user_disconnected(user_id: &str, socket_state: &SocketState) {
         return;
     }
 
-    // Drop voice memberships so peers do not see a ghost after WS drop.
     let cleared_channels = clear_user_from_all_channels(user_id);
     for channel_id in cleared_channels {
         let participants = participants_in_channel(&channel_id);
@@ -3433,7 +3404,6 @@ pub async fn on_user_disconnected(user_id: &str, socket_state: &SocketState) {
         return;
     }
 
-    // Read availability before flipping offline so friends keep the last chosen status.
     let Some(availability) = availability_status_for_user(user_id).await else {
         return;
     };
@@ -3443,7 +3413,7 @@ pub async fn on_user_disconnected(user_id: &str, socket_state: &SocketState) {
     if !set_user_offline(user_id).await {
         return;
     }
-    // Final gate — a tab may have connected during the offline write.
+
     if socket_state.is_user_connected(user_id) || socket_state.connection_count(user_id) > 0 {
         let _ = set_user_online(user_id).await;
         return;
@@ -3501,9 +3471,7 @@ pub async fn dispatch_message(
         }
         "typing" => {
             if let Ok(p) = serde_json::from_value::<TypingPayload>(payload) {
-                // Never rate-limit a "stopped typing" signal: dropping it would
-                // leave the peer's "typing…" indicator stuck on screen. Only
-                // throttle the "started/keeps typing" heartbeats, per chat.
+
                 if p.is_typing.unwrap_or(false) {
                     let chat_key = p
                         .chat_id
@@ -3515,7 +3483,7 @@ pub async fn dispatch_message(
                         return;
                     }
                 }
-                // Run off the socket read loop; coalesce per chat_id (latest wins).
+
                 let state = state.clone();
                 let connected = connected.to_string();
                 let state_job = state.clone();
@@ -3651,7 +3619,7 @@ pub async fn dispatch_message(
             if !state.check_rate_limit(connected, "set-offline", 30, 60_000) {
                 return;
             }
-            // Multi-tab: re-check before and after await so a new tab mid-flight wins.
+
             let connected = connected.to_string();
             let state = state.clone();
             tokio::spawn(async move {
@@ -3667,7 +3635,7 @@ pub async fn dispatch_message(
                 if !set_user_offline(&connected).await {
                     return;
                 }
-                // Final gate — a tab may have connected during the offline write.
+
                 if state.connection_count(&connected) > 1 {
                     let _ = set_user_online(&connected).await;
                     return;
@@ -3687,8 +3655,7 @@ pub async fn dispatch_message(
             if !state.check_rate_limit(connected, "set-status", 30, 60_000) {
                 return;
             }
-            // Prefer HTTP /availability-status (already emits). Keep WS for legacy/clients
-            // that only speak WS — run off the socket loop either way.
+
             let status = payload
                 .get("availabilityStatus")
                 .and_then(|v| v.as_str())
@@ -3699,7 +3666,7 @@ pub async fn dispatch_message(
                     let Some(normalized) = set_availability(&connected, &st).await else {
                         return;
                     };
-                    // Parity with HTTP /availability-status — emit DB isOnline, not socket map.
+
                     let Ok(oid) = ObjectId::parse_str(&connected) else {
                         return;
                     };

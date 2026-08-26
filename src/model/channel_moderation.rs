@@ -1,3 +1,11 @@
+// channel_moderation.rs
+// Wpis mute/ban (opcjonalne wygaśnięcie) + deserializer starych kształtów.
+// Zakres:
+//  - osadzone w Channel
+//  - mute/ban + expiry; deserializer starych kształtów
+// Nie zmieniaj kształtu bez migracji starych dokumentów.
+// Przy zmianach: model/channels.rs, utils/channel/moderation.rs.
+
 use mongodb::bson::{oid::ObjectId, DateTime};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -70,7 +78,7 @@ where
                 expires_at: None,
                 created_at: now,
             }),
-            // Keep expired entries so maybe_prune can persist cleanup + notify.
+
             ModerationEntryCompat::Full(entry) => Some(entry),
         })
         .collect())

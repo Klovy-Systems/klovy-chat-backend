@@ -1,3 +1,11 @@
+// r2.rs
+// S3 API Cloudflare R2: put/get/delete, public URL.
+// Zakres:
+//  - init na starcie
+//  - put/get/delete S3; CDN_PUBLIC_BASE_URL = ten bucket
+// CDN_PUBLIC_BASE_URL musi wskazywać ten bucket.
+// Przy zmianach: keys.rs, images.rs, FE cdn.ts.
+
 use std::env;
 use std::sync::OnceLock;
 
@@ -5,7 +13,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 
-use super::storage_keys::attachment_prefers_download;
+use super::keys::attachment_prefers_download;
 
 #[derive(Debug)]
 pub enum StorageError {

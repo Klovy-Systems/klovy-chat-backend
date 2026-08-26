@@ -1,9 +1,17 @@
-pub mod crypto_store;
-pub mod frame_crypto;
+// mod.rs
+// Handshake WS: origin, TLS, IP, klient, JWT, whitelist, crypto token.
+// Zakres:
+//  - pętla gniazda, heartbeat, cap połączeń
+//  - handshake: origin, TLS, IP, klient, JWT, whitelist, crypto
+// Nowy warunek odrzucenia: log + ten sam powód co HTTP gdy się da.
+// Przy zmianach: ws/handlers.rs, ws/registry.rs, middlewares/client.rs.
+
+pub mod keys;
+pub mod encrypt;
 pub mod handlers;
 pub mod registry;
 pub mod state;
-pub mod typing_access_cache;
+pub mod typing;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,26 +31,26 @@ use serde_json::json;
 use std::net::SocketAddr;
 use tokio::sync::{mpsc, watch};
 
-use crate::middlewares::ip_blocker::IPBlockerArc;
-use crate::utils::client_ip::client_ip_from_headers;
-use crate::utils::security::client_id::{query_client_valid, query_param, WS_CRYPTO_QUERY_PARAM};
+use crate::middlewares::ip_block::IPBlockerArc;
+use crate::utils::ip::client_ip_from_headers;
+use crate::utils::security::id::{query_client_valid, query_param, WS_CRYPTO_QUERY_PARAM};
 use crate::utils::security::origin::is_origin_header_allowed;
 use crate::utils::security::transport::is_secure_client_connection;
-use crate::ws::crypto_store::{consume_ws_crypto_key, ws_frame_encryption_required};
-use crate::ws::frame_crypto::{decrypt_frame_async, encrypt_frame_async, FrameCipher};
+use crate::ws::keys::{consume_ws_crypto_key, ws_frame_encryption_required};
+use crate::ws::encrypt::{decrypt_frame_async, encrypt_frame_async, FrameCipher};
 use crate::ws::handlers::{
     dispatch_message, finalize_taken_call_sessions, on_user_connected, on_user_disconnected,
 };
-use crate::utils::voice::call_sessions::take_sessions_for_connection;
+use crate::utils::voice::calls::take_sessions_for_connection;
 use crate::ws::registry::ConnectionRegistry;
 use crate::ws::state::{is_valid_object_id, SocketState};
-use crate::middlewares::auth_middleware::TokenPayload;
-use crate::model::user_model::User;
-use crate::utils::auth::jwt_auth::{
+use crate::middlewares::auth::TokenPayload;
+use crate::model::users::User;
+use crate::utils::auth::jwt::{
     jwt_decoding_key, parse_jwt_from_cookie_header, parse_refresh_from_cookie_header,
     resolve_session_family_id, user_from_jwt_with_refresh, JwtUserError,
 };
-use crate::utils::auth::jwt_validation::hs256_validation;
+use crate::utils::auth::validation::hs256_validation;
 use crate::utils::db::get_db;
 use crate::utils::whitelist::is_whitelist_enabled;
 use mongodb::bson::oid::ObjectId;
@@ -51,7 +59,7 @@ use mongodb::bson::oid::ObjectId;
 pub struct WsAppState {
     pub socket_state: SocketState,
     pub registry: ConnectionRegistry,
-    pub ip_blocker: Arc<IPBlockerArc>,
+    pub ip_block: Arc<IPBlockerArc>,
 }
 
 pub fn init(registry: ConnectionRegistry) {
@@ -86,7 +94,7 @@ pub async fn ws_handler(
         }
     };
 
-    if raw_query.as_deref().is_some_and(|q| q.len() > crate::utils::upload_limits::MAX_PROXY_URI_BYTES)
+    if raw_query.as_deref().is_some_and(|q| q.len() > crate::utils::upload::MAX_PROXY_URI_BYTES)
     {
         return (StatusCode::URI_TOO_LONG, "URI too long").into_response();
     }
@@ -103,13 +111,13 @@ pub async fn ws_handler(
 
     let client_ip = client_ip_from_headers(&headers, Some(peer));
 
-    if app_state.ip_blocker.is_blocked(&client_ip) {
+    if app_state.ip_block.is_blocked(&client_ip) {
         log::warn!("WebSocket rejected — blocked IP {}", client_ip);
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
 
     if !query_client_valid(raw_query.as_deref()) {
-        app_state.ip_blocker.add_suspicious_activity(&client_ip);
+        app_state.ip_block.add_suspicious_activity(&client_ip);
         log::warn!("WebSocket rejected — missing client identifier for IP {}", client_ip);
         return (StatusCode::BAD_REQUEST, "Unsupported client").into_response();
     }
@@ -246,9 +254,7 @@ async fn process_incoming_text(
     last_pong_at: &mut std::time::Instant,
     conn_id: u64,
 ) -> bool {
-    // Auth is validated on connect and re-checked on AUTH_RECHECK_INTERVAL.
-    // Re-running JWT+DB lookup on every frame (typing, ping, send) added a full
-    // Mongo round-trip before the handler could run and stalled the socket loop.
+
     if let Ok(parsed) = serde_json::from_str::<IncomingFrame>(text) {
         if parsed.msg_type == "pong" {
             *last_pong_at = std::time::Instant::now();
@@ -311,7 +317,7 @@ async fn handle_socket(
     auth_interval.tick().await;
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // First tick completes immediately; skip so the first ping is after PING_INTERVAL.
+
     ping_interval.tick().await;
     let mut last_pong_at = std::time::Instant::now();
 
@@ -371,7 +377,7 @@ async fn handle_socket(
                     .await
                     {
                         Ok(_) => {}
-                        // Transient Mongo — do not kick a live socket.
+
                         Err(JwtUserError::Unavailable) => return,
                         Err(JwtUserError::Denied) => {
                             registry.disconnect_user(&user_id).await;
@@ -383,7 +389,7 @@ async fn handle_socket(
                             Ok(oid) => match User::find_by_id(&get_db(), oid).await {
                                 Ok(Some(u)) => u.is_whitelisted,
                                 Ok(None) => false,
-                                // Transient — keep the socket; next tick retries.
+
                                 Err(_) => return,
                             },
                             Err(_) => false,
@@ -494,16 +500,13 @@ async fn handle_socket(
 
     let last_connection = !app_state.socket_state.is_user_connected(&user_id);
 
-    // Drop channel-voice owned by this connection only when OTHER tabs remain.
-    // Last-tab drop waits for reconnect grace (same as DM calls) so refresh does
-    // not flicker peers with a false leave.
     if !last_connection {
         let voice_left =
-            crate::utils::voice::channel_voice::clear_connection(&user_id, conn_id);
+            crate::utils::voice::channels::clear_connection(&user_id, conn_id);
         if !voice_left.is_empty() {
             let user_id_voice = user_id.clone();
             tokio::spawn(async move {
-                use crate::model::channel_model::Channel;
+                use crate::model::channels::Channel;
                 use crate::utils::db::get_db;
                 use crate::ws::registry::{channel_recipient_ids, emit_to_users};
                 use mongodb::bson::oid::ObjectId;
@@ -511,7 +514,7 @@ async fn handle_socket(
                 let db = get_db();
                 for channel_id in voice_left {
                     let participants =
-                        crate::utils::voice::channel_voice::participants_in_channel(&channel_id);
+                        crate::utils::voice::channels::participants_in_channel(&channel_id);
                     let body = json!({ "channelId": channel_id, "participants": participants });
                     let Ok(oid) = ObjectId::parse_str(&channel_id) else {
                         let mut recipients = participants.clone();
@@ -525,7 +528,7 @@ async fn handle_socket(
                     };
                     let channel = match Channel::find_by_id(&db, oid).await {
                         Ok(Some(ch)) => Some(ch),
-                        // Missing or transient — caller uses read-state / skip fanout.
+
                         Ok(None) | Err(_) => None,
                     };
                     if let Some(ch) = channel {
@@ -553,9 +556,6 @@ async fn handle_socket(
         }
     }
 
-    // Drop DM call sessions owned by this connection only when OTHER tabs remain.
-    // Last-tab drop must not bypass the reconnect grace — otherwise caller/accepted
-    // sessions die immediately on refresh and peer gets cancelled/ended.
     if !last_connection {
         let call_left = take_sessions_for_connection(&user_id, conn_id);
         if !call_left.is_empty() {
@@ -566,10 +566,6 @@ async fn handle_socket(
         }
     }
 
-    // Ustaw offline / wyczyść stan tylko gdy to było OSTATNIE aktywne połączenie
-    // użytkownika (inaczej zamknięcie jednej karty wyłączałoby go na innych).
-    // Grace window: a quick reconnect (new tab / refresh) must not tear down
-    // call sessions / presence before the new socket registers.
     if last_connection {
         let user_id_for_presence = user_id.clone();
         let socket_state = app_state.socket_state.clone();

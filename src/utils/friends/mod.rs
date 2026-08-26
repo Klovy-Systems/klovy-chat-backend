@@ -1,14 +1,22 @@
+// mod.rs
+// Czy para może DM (friend vs block).
+// Zakres:
+//  - brak dokumentu = not blocked
+//  - czy para może DM; brak dokumentu = not blocked
+// Wołane z WS send — cache'uj w friends/cache.rs.
+// Przy zmianach: access/members.rs, handlers send.
+
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId};
 use mongodb::Database;
 use serde_json::{json, Value};
 
-use crate::model::friend_request_model::FriendRequest;
-use crate::model::user_model::User;
+use crate::model::friend_requests::FriendRequest;
+use crate::model::users::User;
 use crate::utils::friends::cache::{
     get_cached_block_pair, get_cached_friend_ids, get_cached_friend_set, put_cached_friend_ids,
 };
-use crate::utils::user::serialize_user::resolve_display_name;
+use crate::utils::user::json::resolve_display_name;
 
 pub mod cache;
 
@@ -17,7 +25,6 @@ pub use cache::{
     invalidate_friend_ids_pair,
 };
 
-/// `(viewer_blocks_peer, peer_blocks_viewer)` for DM block UI / errors.
 pub async fn try_dm_block_flags(
     db: &Database,
     viewer: &str,
@@ -43,7 +50,7 @@ pub async fn try_dm_block_flags(
         .map_err(|_| ())?;
     let docs: Vec<Document> = cursor.try_collect().await.map_err(|_| ())?;
     if docs.len() < 2 {
-        // Missing user doc(s) — authoritative not-blocked.
+
         crate::utils::friends::cache::put_cached_block_flags(viewer, peer, false, false);
         return Ok((false, false));
     }
@@ -118,7 +125,6 @@ pub async fn try_are_friends(db: &Database, user_id1: &str, user_id2: &str) -> R
     }
 }
 
-/// Lista hex-id zaakceptowanych znajomych (cache + DB). Błąd bazy → Err, nie pusta lista.
 pub async fn try_friend_ids(db: &Database, user_id: &str) -> Result<Vec<String>, ()> {
     if let Some(cached) = get_cached_friend_ids(user_id) {
         return Ok(cached);
@@ -172,9 +178,6 @@ async fn load_friend_ids_uncached(db: &Database, user_id: &str) -> Result<Vec<St
         .collect())
 }
 
-/// Rozgłasza zdarzenie WS tylko do zaakceptowanych znajomych użytkownika.
-/// Zastępuje globalny broadcast, który wyciekał obecność/profil do wszystkich
-/// zalogowanych klientów (spójne z polityką HTTP `get_user_status`).
 pub async fn emit_to_friends(db: &Database, user_id: &str, event: &str, data: Value) {
     if let Some(cached) = get_cached_friend_ids(user_id) {
         if !cached.is_empty() {
@@ -197,21 +200,18 @@ pub async fn emit_to_friends(db: &Database, user_id: &str, event: &str, data: Va
                 }
             }
             Err(_) => {
-                // Last resort: emit to the actor so multi-tab still updates; friends
-                // will heal on next successful presence poll / profile refresh.
+
                 log::warn!("emit_to_friends: friend list unavailable for {user_id}");
             }
         },
     }
 }
 
-/// Wysyła zdarzenie profilu do samego użytkownika i jego znajomych (panel admina, kontakty).
 pub async fn emit_profile_event(db: &Database, user_id: &str, event: &str, data: Value) {
     crate::ws::registry::emit_to_user(user_id, event, data.clone());
     emit_to_friends(db, user_id, event, data).await;
 }
 
-/// Rozgłasza zmianę obecności/statusu do samego użytkownika (wiele kart) i znajomych.
 pub async fn emit_status_event(db: &Database, user_id: &str, data: Value) {
     crate::ws::registry::emit_to_user(user_id, "user-status-changed", data.clone());
     emit_to_friends(db, user_id, "user-status-changed", data).await;

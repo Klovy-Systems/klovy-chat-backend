@@ -1,3 +1,11 @@
+// registry.rs
+// Mapa user → gniazda, fan-out, limit połączeń / IP.
+// Zakres:
+//  - cap pamięci przy wolnym kliencie
+//  - user → gniazda, fan-out, cap / IP; broadcast best-effort
+// Broadcast musi być best-effort — błąd jednego peera nie rollbackuje zapisu.
+// Przy zmianach: ws/mod.rs, handlers.rs.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -9,14 +17,10 @@ use serde_json::{json, Value};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::sync::mpsc::error::TrySendError;
 
-use crate::model::channel_model::Channel;
+use crate::model::channels::Channel;
 
 pub type WsSender = mpsc::Sender<String>;
 
-/// Maksymalna liczba zakolejkowanych ramek na jedno połączenie WS.
-/// Chroni przed nieograniczonym wzrostem pamięci przy wolnym kliencie —
-/// po przepełnieniu ramki są odrzucane (best-effort), a klient po
-/// ponownym połączeniu i tak odświeży stan.
 pub const WS_SEND_BUFFER: usize = 512;
 
 static REGISTRY: OnceCell<ConnectionRegistry> = OnceCell::new();
@@ -69,7 +73,6 @@ fn is_critical_event(msg_type: &str) -> bool {
         || msg_type.starts_with("channel-voice:")
 }
 
-/// Fast-path try_send; on Full for critical events briefly await send (~50ms).
 async fn enqueue_frame(tx: &WsSender, msg: String, critical: bool) {
     match tx.try_send(msg) {
         Ok(()) => {}
@@ -154,7 +157,6 @@ impl ConnectionRegistry {
         }
     }
 
-    /// One lock snapshot + shared frame string for N recipients.
     async fn send_prebuilt_to_users(&self, user_ids: &[String], msg: Arc<String>, critical: bool) {
         let senders: Vec<WsSender> = {
             let map = self.connections.lock().await;
@@ -262,7 +264,6 @@ pub fn emit_to_user(user_id: &str, event: &str, data: impl Serialize + Send + Sy
     });
 }
 
-/// Serialize once, fan out to many users (channel broadcast hot path).
 pub fn emit_to_users(user_ids: &[String], event: &str, data: Value) {
     if user_ids.is_empty() {
         return;
@@ -295,10 +296,6 @@ pub fn emit_to_all_connected(event: &str, data: impl Serialize + Send + Sync + '
         reg.broadcast_to_all(&event, payload).await;
     });
 }
-
-// Ogłoszenia i inne zdarzenia globalne: `emit_to_all_connected`.
-// Obecność/profil: `crate::utils::friends::emit_to_friends`.
-// Kanały: `emit_to_users(&channel_recipient_ids(...), ...)`.
 
 pub fn channel_recipient_ids(channel: &Channel) -> Vec<String> {
     let mut ids: Vec<String> = channel.members.iter().map(|m| m.to_hex()).collect();

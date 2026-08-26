@@ -1,12 +1,19 @@
+// transport.rs
+// https za Caddy/CF (Forwarded, Cf-Visitor).
+// Zakres:
+//  - secure cookie, WSS
+//  - https za Caddy/CF → secure cookie i WSS
+// Źle = cookie nie siądzie na HTTPS.
+// Przy zmianach: env.rs, ws/mod.rs.
+
 use http::HeaderMap;
 
-use crate::utils::app_env::is_production;
+use crate::utils::env::is_production;
 
 fn proto_token_is_https(token: &str) -> bool {
     token.trim().eq_ignore_ascii_case("https")
 }
 
-/// Leftmost `X-Forwarded-Proto` value (client-facing hop).
 fn x_forwarded_proto_https(raw: &str) -> bool {
     raw.split(',')
         .next()
@@ -14,7 +21,6 @@ fn x_forwarded_proto_https(raw: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// RFC 7239 `Forwarded` — first `proto=` parameter in the chain.
 fn forwarded_proto_https(raw: &str) -> bool {
     for element in raw.split(',') {
         for part in element.split(';') {
@@ -31,14 +37,11 @@ fn forwarded_proto_https(raw: &str) -> bool {
     false
 }
 
-/// Cloudflare `Cf-Visitor: {"scheme":"https"}` — useful when Caddy overwrites
-/// `X-Forwarded-Proto` based on the cleartext tunnel hop (cloudflared → Caddy).
 fn cf_visitor_https(raw: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
     lower.contains("\"scheme\":\"https\"") || lower.contains("\"scheme\": \"https\"")
 }
 
-/// Inspect proxy headers for an HTTPS client-facing hop (ignores `NODE_ENV`).
 pub fn proxy_headers_indicate_https(headers: &HeaderMap) -> bool {
     if let Some(raw) = headers
         .get("x-forwarded-proto")
@@ -64,7 +67,6 @@ pub fn proxy_headers_indicate_https(headers: &HeaderMap) -> bool {
     false
 }
 
-/// True when the client connection reached us over HTTPS (via reverse proxy).
 pub fn is_secure_client_connection(headers: &HeaderMap) -> bool {
     if !is_production() {
         return true;

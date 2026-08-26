@@ -1,12 +1,20 @@
+// reconcile.rs
+// Sprzątanie pending vs obiekty w R2.
+// Zakres:
+//  - start / job
+//  - kasuj pending bez message; nie ruszaj żywego klucza
+// Nie kasuj obiektu jeśli message wciąż wskazuje klucz.
+// Przy zmianach: uploads.rs, main.rs.
+
 use std::collections::{HashMap, HashSet};
 
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId};
 use mongodb::Database;
 
-use crate::model::messages_model::Message;
-use crate::model::pending_upload_model::PendingUpload;
-use crate::model::user_storage_usage_model::UserStorageUsage;
+use crate::model::messages::Message;
+use crate::model::uploads::PendingUpload;
+use crate::model::storage_usage::UserStorageUsage;
 use crate::utils::storage::{is_attachment_key, storage, StorageError};
 
 #[derive(Debug, Default)]
@@ -110,7 +118,6 @@ async fn rebuild_user_storage_usage(db: &Database) -> mongodb::error::Result<u64
         updated += 1;
     }
 
-    // Zero sticky quotas for users who no longer have any counted attachments.
     let existing = UserStorageUsage::collection(db).find(doc! {}).await?;
     let rows: Vec<UserStorageUsage> = existing.try_collect().await?;
     for row in rows {

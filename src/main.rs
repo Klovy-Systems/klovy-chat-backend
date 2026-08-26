@@ -1,14 +1,22 @@
-use klovy_chat_server::loaders::express;
-use klovy_chat_server::utils::app_env::is_production;
+// main.rs
+// Proces serwera: dotenv, logi, Mongo, R2, indeksy, bind HTTP.
+// Zakres:
+//  - Axum publiczny + Actix wewnętrzny z loaders/server.rs
+//  - dotenv, logi, Mongo, R2, indeksy, bind; nowy model = indeks tutaj albo w db::
+// Nowy model Mongo: dopisz sync/index tutaj albo w db::, inaczej unikaty nie wstaną.
+// Przy zmianach: loaders/server.rs, utils/config.rs, utils/db/mod.rs.
+
+use klovy_chat_server::loaders::server;
+use klovy_chat_server::utils::env::is_production;
 use klovy_chat_server::model::{
-    announcement_model::Announcement, audit_log_model::AuditLog, channel_model::Channel,
-    channel_read_state_model::ChannelReadState, channel_report_model::ChannelReport,
-    friend_request_model::FriendRequest, invite_model::Invite,
-    messages_model::Message, pending_upload_model::PendingUpload,
-    refresh_token_model::RefreshToken, user_model::User, user_storage_usage_model::UserStorageUsage,
-    warning_model::Warning,
+    announcements::Announcement, audit::AuditLog, channels::Channel,
+    read_state::ChannelReadState, reports::ChannelReport,
+    friend_requests::FriendRequest, invites::Invite,
+    messages::Message, uploads::PendingUpload,
+    refresh_tokens::RefreshToken, users::User, storage_usage::UserStorageUsage,
+    warnings::Warning,
 };
-use klovy_chat_server::utils::database_url::database_url;
+use klovy_chat_server::utils::db_url::database_url;
 use klovy_chat_server::utils::db;
 use klovy_chat_server::utils::storage::reconcile_attachments;
 
@@ -25,7 +33,7 @@ async fn main() -> std::io::Result<()> {
 
     db::sync_user_indexes().await.ok();
 
-    klovy_chat_server::utils::config_validate::validate_startup_config();
+    klovy_chat_server::utils::config::validate_startup_config();
 
     klovy_chat_server::utils::storage::init_storage().unwrap_or_else(|e| {
         panic!(
@@ -40,7 +48,7 @@ async fn main() -> std::io::Result<()> {
     {
         let db = mongodb_db.clone();
         tokio::spawn(async move {
-            match klovy_chat_server::utils::messages::search_text::backfill_message_search_text(&db)
+            match klovy_chat_server::utils::messages::search::backfill_message_search_text(&db)
                 .await
             {
                 Ok(n) if n > 0 => log::info!("Startup: backfilled searchText on {n} message(s)"),
@@ -183,7 +191,7 @@ async fn main() -> std::io::Result<()> {
             "disabled"
         }
     );
-    express::run_server().await
+    server::run_server().await
 }
 
 async fn ensure_indexes(db: &mongodb::Database) {
@@ -195,7 +203,7 @@ async fn ensure_indexes(db: &mongodb::Database) {
         ("friend_requests", FriendRequest::create_indexes(db).await),
         ("invites", Invite::create_indexes(db).await),
         ("channel_read_states", ChannelReadState::create_indexes(db).await),
-        ("dm_conversation_tips", klovy_chat_server::utils::conversation_tips::DmConversationTip::create_indexes(db).await),
+        ("dm_conversation_tips", klovy_chat_server::utils::tips::DmConversationTip::create_indexes(db).await),
         ("channel_reports", ChannelReport::create_indexes(db).await),
         ("refresh_tokens", RefreshToken::create_indexes(db).await),
         ("pending_uploads", PendingUpload::create_indexes(db).await),

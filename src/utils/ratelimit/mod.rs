@@ -1,3 +1,11 @@
+// mod.rs
+// Liczniki HTTP/WS per IP i user (przed body).
+// Zakres:
+//  - osobno WS handshake
+//  - liczniki per IP/user przed body; osobno handshake WS
+// Nowa publiczna ścieżka: dopisz bucket, inaczej łatwy flood.
+// Przy zmianach: loaders/server.rs, ws/mod.rs.
+
 pub mod slowmode;
 
 use actix_web::{
@@ -12,7 +20,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Drop expired / excess keys so a unique-IP flood cannot grow RAM without bound.
 const MAX_STORE_BUCKETS: usize = 50_000;
 
 pub struct Store {
@@ -86,7 +93,6 @@ impl Store {
         true
     }
 
-    /// Peek without consuming a slot (e.g. slowmode before create).
     pub fn would_block_with_window(&self, key: &str, max: u32, window: Duration) -> bool {
         let mut map = self.lock_buckets();
         let now = Instant::now();
@@ -132,7 +138,6 @@ impl Store {
         bucket.count += 1;
     }
 
-    /// Seconds until the current window resets (at least 1 when blocked).
     pub fn retry_after_secs(&self, key: &str) -> u64 {
         let map = self.lock_buckets();
         let now = Instant::now();
@@ -142,7 +147,6 @@ impl Store {
         }
     }
 
-    /// Atomically checks quota and consumes one slot. Returns retry-after seconds on failure.
     pub fn try_consume(&self, key: &str) -> Result<(), u64> {
         if self.check_and_increment(key) {
             Ok(())
@@ -152,10 +156,10 @@ impl Store {
     }
 }
 
-use crate::middlewares::auth_middleware::RequestUserId;
+use crate::middlewares::auth::RequestUserId;
 
 fn client_ip(req: &ServiceRequest) -> String {
-    crate::utils::client_ip::client_ip_from_service_request(req)
+    crate::utils::ip::client_ip_from_service_request(req)
 }
 
 fn rate_limit_key(prefix: &str, ip: &str) -> String {
@@ -223,10 +227,6 @@ fn trusted_ips() -> Vec<String> {
         .unwrap_or_default()
 }
 
-// NOTE on tuning: limits that gate normal real-time usage (browsing, loading
-// media, uploading, discovery) are set generously so production feels
-// responsive. Security-sensitive limits (login/2FA/signup/password/
-// username brute-force) stay strict.
 static GLOBAL: Lazy<Store> = Lazy::new(|| Store::new(1500, Duration::from_secs(15 * 60)));
 static SEND: Lazy<Store> = Lazy::new(|| Store::new(900, Duration::from_secs(60)));
 static AUTH: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
@@ -252,18 +252,18 @@ static CHANGE_USERNAME: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_
 static FRIEND_ACTION: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(5 * 60)));
 static STATUS_UPDATE: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(60)));
 static PIN_MESSAGE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
-/// Public Axum hop — counted before the HTTP body is buffered. WS is separate.
+
 static EDGE_HTTP: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(10)));
-/// Process-wide HTTP budget. Per-IP limits do not stop a unique-IP flood.
+
 static EDGE_HTTP_TOTAL: Lazy<Store> = Lazy::new(|| Store::new(2500, Duration::from_secs(10)));
-/// Process-wide WS handshake budget (before JWT / DB). Separate from HTTP.
+
 static WS_HANDSHAKE_TOTAL: Lazy<Store> = Lazy::new(|| Store::new(600, Duration::from_secs(10)));
 static HTTP_INFLIGHT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
 pub const HTTP_EDGE_TIMEOUT: Duration = Duration::from_secs(60);
 static CHAT_ATTACHMENT: Lazy<Store> = Lazy::new(|| {
     Store::new(
-        crate::utils::upload_limits::MAX_CHAT_ATTACHMENTS_PER_WINDOW,
-        crate::utils::upload_limits::chat_attachment_window(),
+        crate::utils::upload::MAX_CHAT_ATTACHMENTS_PER_WINDOW,
+        crate::utils::upload::chat_attachment_window(),
     )
 });
 
@@ -271,7 +271,6 @@ fn chat_attachment_key(user_id: &str) -> String {
     rate_limit_key("chat-attachment", user_id)
 }
 
-/// Rolling quota for DM/channel file uploads (images, documents, voice notes, etc.).
 pub fn try_consume_chat_attachment_quota(user_id: &str) -> Result<(), u64> {
     CHAT_ATTACHMENT.try_consume(&chat_attachment_key(user_id))
 }
@@ -628,9 +627,6 @@ pub fn ws_handshake_allowed(ip: &str) -> Result<(), u64> {
     )
 }
 
-/// Cheap burst check for the public HTTP proxy (before `to_bytes`).
-/// Per-IP first, then a process-wide budget so a unique-IP flood cannot
-/// walk past 120/10s × N addresses.
 pub fn edge_http_allowed(ip: &str) -> Result<(), u64> {
     if trusted_ips().iter().any(|trusted| trusted == ip) {
         return Ok(());
@@ -639,7 +635,6 @@ pub fn edge_http_allowed(ip: &str) -> Result<(), u64> {
     try_ip_then_total(&EDGE_HTTP, &key, &EDGE_HTTP_TOTAL, "edge-http-total")
 }
 
-/// Slot for one in-flight HTTP proxy request. WebSocket upgrades do not take this.
 pub fn try_acquire_http_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
     HTTP_INFLIGHT.try_acquire().ok()
 }

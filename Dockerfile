@@ -28,7 +28,7 @@ WORKDIR /app
 
 # Kopiowanie skompilowanych plików binarnych ze etapu builder
 COPY --from=builder /usr/src/app/target/release/klovy-chat-server /app/klovy-chat-server
-COPY --from=builder /usr/src/app/target/release/migrate-message-content-seal /app/migrate-message-content-seal
+COPY --from=builder /usr/src/app/target/release/encrypt-old-messages /app/encrypt-old-messages
 
 EXPOSE 6701
 

@@ -15,8 +15,8 @@ name = "klovy-chat-server"
 path = "src/main.rs"
 
 [[bin]]
-name = "migrate-message-content-seal"
-path = "src/bin/migrate_message_content_seal.rs"
+name = "encrypt-old-messages"
+path = "src/bin/encrypt_old_messages.rs"
 
 [dependencies]
 actix-web = "4"

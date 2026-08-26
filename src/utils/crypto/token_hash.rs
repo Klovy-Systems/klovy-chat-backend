@@ -1,6 +1,14 @@
+// token_hash.rs
+// Hash tokenów refresh/invite przed Mongo.
+// Zakres:
+//  - nie plaintext
+//  - hash refresh/invite; zmiana algorytmu unieważnia tokeny
+// Lookup po hash — zmiana algorytmu unieważnia tokeny.
+// Przy zmianach: refresh.rs, invites.rs.
+
 use std::env;
 
-use super::keyed_hash::{derive_subkey, hmac_sha256_hex, sha256_hex};
+use super::hmac::{derive_subkey, hmac_sha256_hex, sha256_hex};
 
 const REFRESH_TOKEN_CONTEXT: &str = "refresh-token-v2";
 const REFRESH_HASH_PREFIX: &str = "v2:";
@@ -9,14 +17,14 @@ pub fn refresh_token_hmac_key() -> Result<Vec<u8>, String> {
     if let Ok(key) = env::var("TOKEN_HASH_KEY") {
         let key = key.trim();
         if !key.is_empty() {
-            if crate::utils::app_env::is_production() && key.len() < 32 {
+            if crate::utils::env::is_production() && key.len() < 32 {
                 return Err("TOKEN_HASH_KEY must be at least 32 characters in production".to_string());
             }
             return Ok(key.as_bytes().to_vec());
         }
     }
 
-    if crate::utils::app_env::is_production() {
+    if crate::utils::env::is_production() {
         return Err("TOKEN_HASH_KEY must be set in production".to_string());
     }
 

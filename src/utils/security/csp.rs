@@ -1,3 +1,11 @@
+// csp.rs
+// Nagłówki CSP.
+// Zakres:
+//  - XSS
+//  - XSS headers; nowy iframe = tu + FE embeds
+// Nowy embed iframe: tu + FE embeds.
+// Przy zmianach: server.rs security headers.
+
 use std::env;
 
 fn cdn_image_host() -> String {

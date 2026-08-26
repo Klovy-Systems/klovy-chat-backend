@@ -1,14 +1,22 @@
-pub mod announcement_model;
-pub mod audit_log_model;
+// mod.rs
+// Reeksport dokumentów Mongo.
+// Zakres:
+//  - users, channels, messages, …
+//  - nowy collection: plik + indeksy przy starcie
+// Nowy collection: plik tutaj + indeksy przy starcie.
+// Przy zmianach: utils/db/mod.rs, main.rs.
+
+pub mod announcements;
+pub mod audit;
 pub mod channel_moderation;
-pub mod channel_model;
-pub mod channel_read_state_model;
-pub mod channel_report_model;
-pub mod friend_request_model;
-pub mod invite_model;
-pub mod messages_model;
-pub mod pending_upload_model;
-pub mod refresh_token_model;
-pub mod user_model;
-pub mod user_storage_usage_model;
-pub mod warning_model;
+pub mod channels;
+pub mod read_state;
+pub mod reports;
+pub mod friend_requests;
+pub mod invites;
+pub mod messages;
+pub mod uploads;
+pub mod refresh_tokens;
+pub mod users;
+pub mod storage_usage;
+pub mod warnings;

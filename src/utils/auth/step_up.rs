@@ -1,6 +1,14 @@
+// step_up.rs
+// Ponowne hasło przy zmianie email/hasła/2FA off.
+// Zakres:
+//  - krótki challenge
+//  - hasło ponownie przy zmianie email/hasła/2FA off
+// Bez tego CSRF+skradziona sesja zmienia konto.
+// Przy zmianach: controllers/auth.rs.
+
 use mongodb::bson::Bson;
 
-use crate::model::user_model::User;
+use crate::model::users::User;
 use crate::utils::auth::totp::{
     decrypt_totp_secret, is_totp_code, verify_and_consume_backup_code, verify_totp_code,
 };

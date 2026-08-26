@@ -1,8 +1,16 @@
+// mentions.rs
+// Parse @user / everyone, fan-out powiadomień.
+// Zakres:
+//  - przy send
+//  - @user / everyone przy send; everyone tylko gdy policy pozwala
+// everyone tylko gdy policy kanału pozwala — sprawdź tu.
+// Przy zmianach: handlers.rs, Mentions.tsx.
+
 use mongodb::bson::{doc, oid::ObjectId};
 use mongodb::Database;
 use regex::Regex;
 
-use crate::model::user_model::User;
+use crate::model::users::User;
 
 lazy_static::lazy_static! {
     static ref MENTION_REGEX: Regex = Regex::new(
@@ -35,7 +43,6 @@ pub fn has_everyone_mention(content: &str) -> bool {
     !content.is_empty() && EVERYONE_REGEX.is_match(content)
 }
 
-/// Resolve @username mentions among allowed users.
 pub async fn resolve_mentions(
     db: &Database,
     content: &str,

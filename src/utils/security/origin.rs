@@ -1,11 +1,18 @@
+// origin.rs
+// Walidacja Origin/Referer.
+// Zakres:
+//  - HTTP+WS
+//  - Origin/Referer HTTP+WS; nowy host deployu = ENV
+// Preview deploy (nowy host) = ENV ORIGIN.
+// Przy zmianach: middlewares/origin.rs, ws/mod.rs.
+
 use std::env;
 
 use actix_web::http::Method;
 use http::HeaderMap;
 
 fn normalize_origin(origin: &str) -> String {
-    // Browser `Origin` never includes a trailing slash; strip so env typos don't
-    // silently break CORS / WS origin checks in production.
+
     origin.trim().trim_end_matches('/').to_string()
 }
 
@@ -30,7 +37,7 @@ pub fn allowed_origins() -> Vec<String> {
         }
     }
 
-    if crate::utils::app_env::is_development() {
+    if crate::utils::env::is_development() {
         for origin in ["http://127.0.0.1:5173", "http://localhost:5173"] {
             push_origin(&mut origins, origin);
         }
@@ -39,8 +46,6 @@ pub fn allowed_origins() -> Vec<String> {
     origins
 }
 
-/// Nagłówki CORS z wewnętrznego Actix — nie przekazujemy ich do przeglądarki,
-/// bo publiczna warstwa Axum ustawia własne (podwójne ACAO psuje CORS w browserze).
 pub fn is_cors_response_header(name: &str) -> bool {
     matches!(
         name,
@@ -59,11 +64,10 @@ pub fn origin_allowed(value: &str, allowed: &[String]) -> bool {
         .any(|origin| value == origin || value.starts_with(&format!("{origin}/")))
 }
 
-use crate::utils::security::client_id::{
+use crate::utils::security::id::{
     canonicalize_request_path, is_security_webhook_path,
 };
 
-/// Ścieżki zwolnione z kontroli Origin.
 pub fn is_origin_guard_exempt(path: &str) -> bool {
     let path = canonicalize_request_path(path);
     path == "/api" || is_security_webhook_path(&path)
@@ -82,9 +86,9 @@ pub fn requires_origin_guard(method: &Method, path: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginGuardMode {
-    /// Mutacje w produkcji: wymagany poprawny Origin lub Referer.
+
     Strict,
-    /// GET/HEAD: odrzucaj tylko gdy Origin/Referer są obecne i niedozwolone.
+
     RejectKnownBad,
 }
 
@@ -113,7 +117,7 @@ pub fn validate_browser_origin_values(
 
     match mode {
         OriginGuardMode::Strict => {
-            if crate::utils::app_env::is_production() {
+            if crate::utils::env::is_production() {
                 origin_ok == Some(true) || referer_ok == Some(true)
             } else {
                 !matches!(
@@ -126,7 +130,7 @@ pub fn validate_browser_origin_values(
             if origin_ok == Some(false) || referer_ok == Some(false) {
                 return false;
             }
-            if crate::utils::app_env::is_production() {
+            if crate::utils::env::is_production() {
                 return true;
             }
             !matches!(

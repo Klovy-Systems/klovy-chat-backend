@@ -1,3 +1,11 @@
+// state.rs
+// Kolejki FIFO per gniazdo: chat, mark-read, typing, call (bez HOL-block).
+// Zakres:
+//  - jeden worker, nie dropuj sendera mid-job
+//  - FIFO chat / mark-read / typing / call — bez HOL-block
+// Nowy rodzaj ramki o innym SLA: nowa kolejka, nie wrzucaj typing na send FIFO.
+// Przy zmianach: ws/handlers.rs, ws/registry.rs.
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -17,33 +25,33 @@ type UserJob = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 struct FifoSlot {
     tx: mpsc::Sender<UserJob>,
-    /// False once the worker has exited — blocks creating a second worker mid-drain.
+
     alive: Arc<AtomicBool>,
-    /// True while a job is running — idle GC must not drop the sender mid-job.
+
     busy: Arc<AtomicBool>,
     last_used_ms: i64,
 }
 
 #[derive(Clone, Default)]
 pub struct SocketState {
-    /// chat_id → (user_id → last_typing_heartbeat_ms)
+
     pub typing_users: Arc<StdMutex<HashMap<String, HashMap<String, i64>>>>,
-    /// Sync mutex — checked on the socket receive loop (no await).
+
     pub rate_limits: Arc<StdMutex<HashMap<String, HashMap<String, RateLimitEntry>>>>,
     pub connections: Arc<StdMutex<HashMap<String, u32>>>,
     pub ip_connections: Arc<StdMutex<HashMap<String, u32>>>,
-    /// Chat mutations (send/edit/delete/react) — bounded FIFO.
+
     chat_fifo: Arc<StdMutex<HashMap<String, FifoSlot>>>,
-    /// Mark-read acks — separate so send/edit cannot HOL-block read receipts.
+
     ack_fifo: Arc<StdMutex<HashMap<String, FifoSlot>>>,
-    /// Typing only — sync VecDeque so start/stop never reorder (no try_send leapfrog).
+
     typing_fifo: Arc<StdMutex<HashMap<String, TypingSlot>>>,
-    /// Call + channel-voice — separate from typing so heartbeats cannot HOL-block accept.
+
     call_fifo: Arc<StdMutex<HashMap<String, FifoSlot>>>,
-    /// Per-user auth recheck throttle (one JWT lookup per user per interval).
+
     auth_recheck_started: Arc<StdMutex<HashMap<String, i64>>>,
     typing_gc_counter: Arc<AtomicU32>,
-    /// Live WebSocket upgrades currently counted (all IPs).
+
     ws_total: Arc<AtomicU32>,
 }
 
@@ -55,7 +63,7 @@ struct TypingJob {
 
 struct TypingSlot {
     queue: std::collections::VecDeque<TypingJob>,
-    /// Worker is spawned / draining this user's typing queue.
+
     running: bool,
     last_used_ms: i64,
 }
@@ -84,7 +92,7 @@ impl SocketState {
             if !slot.alive.load(Ordering::Acquire) {
                 return false;
             }
-            // Never drop a sender while a job is in-flight — avoids dual-worker on reconnect.
+
             if slot.busy.load(Ordering::Acquire) {
                 return true;
             }
@@ -164,7 +172,6 @@ impl SocketState {
         true
     }
 
-    /// Chat path: send / edit / delete / reaction.
     pub fn spawn_user_ordered<F>(&self, user_id: impl Into<String>, fut: F) -> bool
     where
         F: Future<Output = ()> + Send + 'static,
@@ -181,7 +188,6 @@ impl SocketState {
         )
     }
 
-    /// Mark-read path — must not sit behind slow send/edit/delete.
     pub fn spawn_user_ack<F>(&self, user_id: impl Into<String>, fut: F) -> bool
     where
         F: Future<Output = ()> + Send + 'static,
@@ -198,7 +204,6 @@ impl SocketState {
         )
     }
 
-    /// Call + channel-voice — must not sit behind typing heartbeats or slow sends.
     pub fn spawn_user_realtime<F>(&self, user_id: impl Into<String>, fut: F) -> bool
     where
         F: Future<Output = ()> + Send + 'static,
@@ -215,9 +220,6 @@ impl SocketState {
         )
     }
 
-    /// Typing: sync push onto a per-user VecDeque (receive order), then drain serially.
-    /// Latest job for a given `chat_id` wins (prior jobs for that chat are dropped).
-    /// Never drops under load up to TYPING_QUEUE_MAX (pop_front when full).
     pub fn spawn_user_ordered_eventually<F>(
         &self,
         user_id: impl Into<String>,
@@ -233,7 +235,6 @@ impl SocketState {
         let now = now_ms();
         let mut guard = self.typing_fifo.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Idle GC for disconnected users with empty queues.
         {
             let conn = self.connections.lock().unwrap_or_else(|e| e.into_inner());
             guard.retain(|uid, slot| {
@@ -251,7 +252,7 @@ impl SocketState {
             last_used_ms: now,
         });
         slot.last_used_ms = now;
-        // Same chat + same is_typing: replace in place (heartbeat). Else latest wins.
+
         if let Some(existing) = slot
             .queue
             .iter_mut()
@@ -463,12 +464,10 @@ impl SocketState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(user_id);
-        // Do not drop FIFO senders here — that races a draining worker with a
-        // reconnect-created worker. Idle GC in fifo_enqueue removes slots after
-        // FIFO_IDLE_GC_MS when the user stays disconnected and !busy.
-        crate::ws::typing_access_cache::clear_user(user_id);
-        crate::utils::access::channel_access_cache::clear_user(user_id);
-        crate::utils::user::availability_cache::clear(user_id);
+
+        crate::ws::typing::clear_user(user_id);
+        crate::utils::access::cache::clear_user(user_id);
+        crate::utils::user::online::clear(user_id);
         crate::utils::friends::cache::invalidate_block_pair_for_user(user_id);
         let mut typing = self.typing_users.lock().unwrap_or_else(|e| e.into_inner());
         for users in typing.values_mut() {

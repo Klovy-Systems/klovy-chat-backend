@@ -1,3 +1,11 @@
+// mod.rs
+// Tip/unread denorm kanału, fill przed zaufaniem unread 0.
+// Zakres:
+//  - roster helpers
+//  - tip/unread denorm; fill zanim zaufasz unread 0
+// Nie ufaj unread 0 gdy tip jest dziurawy — najpierw fill.
+// Przy zmianach: controllers/channels.rs, tips.rs, unread/mod.rs.
+
 use std::collections::{HashMap, HashSet};
 
 use futures_util::TryStreamExt;
@@ -6,11 +14,11 @@ use mongodb::Database;
 use serde_json::{json, Value};
 
 use crate::model::channel_moderation::has_active_entry;
-use crate::model::channel_model::Channel;
-use crate::model::channel_read_state_model::ChannelReadState;
-use crate::model::messages_model::Message;
-use crate::model::user_model::User;
-use crate::utils::user::serialize_user::resolve_display_name;
+use crate::model::channels::Channel;
+use crate::model::read_state::ChannelReadState;
+use crate::model::messages::Message;
+use crate::model::users::User;
+use crate::utils::user::json::resolve_display_name;
 
 pub mod moderation;
 
@@ -68,7 +76,6 @@ fn user_to_list_admin(db_value: Option<&Value>, admin_id: ObjectId) -> Value {
         .unwrap_or_else(|| json!({ "_id": admin_id.to_hex() }))
 }
 
-/// Slim channel payload for sidebar list / channel-added WS (no member roster).
 pub async fn serialize_channel_list_item(
     db: &Database,
     channel: &Channel,
@@ -133,7 +140,6 @@ fn user_to_channel_json_slim(user: &User) -> Value {
     })
 }
 
-/// Batch-load slim profiles for channel list (no bio / banner).
 pub async fn fetch_users_map_slim(db: &Database, ids: &[ObjectId]) -> HashMap<ObjectId, Value> {
     let mut seen = HashSet::new();
     let unique: Vec<ObjectId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
@@ -176,7 +182,6 @@ pub async fn populate_channel_user(db: &Database, id: ObjectId) -> Value {
     }
 }
 
-/// Batch-load channel member/admin profiles (one users query).
 pub async fn fetch_users_map(db: &Database, ids: &[ObjectId]) -> HashMap<ObjectId, Value> {
     let mut seen = HashSet::new();
     let unique: Vec<ObjectId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
@@ -232,7 +237,6 @@ pub async fn get_channel_ban_mute_lists(
     moderation::get_channel_ban_mute_lists(db, channel_id).await
 }
 
-/// Tip + unread for one channel. Tip is resolved before unread trust.
 pub async fn enrich_channel_unread(
     db: &Database,
     user_id: ObjectId,
@@ -242,7 +246,6 @@ pub async fn enrich_channel_unread(
         return Some((0, None));
     };
 
-    // Resolve tip first — missing denorm tip must not trust unread 0 before fill.
     let tip = match (
         channel.last_message_at,
         channel.last_message.as_ref(),
@@ -258,7 +261,7 @@ pub async fn enrich_channel_unread(
             {
                 Ok(mut cursor) => match cursor.try_next().await {
                     Ok(Some(m)) => {
-                        let content = crate::utils::messages::content_storage::content_for_api_async(
+                        let content = crate::utils::messages::storage::content_for_api_async(
                             m.content.clone(),
                         )
                         .await;
@@ -278,8 +281,7 @@ pub async fn enrich_channel_unread(
     };
 
     let unread = if let Some(ref s) = state {
-        // Trust positive denorm only when lastRead is still behind tip — otherwise
-        // sticky-high after mark-read × late $inc must be recounted.
+
         let effective = if s.last_read_at.timestamp_millis() <= 0 {
             s.created_at
         } else {
@@ -290,16 +292,14 @@ pub async fn enrich_channel_unread(
             .is_some_and(|ts| effective.timestamp_millis() < ts.timestamp_millis());
         let stale_high = s.unread_count > 0
             && tip_ts.is_some_and(|ts| effective.timestamp_millis() >= ts.timestamp_millis());
-        // Parity with contacts: never trust positive denorm when behind tip
-        // (failed bump after WS +1 leaves denorm low).
+
         if s.unread_count > 0 && !stale_high && !behind_tip {
             s.unread_count
         } else if s.unread_count == 0 && !behind_tip && tip.is_none() {
-            // Empty channel (no tip) — truly caught up.
+
             0
         } else {
-            // Tip present + unread 0: verify (stale tip after failed upsert).
-            // behind_tip / stale_high: always recount.
+
             match crate::utils::unread::try_count_channel_unread(db, user_id, channel_id).await {
                 Some(n) => n,
                 None if s.unread_count > 0 => s.unread_count,
@@ -309,15 +309,13 @@ pub async fn enrich_channel_unread(
     } else if tip.is_some() {
         return None;
     } else {
-        // Empty channel (no tip, no row) — truly caught up.
+
         0
     };
 
     Some((unread, tip))
 }
 
-/// Batch last-message + unread for many channels (one read-state query + unread agg).
-/// Last-message prefers denormalized channel tip fields when present.
 pub async fn enrich_channels_batch(
     db: &Database,
     user_id: ObjectId,
@@ -345,7 +343,6 @@ pub async fn enrich_channels_batch(
         }
     }
 
-    // Tip fill BEFORE unread trust — missing denorm tip must not trust unread 0.
     if !missing_tip.is_empty() {
         let last_pipeline = vec![
             doc! {
@@ -375,7 +372,7 @@ pub async fn enrich_channels_batch(
                             let content = doc
                                 .get_str("content")
                                 .ok()
-                                .map(crate::utils::messages::content_storage::content_for_api);
+                                .map(crate::utils::messages::storage::content_for_api);
                             let mid = doc.get_object_id("messageId").ok();
                             if let (Some(ts), Some(content), Some(mid)) = (ts, content, mid) {
                                 filled.insert(cid, (ts, content, mid));
@@ -407,7 +404,7 @@ pub async fn enrich_channels_batch(
                 Err(_) => return None,
             };
             for s in states {
-                // Epoch lastReadAt → createdAt (legacy bump-before-seed rows).
+
                 let effective = if s.last_read_at.timestamp_millis() <= 0 {
                     s.created_at
                 } else {
@@ -417,9 +414,7 @@ pub async fn enrich_channels_batch(
                 let tip_ts = out.get(&s.channel_id).and_then(|e| e.1.as_ref().map(|t| t.0));
                 let behind_tip = tip_ts
                     .is_some_and(|ts| effective.timestamp_millis() < ts.timestamp_millis());
-                // Positive denorm behind tip must recount (failed bump undercount).
-                // Tip present + unread 0: verify (parity contacts; stale tip after upsert fail).
-                // Trust denorm 0 only when no tip (empty channel).
+
                 if s.unread_count > 0 {
                     let stale_high = tip_ts
                         .is_some_and(|ts| effective.timestamp_millis() >= ts.timestamp_millis());
@@ -490,7 +485,7 @@ pub async fn enrich_channels_batch(
                         }
                         Ok(None) => break,
                         Err(_) => {
-                            // Mid-stream Err — do not leave undercount candidates at init 0.
+
                             return None;
                         }
                     }
@@ -504,4 +499,3 @@ pub async fn enrich_channels_batch(
 
     Some(out)
 }
-

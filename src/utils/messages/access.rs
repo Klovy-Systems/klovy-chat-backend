@@ -1,9 +1,17 @@
+// access.rs
+// Czy ten user może wysłać ten plik/treść (size, SHA pending, membership).
+// Zakres:
+//  - skip R2 HEAD na non-image gdy size już sprawdzony
+//  - size, SHA pending, membership przed send/upload
+// Nowe ograniczenie załącznika: tu + attachments.rs + FE.
+// Przy zmianach: ws send, upload.rs.
+
 use mongodb::bson::oid::ObjectId;
 use mongodb::Database;
 
-use crate::model::pending_upload_model::PendingUpload;
-use crate::model::messages_model::Message;
-use crate::utils::access::membership_gate::{
+use crate::model::uploads::PendingUpload;
+use crate::model::messages::Message;
+use crate::utils::access::members::{
     require_channel_message_access, require_dm_access,
 };
 use crate::utils::friends::try_are_friends;
@@ -11,7 +19,7 @@ use crate::utils::storage::{
     attachment_path_matches_channel, attachment_path_matches_dm, is_attachment_key,
     is_logical_message_path, is_safe_key, storage,
 };
-use crate::utils::validators::external_url::is_allowed_external_media_url;
+use crate::utils::validators::url::is_allowed_external_media_url;
 
 #[derive(Debug, Clone)]
 pub enum QuoteContext {
@@ -34,7 +42,6 @@ pub async fn validate_quote_target(
     validate_quote_target_with_access(db, user_id, quoted_message_id, context, false).await
 }
 
-/// When `access_already_checked`, skip membership/friend gates (caller already gated send).
 pub async fn validate_quote_target_with_access(
     db: &Database,
     user_id: &str,
@@ -67,7 +74,7 @@ pub async fn validate_quote_target_with_access(
             if !access_already_checked {
                 match require_dm_access(db, user_id, &contact_id).await {
                     Ok(()) => {}
-                    Err(crate::utils::access::membership_gate::AccessDeniedReason::Unavailable) => {
+                    Err(crate::utils::access::members::AccessDeniedReason::Unavailable) => {
                         return Err(());
                     }
                     Err(_) => return Ok(None),
@@ -82,7 +89,7 @@ pub async fn validate_quote_target_with_access(
             if !access_already_checked {
                 match require_channel_message_access(db, &channel_id, user_id).await {
                     Ok(_) => {}
-                    Err(crate::utils::access::membership_gate::AccessDeniedReason::Unavailable) => {
+                    Err(crate::utils::access::members::AccessDeniedReason::Unavailable) => {
                         return Err(());
                     }
                     Err(_) => return Ok(None),
@@ -194,7 +201,7 @@ pub async fn cleanup_attachment_if_unreferenced(db: &Database, file_url: Option<
                 measured as i64
             };
             if decrement > 0 {
-                let _ = crate::model::user_storage_usage_model::UserStorageUsage::adjust(
+                let _ = crate::model::storage_usage::UserStorageUsage::adjust(
                     db, user_id, -decrement,
                 )
                 .await;
@@ -234,12 +241,11 @@ async fn attachment_stored_size_is_valid(
         "jpg" | "jpeg" | "png" | "webp"
     );
 
-    // Non-image: pending size already verified at upload — skip R2 HEAD on send FIFO.
     if !is_image {
         if let (Some(claimed), Some(expected)) = (claimed_size, pending_size) {
             if expected > 0
                 && claimed == expected
-                && expected <= crate::utils::upload_limits::MAX_ATTACHMENT_BYTES
+                && expected <= crate::utils::upload::MAX_ATTACHMENT_BYTES
             {
                 return true;
             }
@@ -252,9 +258,9 @@ async fn attachment_stored_size_is_valid(
     };
 
     let max_bytes = if is_image {
-        crate::utils::upload_limits::MAX_IMAGE_ATTACHMENT_BYTES
+        crate::utils::upload::MAX_IMAGE_ATTACHMENT_BYTES
     } else {
-        crate::utils::upload_limits::MAX_ATTACHMENT_BYTES
+        crate::utils::upload::MAX_ATTACHMENT_BYTES
     };
     if actual > max_bytes {
         return false;
@@ -262,7 +268,7 @@ async fn attachment_stored_size_is_valid(
 
     if let Some(expected) = pending_size {
         if expected > 0 {
-            // Pending size for images includes the thumbnail object bytes.
+
             if is_image {
                 if expected < actual {
                     return false;
@@ -277,9 +283,6 @@ async fn attachment_stored_size_is_valid(
         return true;
     };
 
-    // Obrazy są re-enkodowane po stronie serwera do webp, więc zapisany rozmiar
-    // różni się od pierwotnego rozmiaru z klienta — nie porównujemy z „claimed"
-    // (dokładny rozmiar jest już zweryfikowany powyżej przez pending_size).
     if is_image {
         return true;
     }
@@ -322,10 +325,10 @@ pub async fn validate_message_attachment(
         Some(url) if url.trim().is_empty() => true,
         Some(url) => {
             if file_size
-                .map(|size| size > crate::utils::upload_limits::MAX_ATTACHMENT_BYTES)
+                .map(|size| size > crate::utils::upload::MAX_ATTACHMENT_BYTES)
                 .unwrap_or(false)
             {
-                // Client-reported size is pre-encode; images are capped separately on upload.
+
                 let path = url.trim().replace('\\', "/");
                 let ext = path.rsplit('.').next().unwrap_or("");
                 let is_image = matches!(
@@ -382,8 +385,6 @@ pub async fn validate_message_attachment(
                 return false;
             }
 
-            // Pending upload already stored SHA at upload time + size matches —
-            // skip full R2 download/hash on the send hot path (holds user FIFO).
             true
         }
     }

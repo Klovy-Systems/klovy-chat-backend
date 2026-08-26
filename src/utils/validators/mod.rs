@@ -1,8 +1,15 @@
-pub mod archive_validation;
-pub mod external_url;
-pub mod file_magic;
-pub mod normalize_username;
-pub mod pwned_password;
-pub mod sanitize_input;
-pub mod unicode_text;
-pub mod validate_json_payload;
+// mod.rs
+// Reeksport walidatorów wejścia.
+// Zakres:
+//  - username, url, unicode, file, json
+// Nowa walidacja: plik + wrap w server.rs jeśli globalna.
+// Przy zmianach: sanitize.rs, json.rs.
+
+pub mod zip;
+pub mod url;
+pub mod file_type;
+pub mod username;
+pub mod leaked_password;
+pub mod sanitize;
+pub mod unicode;
+pub mod json;

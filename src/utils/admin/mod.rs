@@ -1,25 +1,32 @@
+// mod.rs
+// Cięższe operacje (wipe tipów, sprzątanie po userze).
+// Zakres:
+//  - audyt poboczny
+//  - wipe tipów, sprzątanie po userze; nie z publicznego API
+// Nie wołaj z publicznego API bez osobnej autoryzacji admina.
+// Przy zmianach: model/audit.rs.
+
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
 use serde_json::json;
 
-use crate::model::channel_model::Channel;
-use crate::model::channel_read_state_model::ChannelReadState;
-use crate::model::channel_report_model::ChannelReport;
-use crate::model::friend_request_model::FriendRequest;
-use crate::model::invite_model::Invite;
-use crate::model::messages_model::Message;
-use crate::model::pending_upload_model::PendingUpload;
-use crate::model::refresh_token_model::RefreshToken;
-use crate::model::user_model::User;
-use crate::model::warning_model::Warning;
+use crate::model::channels::Channel;
+use crate::model::read_state::ChannelReadState;
+use crate::model::reports::ChannelReport;
+use crate::model::friend_requests::FriendRequest;
+use crate::model::invites::Invite;
+use crate::model::messages::Message;
+use crate::model::uploads::PendingUpload;
+use crate::model::refresh_tokens::RefreshToken;
+use crate::model::users::User;
+use crate::model::warnings::Warning;
 use crate::utils::storage::{avatar_key_owned_by_channel, storage};
 use crate::utils::whitelist::is_whitelist_enabled;
 use crate::ws::registry::disconnect_user;
 
 pub const DELETION_GRACE_DAYS: i64 = 7;
 
-/// Przy włączonej whitelistcie: zatwierdza konta sprzed wprowadzenia pola isWhitelisted.
 pub async fn reconcile_whitelist_fields(db: &Database) -> Result<u64, mongodb::error::Error> {
     if !is_whitelist_enabled() {
         return Ok(0);
@@ -55,7 +62,6 @@ pub struct PurgeRemovedSchemaReport {
     pub e2e_keys_dropped: bool,
 }
 
-/// Strip obsolete E2E / panel-admin / badge fields left in Mongo after those features were removed.
 pub async fn purge_removed_schema_fields(
     db: &Database,
 ) -> Result<PurgeRemovedSchemaReport, mongodb::error::Error> {
@@ -118,7 +124,7 @@ pub async fn purge_removed_schema_fields(
                 }
             }
             Err(e) => {
-                // NamespaceNotFound is fine when the collection was never created / already gone.
+
                 let msg = e.to_string();
                 if !msg.contains("NamespaceNotFound") && !msg.contains("ns not found") {
                     return Err(e);
@@ -229,12 +235,11 @@ pub async fn purge_user_data(
     db: &Database,
     user_id: ObjectId,
 ) -> Result<u64, mongodb::error::Error> {
-    use crate::utils::conversation_tips::DmConversationTip;
+    use crate::utils::tips::DmConversationTip;
     use crate::ws::registry::{channel_recipient_ids, emit_to_users};
 
     let user_hex = user_id.to_hex();
 
-    // Invalidate friend caches + drop DM tips before wiping messages/friendships.
     let friendships: Vec<FriendRequest> = FriendRequest::collection(db)
         .find(doc! {
             "status": "accepted",
@@ -248,35 +253,35 @@ pub async fn purge_user_data(
         let peer = if f.from == user_id { f.to } else { f.from };
         let peer_hex = peer.to_hex();
         crate::utils::friends::invalidate_friend_ids_pair(&user_hex, &peer_hex);
-        crate::ws::typing_access_cache::invalidate_pair(&user_hex, &peer_hex);
-        crate::utils::conversation_tips::clear_dm_tip(db, user_id, peer).await;
-        // Tear down live DM calls (unfriend path does the same).
+        crate::ws::typing::invalidate_pair(&user_hex, &peer_hex);
+        crate::utils::tips::clear_dm_tip(db, user_id, peer).await;
+
         if let Some(session) =
-            crate::utils::voice::call_sessions::take_session_for_pair(&user_hex, &peer_hex)
+            crate::utils::voice::calls::take_session_for_pair(&user_hex, &peer_hex)
         {
             let end_payload = json!({ "from": user_hex, "reason": "ACCOUNT_DELETED" });
             let event = match session.phase {
-                crate::utils::voice::call_sessions::CallPhase::Ringing => "call:cancelled",
-                crate::utils::voice::call_sessions::CallPhase::Accepted => "call:ended",
+                crate::utils::voice::calls::CallPhase::Ringing => "call:cancelled",
+                crate::utils::voice::calls::CallPhase::Accepted => "call:ended",
             };
             crate::ws::registry::emit_to_user(&session.callee_id, event, end_payload.clone());
             crate::ws::registry::emit_to_user(&session.caller_id, event, end_payload);
         }
     }
-    // Any leftover sessions involving this user (race / non-friend).
-    for session in crate::utils::voice::call_sessions::take_sessions_for_user(&user_hex) {
+
+    for session in crate::utils::voice::calls::take_sessions_for_user(&user_hex) {
         let end_payload = json!({ "from": user_hex, "reason": "ACCOUNT_DELETED" });
         let event = match session.phase {
-            crate::utils::voice::call_sessions::CallPhase::Ringing => "call:cancelled",
-            crate::utils::voice::call_sessions::CallPhase::Accepted => "call:ended",
+            crate::utils::voice::calls::CallPhase::Ringing => "call:cancelled",
+            crate::utils::voice::calls::CallPhase::Accepted => "call:ended",
         };
         crate::ws::registry::emit_to_user(&session.callee_id, event, end_payload.clone());
         crate::ws::registry::emit_to_user(&session.caller_id, event, end_payload);
     }
-    // Drop channel-voice memberships and notify peers.
-    for channel_id in crate::utils::voice::channel_voice::clear_user_from_all_channels(&user_hex) {
+
+    for channel_id in crate::utils::voice::channels::clear_user_from_all_channels(&user_hex) {
         let participants =
-            crate::utils::voice::channel_voice::participants_in_channel(&channel_id);
+            crate::utils::voice::channels::participants_in_channel(&channel_id);
         if let Ok(oid) = ObjectId::parse_str(&channel_id) {
             if let Ok(Some(ch)) = Channel::find_by_id(db, oid).await {
                 let recipients = channel_recipient_ids(&ch);
@@ -294,7 +299,6 @@ pub async fn purge_user_data(
         })
         .await;
 
-    // Channels where this user posted — tip may point at a message we are about to wipe.
     let tip_channel_oids: Vec<ObjectId> = Message::collection(db)
         .distinct("channel", doc! {
             "sender": user_id,
@@ -331,7 +335,6 @@ pub async fn purge_user_data(
         .delete_many(doc! { "createdBy": user_id })
         .await?;
 
-    // Member channels: notify peers + invalidate before pull.
     let member_channels: Vec<Channel> = Channel::find_by_member(db, user_id)
         .await
         .unwrap_or_default();
@@ -346,11 +349,11 @@ pub async fn purge_user_data(
     for ch in &member_channels {
         let Some(cid) = ch.id else { continue };
         let channel_id = cid.to_hex();
-        crate::ws::typing_access_cache::invalidate_channel(&channel_id);
+        crate::ws::typing::invalidate_channel(&channel_id);
         let mut remaining = channel_recipient_ids(ch);
         remaining.retain(|r| r != &user_hex);
         let participants =
-            crate::utils::voice::channel_voice::leave_channel_voice(&channel_id, &user_hex);
+            crate::utils::voice::channels::leave_channel_voice(&channel_id, &user_hex);
         emit_to_users(
             &remaining,
             "channel-voice:state",
@@ -380,12 +383,11 @@ pub async fn purge_user_data(
     let owned_ids: Vec<ObjectId> = owned.iter().filter_map(|c| c.id).collect();
     let owned_set: std::collections::HashSet<ObjectId> = owned_ids.iter().copied().collect();
 
-    // Rebuild tips for remaining member channels after hard-deleting this user's posts.
     for cid in tip_channel_oids {
         if owned_set.contains(&cid) {
             continue;
         }
-        crate::utils::conversation_tips::recompute_channel_tip(db, cid).await;
+        crate::utils::tips::recompute_channel_tip(db, cid).await;
     }
 
     let channels_deleted = owned_ids.len() as u64;
@@ -393,8 +395,8 @@ pub async fn purge_user_data(
         for ch in &owned {
             let Some(cid) = ch.id else { continue };
             let channel_id = cid.to_hex();
-            crate::ws::typing_access_cache::invalidate_channel(&channel_id);
-            crate::utils::voice::channel_voice::clear_channel_voice(&channel_id);
+            crate::ws::typing::invalidate_channel(&channel_id);
+            crate::utils::voice::channels::clear_channel_voice(&channel_id);
             let recipients = channel_recipient_ids(ch);
             emit_to_users(
                 &recipients,

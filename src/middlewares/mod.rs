@@ -1,28 +1,34 @@
-pub mod auth_fallback_guard;
-pub mod auth_middleware;
-pub mod client_guard;
+// mod.rs
+// Reeksport middleware + helper odczytu body z limitem bajtów.
+// Zakres:
+//  - ochrona RAM na wewnętrznym Actix
+//  - reeksport + limit bajtów body na wewnętrznym Actix
+// Limit musi być ≥ max uploadu, inaczej 413 przed kontrolerem.
+// Przy zmianach: utils/upload.rs, loaders/server.rs.
+
+pub mod auth_fallback;
+pub mod auth;
+pub mod client;
 pub mod csrf;
-pub mod internal_proxy_guard;
-pub mod ip_blocker;
-pub mod origin_guard;
-pub mod registration_guard;
-pub mod turnstile_middleware;
-pub mod validation_middleware;
+pub mod proxy;
+pub mod ip_block;
+pub mod origin;
+pub mod signup;
+pub mod captcha;
+pub mod validation;
 pub mod whitelist;
 
 use actix_web::dev::Payload;
 use actix_web::web::{Bytes, BytesMut};
 
-use crate::utils::upload_limits::MAX_HTTP_BODY_BYTES;
+use crate::utils::upload::MAX_HTTP_BODY_BYTES;
 
 pub(crate) async fn read_body_bytes(mut payload: Payload) -> Result<Bytes, actix_web::Error> {
     use futures_util::StreamExt;
     let mut buf = BytesMut::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(actix_web::error::ErrorBadRequest)?;
-        // Twardy limit rozmiaru — chroni middleware buforujące ciało żądania
-        // przed wyczerpaniem pamięci (istotne na wewnętrznym porcie Actix,
-        // który nie przechodzi przez limit proxy Axum).
+
         if buf.len() + chunk.len() > MAX_HTTP_BODY_BYTES {
             return Err(actix_web::error::ErrorPayloadTooLarge("Payload too large"));
         }

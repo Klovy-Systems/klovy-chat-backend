@@ -1,3 +1,11 @@
+// mod.rs
+// Czy signup otwarty / whitelist / disabled.
+// Zakres:
+//  - czytane przez middleware
+//  - signup open / whitelist / disabled — czyta middleware
+// Zmiana bez FE = 403 z komunikatem API.
+// Przy zmianach: signup.rs, whitelist/mod.rs.
+
 use std::env;
 
 use mongodb::{
@@ -6,7 +14,7 @@ use mongodb::{
     Collection, Database,
 };
 
-use crate::utils::app_env::is_production;
+use crate::utils::env::is_production;
 
 fn env_flag(name: &str) -> bool {
     env::var(name)
@@ -32,7 +40,6 @@ fn env_u32(name: &str, default: u32) -> u32 {
     env_u64(name, default as u64) as u32
 }
 
-/// Całkowite wyłączenie rejestracji (REGISTRATION_DISABLED=true).
 pub fn is_registration_disabled() -> bool {
     env_flag("REGISTRATION_DISABLED")
 }
@@ -130,7 +137,6 @@ async fn try_consume_window(
     Ok(result.is_some_and(|doc| doc.count <= max as i64))
 }
 
-/// Atomically reserves a global signup slot shared across all backend instances.
 pub async fn try_consume_global_signup_slot(
     db: &Database,
 ) -> Result<(), SignupQuotaError> {
@@ -150,7 +156,7 @@ pub async fn try_consume_global_signup_slot(
         Err(_) => return Err(SignupQuotaError::Unavailable),
     };
     if !day_ok {
-        // Best-effort rollback of the hour slot so failed day checks don't skew hourly stats.
+
         let _ = quota_collection(db)
             .update_one(
                 doc! { "_id": &hour_key, "count": { "$gt": 0 } },

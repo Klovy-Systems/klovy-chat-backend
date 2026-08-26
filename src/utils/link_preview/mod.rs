@@ -1,3 +1,11 @@
+// mod.rs
+// OG preview tylko https, limity rozmiaru.
+// Zakres:
+//  - SSR F karta
+//  - OG tylko https; SSRF — nie fetchuj RFC1918
+// SSRF: nie fetchuj RFC1918. Allowlista hostów w urls.rs.
+// Przy zmianach: controllers/messages.rs, embeds.ts.
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
@@ -256,11 +264,11 @@ pub async fn fetch_link_preview(url: &str) -> Result<LinkPreview, &'static str> 
             return Err("Preview unavailable.");
         }
 
-        let bytes = crate::utils::http_limits::read_response_limited(response, MAX_HTML_BYTES)
+        let bytes = crate::utils::http::read_response_limited(response, MAX_HTML_BYTES)
             .await
             .map_err(|err| match err {
-                crate::utils::http_limits::LimitedBodyError::TooLarge => "Preview too large.",
-                crate::utils::http_limits::LimitedBodyError::ReadFailed => {
+                crate::utils::http::LimitedBodyError::TooLarge => "Preview too large.",
+                crate::utils::http::LimitedBodyError::ReadFailed => {
                     "Failed to read preview."
                 }
             })?;

@@ -1,8 +1,10 @@
-//! Short-TTL cache for friend-id fan-out (presence / status / profile events)
-//! and DM block-pair lookups.
-//!
-//! Every status flip used to scan the full FriendRequest collection. Cache results
-//! for a few seconds and invalidate when friendships change.
+// cache.rs
+// TTL id znajomych i par blokad.
+// Zakres:
+//  - fan-out presence
+//  - TTL znajomych i blokad; inwaliduj przy każdej mutacji
+// Inwaliduj przy każdej mutacji FriendRequest.
+// Przy zmianach: friends.rs, user/online.rs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -21,7 +23,7 @@ struct CacheEntry {
 }
 
 struct BlockEntry {
-    /// For sorted (low, high) pair ids: whether low blocks high / high blocks low.
+
     low_blocks_high: bool,
     high_blocks_low: bool,
     cached_at_ms: i64,
@@ -150,7 +152,6 @@ pub fn put_cached_block_flags(
     }
 }
 
-/// Back-compat: OR of either direction blocked.
 pub fn get_cached_block_pair(user_a: &str, user_b: &str) -> Option<bool> {
     get_cached_block_flags(user_a, user_b).map(|(a, b)| a || b)
 }

@@ -1,3 +1,11 @@
+// mod.rs
+// Denorm unread, fence delta vs absolute, recovery po poison mutex.
+// Zakres:
+//  - mark-read vs +1 z send
+//  - delta z send vs absolute z mark-read; poison mutex recovery
+// Absolute 0 bez potwierdzenia recount = sticky-high albo false-zero na FE.
+// Przy zmianach: handlers.rs, read_state.rs, UnreadSync.tsx.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -8,11 +16,10 @@ use mongodb::Database;
 use once_cell::sync::Lazy;
 use serde::Serialize;
 
-use crate::model::channel_read_state_model::ChannelReadState;
-use crate::model::messages_model::Message;
+use crate::model::read_state::ChannelReadState;
+use crate::model::messages::Message;
 use crate::ws::registry;
 
-/// Global tie-break for same-generation ordering (debug / optional FE).
 static UNREAD_REVISION: AtomicU64 = AtomicU64::new(1);
 
 struct GenerationEntry {
@@ -20,21 +27,16 @@ struct GenerationEntry {
     touched_at_ms: i64,
 }
 
-/// Per-(user, conversation) generation. Mark-read bumps it so in-flight deltas
-/// from before the read (still carrying the old generation) are ignored.
 static UNREAD_GENERATIONS: Lazy<Mutex<HashMap<String, GenerationEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Preserves generation counters after idle GC so client-held gens stay valid.
 static GENERATION_FLOOR: Lazy<Mutex<HashMap<String, u64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Per-user watermark: max generation ever observed for that user.
-/// Floor eviction must never cause emits below this (avoids gen 0 after eviction).
 static USER_GENERATION_WATERMARK: Lazy<Mutex<HashMap<String, u64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-const GENERATION_GC_IDLE_MS: i64 = 3_600_000; // 1h
+const GENERATION_GC_IDLE_MS: i64 = 3_600_000;
 const GENERATION_GC_EVERY: u64 = 64;
 const GENERATION_FLOOR_MAX: usize = 50_000;
 const USER_WATERMARK_MAX: usize = 50_000;
@@ -60,7 +62,7 @@ fn bump_user_watermark(user_id: &str, value: u64) {
     let entry = wm.entry(user_id.to_string()).or_insert(0);
     *entry = (*entry).max(value);
     if wm.len() > USER_WATERMARK_MAX {
-        // Evict lowest watermarks first.
+
         let overflow = wm.len() - USER_WATERMARK_MAX;
         let mut entries: Vec<(String, u64)> = wm.iter().map(|(k, v)| (k.clone(), *v)).collect();
         entries.sort_by_key(|(_, v)| *v);
@@ -103,7 +105,7 @@ fn maybe_gc_generations(guard: &mut HashMap<String, GenerationEntry>) {
             *entry = (*entry).max(value);
         }
         if floor.len() > GENERATION_FLOOR_MAX {
-            // Evict lowest floor values first (not arbitrary keys) so hot high gens survive.
+
             let overflow = floor.len() - GENERATION_FLOOR_MAX;
             let mut entries: Vec<(String, u64)> =
                 floor.iter().map(|(k, v)| (k.clone(), *v)).collect();
@@ -152,7 +154,7 @@ fn bump_generation(user_id: &str, kind: &str, id: &str) -> u64 {
     let key = conv_key(user_id, kind, id);
     let mut guard = match UNREAD_GENERATIONS.lock() {
         Ok(g) => g,
-        // Poisoned mutex — recover so mark-read can still fence deltas.
+
         Err(e) => e.into_inner(),
     };
     maybe_gc_generations(&mut guard);
@@ -190,7 +192,7 @@ pub struct UnreadUpdatedEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<i64>,
     pub revision: u64,
-    /// Bumped on absolute mark-read; deltas carry the generation at emit time.
+
     pub generation: u64,
 }
 
@@ -203,8 +205,7 @@ pub async fn try_count_dm_unread(
     user_id: ObjectId,
     contact_id: ObjectId,
 ) -> Option<u64> {
-    // Answered CALL logs are tip-only history (read:true + durationMs>0); exclude
-    // any legacy unread answered CALL rows from the recount.
+
     let filter = doc! {
         "sender": contact_id,
         "recipient": user_id,
@@ -231,9 +232,7 @@ pub async fn try_count_channel_unread(
     user_id: ObjectId,
     channel_id: ObjectId,
 ) -> Option<u64> {
-    // Re-read watermark after count so a concurrent mark-read cannot inflate n
-    // with a stale lastReadAt. Epoch lastReadAt falls back to createdAt so legacy
-    // bump-before-seed rows cannot explode the badge to full history.
+
     for _ in 0..3 {
         let state = match ChannelReadState::find(db, user_id, channel_id).await {
             Ok(s) => s,
@@ -295,11 +294,10 @@ pub async fn set_channel_unread_denorm(
 ) -> bool {
     use mongodb::options::UpdateOptions;
     let now = DateTime::now();
-    // Parity upsert/seed — same-ms concurrent send stays visible to recount.
+
     let last_read =
         DateTime::from_millis(now.timestamp_millis().saturating_sub(1));
-    // Upsert — seed_if_missing is best-effort; heal must still create the row
-    // so list enrich / delete last_reads do not false-zero or skip members.
+
     ChannelReadState::collection(db)
         .update_one(
             doc! { "userId": user_id, "channelId": channel_id },
@@ -310,7 +308,7 @@ pub async fn set_channel_unread_denorm(
                 },
                 "$setOnInsert": {
                     "createdAt": now,
-                    // Caught-up watermark (not epoch 0) — history before seed stays read.
+
                     "lastReadAt": last_read,
                 },
             },
@@ -320,7 +318,6 @@ pub async fn set_channel_unread_denorm(
         .is_ok()
 }
 
-/// Recount + denorm until stable (parity with `sync_dm_tip_unread`).
 pub async fn try_sync_channel_unread(
     db: &Database,
     user_id: ObjectId,
@@ -367,8 +364,6 @@ pub fn emit_unread_delta(user_id: &str, kind: &str, id: &str, delta: i64) {
     emit_unread_delta_at(user_id, kind, id, delta, generation);
 }
 
-/// Emit a delta pinned to a generation snapshot (capture before Message::create
-/// so a concurrent mark-read bump makes this delta stale and ignored).
 pub fn emit_unread_delta_at(
     user_id: &str,
     kind: &str,
@@ -393,12 +388,10 @@ pub fn peek_unread_generation(user_id: &str, kind: &str, id: &str) -> u64 {
     current_generation(user_id, kind, id)
 }
 
-/// Bump generation without claiming a count (fence stale deltas after mark).
 pub fn invalidate_unread_generation(user_id: &str, kind: &str, id: &str) -> u64 {
     bump_generation(user_id, kind, id)
 }
 
-/// Absolute unread without recounting Mongo (e.g. after mark-read → 0).
 pub fn emit_unread_absolute(user_id: &str, kind: &str, id: &str, unread_count: u64) {
     let generation = bump_generation(user_id, kind, id);
     emit_unread_updated(

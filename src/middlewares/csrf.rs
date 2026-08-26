@@ -1,3 +1,11 @@
+// csrf.rs
+// Porównanie cookie CSRF z nagłówkiem.
+// Zakres:
+//  - mutacje
+//  - cookie vs nagłówek na mutacjach; GET bez CSRF
+// GET bez CSRF; zmiana nazwy cookie = FE csrf.ts.
+// Przy zmianach: utils/security/csrf.rs, api/client.ts.
+
 use actix_web::{
     body::{BoxBody, MessageBody},
     dev::{ServiceRequest, ServiceResponse},
@@ -8,7 +16,7 @@ use actix_web_lab::middleware::Next;
 
 use crate::utils::security::csrf::{constant_time_eq, CSRF_COOKIE_NAME, CSRF_HEADER_NAME};
 
-use crate::utils::security::client_id::canonicalize_request_path;
+use crate::utils::security::id::canonicalize_request_path;
 
 fn is_exempt(path: &str) -> bool {
     const EXACT: &[&str] = &[
