@@ -26,10 +26,13 @@ jobs:
 
       - name: Sync files to VPS
         run: |
-          rsync -avz --timeout=30 \
+          rsync -avz --delete --timeout=30 \
             -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }}" \
             --exclude target \
             --exclude .git \
+            --exclude .env \
+            --exclude '.env.*' \
+            --exclude Caddyfile.prod \
             ./ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/home/dupa/backend/
 
       - name: Build & Run Docker Container
