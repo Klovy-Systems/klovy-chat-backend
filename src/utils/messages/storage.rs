@@ -10,32 +10,58 @@ use base64::Engine;
 
 use crate::utils::crypto::encrypt::{decrypt_field, encrypt_field};
 
-pub fn wrap_client_opaque(plain: &str) -> String {
+const OPAQUE_PREFIX: &str = "k1.";
+
+fn encode_legacy_opaque(plain: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(plain.as_bytes())
 }
 
-pub fn is_client_opaque(stored: &str) -> bool {
-    let trimmed = stored.trim();
-    if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with('[') {
-        return false;
-    }
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(trimmed) else {
-        return false;
-    };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return false;
-    };
-    if text.contains('\u{FFFD}') {
-        return false;
-    }
-    client_opaque_normalized_equal(&wrap_client_opaque(text), trimmed)
+pub fn wrap_client_opaque(plain: &str) -> String {
+    format!("{OPAQUE_PREFIX}{}", encode_legacy_opaque(plain))
 }
 
-fn client_opaque_normalized_equal(a: &str, b: &str) -> bool {
-    fn strip_pad(s: &str) -> &str {
-        s.trim_end_matches('=')
+fn looks_like_legacy_envelope(stored: &str) -> bool {
+    !stored.bytes().any(|b| b.is_ascii_whitespace())
+        && stored
+            .bytes()
+            .any(|b| b.is_ascii_uppercase() || matches!(b, b'+' | b'/' | b'='))
+}
+
+fn decode_opaque_body(body: &str) -> Option<String> {
+    if body.len() < 4 || body.len() % 4 != 0 {
+        return None;
     }
-    strip_pad(a) == strip_pad(b)
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(body) else {
+        return None;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return None;
+    };
+    if text.is_empty() || text.contains('\u{FFFD}') {
+        return None;
+    }
+    if encode_legacy_opaque(text) != body {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+pub fn is_client_opaque(stored: &str) -> bool {
+    opaque_plain(stored).is_some()
+}
+
+fn opaque_plain(stored: &str) -> Option<String> {
+    let trimmed = stored.trim();
+    if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return None;
+    }
+    if let Some(body) = trimmed.strip_prefix(OPAQUE_PREFIX) {
+        return decode_opaque_body(body);
+    }
+    if !looks_like_legacy_envelope(trimmed) {
+        return None;
+    }
+    decode_opaque_body(trimmed)
 }
 
 fn is_server_sealed(stored: &str) -> bool {
@@ -116,13 +142,7 @@ pub async fn reveal_content_internal_async(stored: String) -> String {
 }
 
 pub fn unwrap_client_opaque(stored: &str) -> String {
-    let trimmed = stored.trim();
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(trimmed) {
-        if let Ok(text) = std::str::from_utf8(&bytes) {
-            return text.to_string();
-        }
-    }
-    trimmed.to_string()
+    opaque_plain(stored).unwrap_or_else(|| stored.trim().to_string())
 }
 
 pub fn normalize_client_opaque_to_plaintext(incoming: &str) -> String {
@@ -141,4 +161,40 @@ pub fn normalize_client_opaque_to_plaintext(incoming: &str) -> String {
         current = inner;
     }
     current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sentences_and_words_stay_plaintext() {
+        for text in [
+            "elo",
+            "file",
+            "hej co tam",
+            "Elo elo elo",
+            "to jest całe zdanie.",
+        ] {
+            assert!(!is_client_opaque(text), "{text}");
+            assert_eq!(unwrap_client_opaque(text), text);
+        }
+    }
+
+    #[test]
+    fn prefixed_wrap_roundtrips_plaintext() {
+        let wrapped = wrap_client_opaque("elo");
+        assert!(wrapped.starts_with("k1."));
+        assert!(is_client_opaque(&wrapped));
+        assert_eq!(unwrap_client_opaque(&wrapped), "elo");
+        assert_eq!(inbound_plaintext_for_processing(&wrapped, false), "elo");
+    }
+
+    #[test]
+    fn legacy_unprefixed_wrap_still_unwraps() {
+        let legacy = encode_legacy_opaque("elo");
+        assert_eq!(legacy, "ZWxv");
+        assert!(is_client_opaque(&legacy));
+        assert_eq!(unwrap_client_opaque(&legacy), "elo");
+    }
 }
