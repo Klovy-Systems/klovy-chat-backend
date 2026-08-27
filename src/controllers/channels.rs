@@ -1123,109 +1123,31 @@ pub async fn delete_channel(req: HttpRequest) -> HttpResponse {
     let channel_id = cid.to_hex();
     let recipients = channel_recipient_ids(&channel);
 
-    let messages: Vec<Message> = match Message::collection(&db)
-        .find(doc! {
-            "channel": cid,
-            "deleted": { "$ne": true },
-        })
-        .projection(doc! { "_id": 1, "fileUrl": 1 })
-        .await
-    {
-        Ok(cursor) => match cursor.try_collect().await {
-            Ok(m) => m,
-            Err(_) => {
-                return HttpResponse::ServiceUnavailable().json(json!({
-                    "message": "Failed to delete channel",
-                    "retryable": true,
-                }));
-            }
-        },
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(json!({
-                "message": "Failed to delete channel",
-                "retryable": true,
-            }));
-        }
+    let live_filter = doc! {
+        "channel": cid,
+        "deleted": { "$ne": true },
     };
-    let ids: Vec<ObjectId> = messages.iter().filter_map(|m| m.id).collect();
-    if !ids.is_empty() {
-        if Message::collection(&db)
-            .update_many(
-                doc! { "_id": { "$in": &ids } },
-                doc! { "$set": {
-                    "deleted": true,
-                    "deletedAt": DateTime::now(),
-                    "updatedAt": DateTime::now(),
-                    "searchText": "",
-                    "searchTokens": [],
-                }},
-            )
-            .await
-            .is_err()
-        {
+    let file_urls = match crate::utils::messages::search::wipe_live_messages(&db, live_filter).await {
+        Ok(urls) => urls,
+        Err(e) => {
+            log::error!("delete_channel: failed to wipe messages for {channel_id}: {e}");
             return HttpResponse::ServiceUnavailable().json(json!({
                 "message": "Failed to delete channel",
                 "retryable": true,
             }));
         }
-    }
-
-    let late: Vec<Message> = match Message::collection(&db)
-        .find(doc! {
-            "channel": cid,
-            "deleted": { "$ne": true },
-        })
-        .projection(doc! { "_id": 1, "fileUrl": 1 })
-        .await
-    {
-        Ok(cursor) => match cursor.try_collect().await {
-            Ok(m) => m,
-            Err(_) => {
-                return HttpResponse::ServiceUnavailable().json(json!({
-                    "message": "Failed to delete channel",
-                    "retryable": true,
-                }));
-            }
-        },
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(json!({
-                "message": "Failed to delete channel",
-                "retryable": true,
-            }));
-        }
     };
-    if !late.is_empty() {
-        let late_ids: Vec<ObjectId> = late.iter().filter_map(|m| m.id).collect();
-        if Message::collection(&db)
-            .update_many(
-                doc! { "_id": { "$in": &late_ids } },
-                doc! { "$set": {
-                    "deleted": true,
-                    "deletedAt": DateTime::now(),
-                    "updatedAt": DateTime::now(),
-                    "searchText": "",
-                    "searchTokens": [],
-                }},
-            )
-            .await
-            .is_err()
-        {
-            return HttpResponse::ServiceUnavailable().json(json!({
-                "message": "Failed to delete channel",
-                "retryable": true,
-            }));
-        }
-    }
-    let cleanups: Vec<_> = messages
+    let cleanups: Vec<_> = file_urls
         .iter()
-        .chain(late.iter())
-        .filter_map(|m| m.file_url.as_deref())
         .map(|url| {
             crate::utils::messages::access::cleanup_attachment_if_unreferenced(&db, Some(url))
         })
         .collect();
     futures_util::future::join_all(cleanups).await;
 
+    let _ = crate::model::invites::Invite::collection(&db)
+        .delete_many(doc! { "channelId": cid })
+        .await;
     let _ = crate::model::read_state::ChannelReadState::collection(&db)
         .delete_many(doc! { "channelId": cid })
         .await;
@@ -1235,7 +1157,8 @@ pub async fn delete_channel(req: HttpRequest) -> HttpResponse {
         Ok(_) => {
             return HttpResponse::NotFound().json(json!({ "message": "Channel not found" }));
         }
-        Err(_) => {
+        Err(e) => {
+            log::error!("delete_channel: failed to delete channel {channel_id}: {e}");
             return HttpResponse::InternalServerError().json(json!({
                 "message": "Failed to delete channel",
                 "retryable": true,

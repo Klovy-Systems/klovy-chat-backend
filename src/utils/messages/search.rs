@@ -1,13 +1,14 @@
 // search.rs
-// Indeks searchText (encrypted) + HMAC tokens.
+// Indeks searchText (encrypted) + HMAC tokens; wipe wiadomości bez pełnego Message.
 // Zakres:
 //  - API nie zwraca tych pól
 //  - encrypted searchText + HMAC; substring = tokeny, nie regex
+//  - wipe_live_messages: projection fileUrl, nie hydratacja Message
 // Substring search = tokeny, nie regex na sealed content.
-// Przy zmianach: hmac.rs, controllers/messages.rs.
+// Przy zmianach: hmac.rs, controllers/messages.rs, channels.rs.
 
 use futures_util::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, Document};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::Database;
 use std::sync::OnceLock;
 
@@ -226,4 +227,58 @@ pub async fn collect_message_ids_limited(
         }
     }
     Ok(ids)
+}
+
+async fn collect_message_file_urls(
+    db: &Database,
+    filter: Document,
+) -> mongodb::error::Result<Vec<String>> {
+    let coll = db.collection::<Document>("messages");
+    let mut cursor = coll
+        .find(filter)
+        .projection(doc! { "fileUrl": 1 })
+        .await?;
+
+    let mut urls = Vec::new();
+    while let Some(doc) = cursor.try_next().await? {
+        if let Ok(url) = doc.get_str("fileUrl") {
+            if !url.is_empty() {
+                urls.push(url.to_string());
+            }
+        }
+    }
+    Ok(urls)
+}
+
+fn soft_delete_set() -> Document {
+    let now = DateTime::now();
+    doc! {
+        "$set": {
+            "deleted": true,
+            "deletedAt": now,
+            "updatedAt": now,
+            "searchText": "",
+            "searchTokens": [],
+        }
+    }
+}
+
+/// Soft-delete matching live messages and return attachment URLs for cleanup.
+///
+/// Must not hydrate full [`Message`]: wipe paths project `{_id, fileUrl}` only,
+/// and `Message` requires `sender` / `content` / `timestamp`.
+pub async fn wipe_live_messages(
+    db: &Database,
+    filter: Document,
+) -> mongodb::error::Result<Vec<String>> {
+    let coll = db.collection::<Document>("messages");
+    let mut urls = collect_message_file_urls(db, filter.clone()).await?;
+    coll.update_many(filter.clone(), soft_delete_set()).await?;
+
+    let late = collect_message_file_urls(db, filter.clone()).await?;
+    if !late.is_empty() {
+        urls.extend(late);
+        coll.update_many(filter, soft_delete_set()).await?;
+    }
+    Ok(urls)
 }

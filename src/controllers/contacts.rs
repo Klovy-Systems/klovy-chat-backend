@@ -811,60 +811,30 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
 
     let wipe_at = DateTime::now();
 
-    let messages: Vec<Message> = match Message::collection(&db)
-        .find(doc! {
-            "$or": [
-                { "sender": uid, "recipient": cid },
-                { "sender": cid, "recipient": uid },
-            ],
-            "deleted": { "$ne": true },
-        })
-        .projection(doc! { "_id": 1, "fileUrl": 1 })
-        .await
-    {
-        Ok(cursor) => match cursor.try_collect().await {
-            Ok(m) => m,
-            Err(_) => {
-                return HttpResponse::ServiceUnavailable().json(json!({
-                    "message": "Failed to delete conversation",
-                    "retryable": true,
-                }));
-            }
-        },
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(json!({
+    let live_filter = doc! {
+        "$or": [
+            { "sender": uid, "recipient": cid },
+            { "sender": cid, "recipient": uid },
+        ],
+        "deleted": { "$ne": true },
+    };
+    let file_urls = match crate::utils::messages::search::wipe_live_messages(&db, live_filter).await {
+        Ok(urls) => urls,
+        Err(e) => {
+            log::error!(
+                "delete_conversation: failed to wipe DM messages for {} / {}: {e}",
+                user_id,
+                contact_id
+            );
+            return HttpResponse::ServiceUnavailable().json(json!({
                 "message": "Failed to delete conversation",
                 "retryable": true,
             }));
         }
     };
 
-    let ids: Vec<ObjectId> = messages.iter().filter_map(|m| m.id).collect();
-    if !ids.is_empty() {
-        if Message::collection(&db)
-            .update_many(
-                doc! { "_id": { "$in": &ids } },
-                doc! { "$set": {
-                    "deleted": true,
-                    "deletedAt": DateTime::now(),
-                    "updatedAt": DateTime::now(),
-                    "searchText": "",
-                    "searchTokens": [],
-                }},
-            )
-            .await
-            .is_err()
-        {
-            return HttpResponse::InternalServerError().json(json!({
-                "message": "Failed to delete conversation",
-                "retryable": true,
-            }));
-        }
-    }
-
-    let cleanups: Vec<_> = messages
+    let cleanups: Vec<_> = file_urls
         .iter()
-        .filter_map(|m| m.file_url.as_deref())
         .map(|url| cleanup_attachment_if_unreferenced(&db, Some(url)))
         .collect();
     futures_util::future::join_all(cleanups).await;

@@ -793,55 +793,34 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
         json!({ "userId": user_id }),
     );
 
-    let wipe_ok = match Message::collection(&db)
-        .find(doc! {
-            "$or": [
-                { "sender": user_oid, "recipient": friend_oid },
-                { "sender": friend_oid, "recipient": user_oid },
-            ],
-            "deleted": { "$ne": true },
-        })
-        .projection(doc! { "_id": 1, "fileUrl": 1 })
-        .await
-    {
-        Ok(cursor) => match cursor.try_collect::<Vec<Message>>().await {
-
-            Err(_) => false,
-            Ok(messages) => {
-                let ids: Vec<ObjectId> = messages.iter().filter_map(|m| m.id).collect();
-                let soft_ok = if ids.is_empty() {
-                    true
-                } else {
-                    Message::collection(&db)
-                        .update_many(
-                            doc! { "_id": { "$in": &ids } },
-                            doc! { "$set": {
-                                "deleted": true,
-                                "deletedAt": DateTime::now(),
-                                "updatedAt": DateTime::now(),
-                                "searchText": "",
-                                "searchTokens": [],
-                            }},
-                        )
-                        .await
-                        .is_ok()
-                };
-                if soft_ok {
-                    let cleanups: Vec<_> = messages
-                        .iter()
-                        .filter_map(|m| m.file_url.as_deref())
-                        .map(|url| cleanup_attachment_if_unreferenced(&db, Some(url)))
-                        .collect();
-                    futures_util::future::join_all(cleanups).await;
-                    crate::utils::tips::clear_dm_tip_at_most(
-                        &db, user_oid, friend_oid, wipe_at,
-                    )
-                    .await;
-                }
-                soft_ok
-            }
+    let dm_filter = doc! {
+        "$or": [
+            { "sender": user_oid, "recipient": friend_oid },
+            { "sender": friend_oid, "recipient": user_oid },
+        ],
+        "deleted": { "$ne": true },
+    };
+    let wipe_ok = match crate::utils::messages::search::wipe_live_messages(&db, dm_filter).await {
+        Ok(urls) => {
+            let cleanups: Vec<_> = urls
+                .iter()
+                .map(|url| cleanup_attachment_if_unreferenced(&db, Some(url)))
+                .collect();
+            futures_util::future::join_all(cleanups).await;
+            crate::utils::tips::clear_dm_tip_at_most(
+                &db, user_oid, friend_oid, wipe_at,
+            )
+            .await;
+            true
         }
-        Err(_) => false,
+        Err(e) => {
+            log::error!(
+                "remove_friend: failed to wipe DM messages for {} / {}: {e}",
+                user_id,
+                friend_user_id
+            );
+            false
+        }
     };
 
     if wipe_ok {
