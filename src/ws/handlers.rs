@@ -441,6 +441,8 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         }
     }
 
+    let created = created.refreshed(&db).await;
+
     if is_replay {
         let populated = serialize_message(&db, &created).await;
         registry::emit_to_user(&payload.recipient, "receiveMessage", populated.clone());
@@ -895,6 +897,8 @@ pub async fn create_and_broadcast_channel_message(
             });
         }
     }
+
+    let created = created.refreshed(db).await;
 
     let mut member_oids = channel.members.clone();
     if !member_oids.iter().any(|id| *id == channel.admin) {

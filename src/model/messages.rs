@@ -425,6 +425,13 @@ impl Message {
         Self::collection(db).find_one(doc! { "_id": id }).await
     }
 
+    pub async fn refreshed(self, db: &Database) -> Self {
+        let Some(id) = self.id else {
+            return self;
+        };
+        Self::find_by_id(db, id).await.ok().flatten().unwrap_or(self)
+    }
+
     pub async fn soft_delete_active(
         db: &Database,
         id: ObjectId,
