@@ -43,6 +43,7 @@ use crate::utils::messages::access::{
     cleanup_attachment_if_unreferenced, scan_status_for_attachment, validate_message_attachment,
     AttachmentSendContext, QuoteContext, validate_quote_target_with_access,
 };
+use crate::utils::scan::{enqueue, ScanJob};
 use crate::utils::messages::mentions::{has_everyone_mention, resolve_mentions};
 use crate::utils::messages::{dm_only_or_clause, serialize_message};
 use crate::utils::messages::storage::inbound_plaintext_for_processing;
@@ -303,6 +304,11 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
     )
     .await
     {
+        log::warn!(
+            "sendMessage rejected INVALID_FILE sender={} file={:?}",
+            payload.sender,
+            payload.file_url
+        );
         registry::emit_to_user(
             &payload.sender,
             "dm-error",
@@ -423,6 +429,17 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
     };
 
     claim_pending_upload(&payload.sender, &file_url).await;
+
+    if created.scan_status == ScanStatus::Pending {
+        if let Some(path) = created.file_url.clone() {
+            enqueue(ScanJob {
+                file_path: path,
+                file_hash: String::new(),
+                content_type: created.file_type.clone().unwrap_or_default(),
+                attempts: 0,
+            });
+        }
+    }
 
     if is_replay {
         let populated = serialize_message(&db, &created).await;
@@ -667,6 +684,11 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
     )
     .await
     {
+        log::warn!(
+            "channel message rejected INVALID_FILE sender={} file={:?}",
+            payload.sender,
+            payload.file_url
+        );
         emit_send_error(
             connected,
             "INVALID_FILE",
@@ -862,6 +884,17 @@ pub async fn create_and_broadcast_channel_message(
     };
 
     claim_pending_upload(&sender_hex, &created.file_url).await;
+
+    if created.scan_status == ScanStatus::Pending {
+        if let Some(path) = created.file_url.clone() {
+            enqueue(ScanJob {
+                file_path: path,
+                file_hash: String::new(),
+                content_type: created.file_type.clone().unwrap_or_default(),
+                attempts: 0,
+            });
+        }
+    }
 
     let mut member_oids = channel.members.clone();
     if !member_oids.iter().any(|id| *id == channel.admin) {

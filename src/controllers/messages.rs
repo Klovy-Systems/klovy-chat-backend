@@ -365,21 +365,21 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     let file_hash = sha256_hex(&body);
     let client_mime = form.content_type.as_ref().map(|value| value.0.as_str());
     let content_type = resolve_upload_content_type(stored_ext, client_mime, &body);
-    if storage()
+    if let Err(err) = storage()
         .put_quarantine(&logical_path, body, &content_type)
         .await
-        .is_err()
     {
+        log::error!("put_quarantine {logical_path} failed: {err}");
         return HttpResponse::InternalServerError().body("Internal Server Error.");
     }
 
     let thumb_path = attachment_thumb_key(&logical_path);
     if let (Some(thumb_bytes), Some(thumb_key)) = (thumb_body, thumb_path.as_ref()) {
-        if storage()
+        if let Err(err) = storage()
             .put_quarantine(thumb_key, thumb_bytes, "image/webp")
             .await
-            .is_err()
         {
+            log::error!("put_quarantine thumb {thumb_key} failed: {err}");
             let _ = storage().delete_attachment_key(&logical_path).await;
             return HttpResponse::InternalServerError().body("Internal Server Error.");
         }

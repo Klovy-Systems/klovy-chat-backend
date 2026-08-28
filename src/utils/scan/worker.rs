@@ -72,12 +72,19 @@ pub fn spawn_worker() {
     if SCAN_TX.set(tx).is_err() {
         return;
     }
+    match clamd_addr() {
+        Some(addr) => log::info!("attachment scanner ready (clamd={addr})"),
+        None => log::error!(
+            "attachment scanner fail-closed: CLAMAV_HOST is not set — uploads stay in quarantine"
+        ),
+    }
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             if !try_begin(&job.file_path) {
                 continue;
             }
             let _guard = InFlightGuard(job.file_path.clone());
+            log::info!("attachment scan started for {}", job.file_path);
             let result = process_job(job.clone()).await;
             drop(_guard);
             if let Err(err) = result {
@@ -109,9 +116,15 @@ fn schedule_retry(mut job: ScanJob) {
 
 pub fn enqueue(job: ScanJob) {
     if let Some(tx) = SCAN_TX.get() {
+        log::info!("attachment scan queued for {}", job.file_path);
         if tx.send(job).is_err() {
             log::warn!("attachment scan queue closed");
         }
+    } else {
+        log::error!(
+            "attachment scan worker not started; dropping job {}",
+            job.file_path
+        );
     }
 }
 
@@ -240,6 +253,7 @@ async fn apply_verdict(
 ) -> Result<(), String> {
     match verdict {
         ScanStatus::Clean => {
+            log::info!("attachment scan clean, publishing {file_path}");
             storage()
                 .publish_scanned(file_path, bytes.to_vec(), content_type)
                 .await
@@ -251,6 +265,7 @@ async fn apply_verdict(
             emit_scan_updates(db, &messages).await;
         }
         ScanStatus::Blocked => {
+            log::warn!("attachment scan blocked {file_path}");
             let _ = storage().delete_attachment_key(file_path).await;
             let _ = PendingUpload::set_scan_status(db, file_path, ScanStatus::Blocked).await;
             let messages = Message::apply_scan_verdict(db, file_path, ScanStatus::Blocked, true)
