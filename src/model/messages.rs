@@ -13,6 +13,8 @@ use mongodb::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use crate::model::scan::ScanStatus;
+
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -82,6 +84,9 @@ pub struct Message {
 
     #[serde(rename = "fileName", skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
+
+    #[serde(rename = "scanStatus", default)]
+    pub scan_status: ScanStatus,
 
     #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u32>,
@@ -167,6 +172,7 @@ pub struct CreateMessageInput {
     pub file_type: Option<String>,
     pub file_size: Option<u64>,
     pub file_name: Option<String>,
+    pub scan_status: ScanStatus,
     pub duration_ms: Option<u32>,
     pub quoted_message: Option<ObjectId>,
     pub mentions: Option<Vec<ObjectId>>,
@@ -363,6 +369,7 @@ impl Message {
             file_type: input.file_type,
             file_size: input.file_size,
             file_name: input.file_name,
+            scan_status: input.scan_status,
             duration_ms: input.duration_ms,
             client_nonce: client_nonce.clone(),
             timestamp: now,
@@ -449,6 +456,56 @@ impl Message {
             return Ok(SoftDeleteOutcome::Deleted { was_unread: false });
         }
         Ok(SoftDeleteOutcome::AlreadyDeleted)
+    }
+
+    pub async fn apply_scan_verdict(
+        db: &Database,
+        file_path: &str,
+        scan_status: ScanStatus,
+        clear_file_url: bool,
+    ) -> mongodb::error::Result<Vec<Message>> {
+        use futures_util::TryStreamExt;
+
+        let with_slash = format!("/{file_path}");
+        let filter = doc! {
+            "fileUrl": { "$in": [file_path, with_slash] },
+            "deleted": { "$ne": true },
+        };
+        let cursor = Self::collection(db).find(filter.clone()).await?;
+        let mut messages: Vec<Message> = cursor.try_collect().await?;
+        if messages.is_empty() {
+            return Ok(messages);
+        }
+
+        let mut set = doc! {
+            "scanStatus": scan_status.as_str(),
+            "updatedAt": DateTime::now(),
+        };
+        if clear_file_url {
+            set.insert("fileUrl", mongodb::bson::Bson::Null);
+        }
+        Self::collection(db)
+            .update_many(filter, doc! { "$set": set })
+            .await?;
+        for message in &mut messages {
+            message.scan_status = scan_status;
+            if clear_file_url {
+                message.file_url = None;
+            }
+        }
+        Ok(messages)
+    }
+
+    pub async fn find_pending_scans(db: &Database) -> mongodb::error::Result<Vec<Message>> {
+        use futures_util::TryStreamExt;
+        let cursor = Self::collection(db)
+            .find(doc! {
+                "scanStatus": ScanStatus::Pending.as_str(),
+                "deleted": { "$ne": true },
+                "fileUrl": { "$exists": true, "$ne": null },
+            })
+            .await?;
+        cursor.try_collect().await
     }
 }
 

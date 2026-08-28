@@ -37,6 +37,22 @@ fn validate_r2_env() {
     }
 }
 
+fn validate_clamav_env(require: bool) {
+    let host = env::var("CLAMAV_HOST").unwrap_or_default();
+    if !host.trim().is_empty() {
+        return;
+    }
+    if require {
+        panic!(
+            "CLAMAV_HOST must be set in production (e.g. 127.0.0.1:3310) — \
+             attachments stay in quarantine until clamd scans them"
+        );
+    }
+    log::error!(
+        "CLAMAV_HOST is not set — uploaded attachments will stay in quarantine until clamd is configured"
+    );
+}
+
 fn validate_livekit_env() {
     let url = env::var("LIVEKIT_URL").unwrap_or_default();
     let key = env::var("LIVEKIT_API_KEY").unwrap_or_default();
@@ -167,6 +183,7 @@ pub fn validate_startup_config() {
 
         validate_r2_env();
         validate_livekit_env();
+        validate_clamav_env(true);
 
         if is_whitelist_enabled() {
             log::info!("Whitelist mode is enabled — new accounts require admin approval");
@@ -193,6 +210,7 @@ pub fn validate_startup_config() {
     }
 
     validate_r2_env();
+    validate_clamav_env(false);
 
     if is_whitelist_enabled() {
         log::info!("Whitelist mode is enabled — new accounts require admin approval");

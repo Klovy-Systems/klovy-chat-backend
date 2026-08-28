@@ -29,6 +29,7 @@ pub mod messages;
 pub mod ratelimit;
 pub mod registration;
 pub mod security;
+pub mod scan;
 pub mod unread;
 pub mod user;
 pub mod validators;

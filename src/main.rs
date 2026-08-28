@@ -12,7 +12,7 @@ use klovy_chat_server::model::{
     announcements::Announcement, audit::AuditLog, channels::Channel,
     read_state::ChannelReadState, reports::ChannelReport,
     friend_requests::FriendRequest, invites::Invite,
-    messages::Message, uploads::PendingUpload,
+    messages::Message, uploads::PendingUpload, scan_cache::ScanVerdict,
     refresh_tokens::RefreshToken, users::User, storage_usage::UserStorageUsage,
     warnings::Warning,
 };
@@ -41,9 +41,11 @@ async fn main() -> std::io::Result<()> {
              Configure R2_* variables in backend/.env — see backend/docs/R2_SETUP.md"
         )
     });
+    klovy_chat_server::utils::scan::spawn_worker();
 
     let mongodb_db = db::get_db();
     ensure_indexes(&mongodb_db).await;
+    klovy_chat_server::utils::scan::requeue_pending().await;
 
     {
         let db = mongodb_db.clone();
@@ -195,7 +197,7 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn ensure_indexes(db: &mongodb::Database) {
-    let tasks: [(&str, mongodb::error::Result<()>); 15] = [
+    let tasks: [(&str, mongodb::error::Result<()>); 16] = [
         ("users", User::create_indexes(db).await),
         ("signup_quotas", klovy_chat_server::utils::registration::create_indexes(db).await),
         ("channels", Channel::create_indexes(db).await),
@@ -207,6 +209,7 @@ async fn ensure_indexes(db: &mongodb::Database) {
         ("channel_reports", ChannelReport::create_indexes(db).await),
         ("refresh_tokens", RefreshToken::create_indexes(db).await),
         ("pending_uploads", PendingUpload::create_indexes(db).await),
+        ("attachment_scan_cache", ScanVerdict::create_indexes(db).await),
         ("user_storage_usage", UserStorageUsage::create_indexes(db).await),
         ("audit_logs", AuditLog::create_indexes(db).await),
         ("warnings", Warning::create_indexes(db).await),

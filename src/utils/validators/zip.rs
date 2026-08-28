@@ -1,8 +1,8 @@
 // zip.rs
-// Ochrona przed zip bomb / path traversal.
+// Ochrona dokumentów: zip bomb, traversal, makra Office, CSV jako tekst.
 // Zakres:
-//  - gdyby ZIP był akceptowany
-//  - zip bomb / traversal; czat ZIP i tak nie przyjmuje
+//  - docx/xlsx/pptx (OOXML), pdf, csv
+//  - zip bomb / traversal / vba; czat ZIP nadal nieprzyjmowany
 // Domyślnie czat nie przyjmuje ZIP — zostaw zamknięte.
 // Przy zmianach: file_type.rs.
 
@@ -32,7 +32,9 @@ pub fn validate_upload_document(path: &Path, ext: &str) -> bool {
     match ext.to_ascii_lowercase().as_str() {
         "docx" => validate_office_zip(path, "docx"),
         "xlsx" => validate_office_zip(path, "xlsx"),
+        "pptx" => validate_office_zip(path, "pptx"),
         "pdf" => validate_pdf_document(path),
+        "csv" => validate_csv_document(path),
         _ => true,
     }
 }
@@ -74,12 +76,17 @@ fn validate_office_zip(path: &Path, kind: &str) -> bool {
             return false;
         }
 
+        if office_entry_forbidden(name) {
+            return false;
+        }
+
         if name == "[Content_Types].xml" {
             has_content_types = true;
         }
         match kind {
             "docx" if name.starts_with("word/") => has_kind_root = true,
             "xlsx" if name.starts_with("xl/") => has_kind_root = true,
+            "pptx" if name.starts_with("ppt/") => has_kind_root = true,
             _ => {}
         }
 
@@ -101,6 +108,58 @@ fn validate_office_zip(path: &Path, kind: &str) -> bool {
     }
 
     has_content_types && has_kind_root
+}
+
+fn office_entry_forbidden(name: &str) -> bool {
+    let n = name.replace('\\', "/").to_ascii_lowercase();
+    if n.contains("vbaproject") || n.contains("vbadata") || n.contains("macrosheets/") {
+        return true;
+    }
+    let ext = n.rsplit('.').next().unwrap_or("");
+    matches!(
+        ext,
+        "exe"
+            | "dll"
+            | "bat"
+            | "cmd"
+            | "ps1"
+            | "js"
+            | "vbs"
+            | "hta"
+            | "jar"
+            | "scr"
+            | "com"
+            | "msi"
+            | "lnk"
+            | "wsf"
+    )
+}
+
+fn validate_csv_document(path: &Path) -> bool {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut body = Vec::new();
+    if file.read_to_end(&mut body).is_err() {
+        return false;
+    }
+    if body.is_empty() || body.len() as u64 > crate::utils::upload::MAX_ATTACHMENT_BYTES {
+        return false;
+    }
+    if body.contains(&0) {
+        return false;
+    }
+    let without_bom = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&body[..]);
+    let trimmed = without_bom
+        .iter()
+        .copied()
+        .skip_while(|b| b.is_ascii_whitespace());
+    let start: Vec<u8> = trimmed.take(8).collect();
+    if start.starts_with(b"<") || start.starts_with(b"%PDF") || start.starts_with(b"PK") {
+        return false;
+    }
+    true
 }
 
 fn validate_pdf_document(path: &Path) -> bool {

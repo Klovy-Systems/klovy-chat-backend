@@ -3,11 +3,13 @@
 // Zakres:
 //  - deterministyczne path
 //  - user/…, chat/… — zmiana layoutu = 404 starych URL
+//  - allowlista rozszerzeń załącznika (w tym mp3/aac/mov/heic/pptx/csv)
 // Zmiana layoutu = stare URL 404. Migruj albo alias.
-// Przy zmianach: r2.rs, cdn.ts.
+// Przy zmianach: r2.rs, cdn.ts, file_type.rs.
 
 const ALLOWED_ATTACHMENT_EXTENSIONS: &[&str] = &[
-    "pdf", "jpg", "jpeg", "png", "webp", "docx", "xlsx", "txt", "webm", "ogg", "wav", "mp4", "m4a",
+    "pdf", "jpg", "jpeg", "png", "webp", "docx", "xlsx", "pptx", "txt", "csv", "webm", "ogg",
+    "wav", "mp3", "aac", "mp4", "m4a", "mov", "heic", "heif",
 ];
 
 pub fn normalize_storage_key(path: &str) -> String {
@@ -228,15 +230,23 @@ pub fn is_logical_message_path(path: &str) -> bool {
     is_attachment_key(path)
 }
 
+fn attachment_is_inline_media(ext: &str) -> bool {
+    matches!(
+        ext,
+        "webp" | "jpg" | "jpeg" | "png" | "webm" | "ogg" | "wav" | "mp3" | "aac" | "mp4"
+            | "m4a" | "mov"
+    )
+}
+
 pub fn attachment_prefers_download(path: &str) -> bool {
     let normalized = normalize_storage_key(path);
-    let Some(ext) = normalized.rsplit('.').next() else {
+    if normalized.ends_with(".thumb.webp") {
         return false;
+    }
+    let Some(ext) = normalized.rsplit('.').next() else {
+        return true;
     };
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "txt" | "pdf" | "docx" | "xlsx"
-    )
+    !attachment_is_inline_media(&ext.to_ascii_lowercase())
 }
 
 pub fn content_type_for_ext(ext: &str) -> &'static str {
@@ -250,12 +260,37 @@ pub fn content_type_for_ext(ext: &str) -> &'static str {
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         }
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        }
         "txt" => "text/plain",
+        "csv" => "text/csv",
         "webm" => "audio/webm",
         "ogg" => "audio/ogg",
         "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "aac" => "audio/aac",
         "mp4" => "video/mp4",
         "m4a" => "audio/mp4",
+        "mov" => "video/quicktime",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_pref_is_non_media() {
+        assert!(attachment_prefers_download("attachments/dm/conv_a/x.pdf"));
+        assert!(attachment_prefers_download("attachments/dm/conv_a/x.csv"));
+        assert!(attachment_prefers_download("attachments/dm/conv_a/x.heic"));
+        assert!(!attachment_prefers_download("attachments/dm/conv_a/x.webp"));
+        assert!(!attachment_prefers_download("attachments/dm/conv_a/x.mp3"));
+        assert!(!attachment_prefers_download("attachments/dm/conv_a/x.mp4"));
+        assert!(!attachment_prefers_download("attachments/dm/conv_a/x.thumb.webp"));
     }
 }

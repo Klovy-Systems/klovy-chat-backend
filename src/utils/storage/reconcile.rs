@@ -28,11 +28,15 @@ pub async fn reconcile_attachments(db: &Database) -> Result<ReconcileReport, Sto
     let mut report = ReconcileReport::default();
 
     let referenced = collect_referenced_paths(db).await;
-    let objects = storage().list_public_attachments().await?;
+    let public_objects = storage().list_public_attachments().await?;
+    let quarantine_objects = storage().list_quarantine_attachments().await?;
 
-    let r2_keys: HashSet<String> = objects.iter().map(|(key, _)| key.clone()).collect();
+    let mut r2_keys: HashSet<String> = HashSet::new();
+    for (key, _) in public_objects.iter().chain(quarantine_objects.iter()) {
+        r2_keys.insert(key.clone());
+    }
 
-    for (key, _) in &objects {
+    for key in r2_keys.iter() {
         if referenced.contains(key) {
             continue;
         }

@@ -17,6 +17,7 @@ use crate::model::channels::Channel;
 use crate::model::messages::{
     CreateMessageError, CreateMessageInput, CreateMessageOutcome, Message, MessageType,
 };
+use crate::model::scan::ScanStatus;
 use crate::model::users::{AvailabilityStatus, User};
 use crate::ws::registry;
 use crate::ws::state::{is_valid_object_id, now_ms, SocketState};
@@ -39,8 +40,8 @@ use crate::utils::voice::channels::{
 };
 use crate::utils::messages::access::{
     claim_pending_upload, try_can_mark_message_as_read,
-    cleanup_attachment_if_unreferenced, validate_message_attachment, AttachmentSendContext,
-    QuoteContext, validate_quote_target_with_access,
+    cleanup_attachment_if_unreferenced, scan_status_for_attachment, validate_message_attachment,
+    AttachmentSendContext, QuoteContext, validate_quote_target_with_access,
 };
 use crate::utils::messages::mentions::{has_everyone_mention, resolve_mentions};
 use crate::utils::messages::{dm_only_or_clause, serialize_message};
@@ -375,6 +376,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
     };
 
     let file_url = payload.file_url.clone();
+    let scan_status = scan_status_for_attachment(&db, &payload.sender, &file_url).await;
     let input = CreateMessageInput {
         sender,
         recipient: Some(recipient),
@@ -385,6 +387,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         file_type: payload.file_type,
         file_size: payload.file_size,
         file_name: payload.file_name,
+        scan_status,
         duration_ms: payload.duration_ms,
         quoted_message: quoted,
         mentions: Some(mentions.clone()),
@@ -818,6 +821,7 @@ pub async fn create_and_broadcast_channel_message(
     };
     let mentions_everyone = has_everyone_mention(&prepared_content);
 
+    let scan_status = scan_status_for_attachment(db, &sender_hex, &file_url).await;
     let create_input = CreateMessageInput {
         sender,
         recipient: None,
@@ -828,6 +832,7 @@ pub async fn create_and_broadcast_channel_message(
         file_type,
         file_size,
         file_name,
+        scan_status,
         duration_ms,
         quoted_message,
         mentions: Some(mentions.clone()),
@@ -3124,6 +3129,7 @@ async fn persist_call_log(
         file_type: None,
         file_size: None,
         file_name: None,
+        scan_status: ScanStatus::Clean,
         duration_ms: Some(duration_ms),
         quoted_message: None,
         mentions: None,

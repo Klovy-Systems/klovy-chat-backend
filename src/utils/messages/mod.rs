@@ -43,6 +43,18 @@ pub fn escape_regex(s: &str) -> String {
     out
 }
 
+fn file_url_for_api(msg: &Message) -> serde_json::Value {
+    if msg.scan_status.exposes_file_url() {
+        json!(msg.file_url)
+    } else {
+        Value::Null
+    }
+}
+
+fn scan_status_for_api(msg: &Message) -> &'static str {
+    msg.scan_status.as_str()
+}
+
 fn iso(dt: &DateTime) -> Option<String> {
     dt.try_to_rfc3339_string().ok()
 }
@@ -137,10 +149,11 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
         "channel": msg.channel.map(|o| o.to_hex()),
         "content": message_content_for_api(msg, &content_cache),
         "messageType": serde_json::to_value(&msg.message_type).unwrap_or(Value::Null),
-        "fileUrl": msg.file_url,
+        "fileUrl": file_url_for_api(msg),
         "fileType": msg.file_type,
         "fileSize": msg.file_size,
         "fileName": msg.file_name,
+        "scanStatus": scan_status_for_api(msg),
         "durationMs": msg.duration_ms,
         "clientNonce": msg.client_nonce,
         "timestamp": iso(&msg.timestamp),
@@ -236,10 +249,11 @@ fn serialize_message_cached(
         "channel": msg.channel.map(|o| o.to_hex()),
         "content": message_content_for_api(msg, &content_cache),
         "messageType": serde_json::to_value(&msg.message_type).unwrap_or(Value::Null),
-        "fileUrl": msg.file_url,
+        "fileUrl": file_url_for_api(msg),
         "fileType": msg.file_type,
         "fileSize": msg.file_size,
         "fileName": msg.file_name,
+        "scanStatus": scan_status_for_api(msg),
         "durationMs": msg.duration_ms,
         "clientNonce": msg.client_nonce,
         "timestamp": iso(&msg.timestamp),

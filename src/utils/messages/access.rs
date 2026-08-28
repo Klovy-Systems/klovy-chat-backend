@@ -11,6 +11,7 @@ use mongodb::Database;
 
 use crate::model::uploads::PendingUpload;
 use crate::model::messages::Message;
+use crate::model::scan::ScanStatus;
 use crate::utils::access::members::{
     require_channel_message_access, require_dm_access,
 };
@@ -174,7 +175,7 @@ pub async fn cleanup_attachment_if_unreferenced(db: &Database, file_url: Option<
     if count == 0 {
         let owner = find_attachment_uploader(db, &path).await;
         let size = storage()
-            .head_public_content_length(&path)
+            .head_attachment_content_length(&path)
             .await
             .ok()
             .flatten()
@@ -182,7 +183,7 @@ pub async fn cleanup_attachment_if_unreferenced(db: &Database, file_url: Option<
         let thumb_bytes = if let Some(thumb) = crate::utils::storage::attachment_thumb_key(&path)
         {
             storage()
-                .head_public_content_length(&thumb)
+                .head_attachment_content_length(&thumb)
                 .await
                 .ok()
                 .flatten()
@@ -252,7 +253,7 @@ async fn attachment_stored_size_is_valid(
         }
     }
 
-    let actual = match storage().head_public_content_length(path).await {
+            let actual = match storage().head_attachment_content_length(path).await {
         Ok(Some(len)) => len,
         _ => return false,
     };
@@ -381,11 +382,39 @@ pub async fn validate_message_attachment(
                 return false;
             }
 
+            if !pending.scan_status.allows_send() {
+                return false;
+            }
+
             if !attachment_stored_size_is_valid(&path, file_size, Some(pending.file_size)).await {
                 return false;
             }
 
             true
         }
+    }
+}
+
+pub async fn scan_status_for_attachment(
+    db: &Database,
+    user_id: &str,
+    file_url: &Option<String>,
+) -> ScanStatus {
+    let Some(url) = file_url else {
+        return ScanStatus::Clean;
+    };
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return ScanStatus::Clean;
+    }
+    let path = url.trim().replace('\\', "/").trim_start_matches('/').to_string();
+    if !is_attachment_key(&path) {
+        return ScanStatus::Pending;
+    }
+    let Ok(user_oid) = ObjectId::parse_str(user_id) else {
+        return ScanStatus::Pending;
+    };
+    match PendingUpload::find_for_user_and_path(db, user_oid, &path).await {
+        Ok(Some(pending)) => pending.scan_status,
+        _ => ScanStatus::Pending,
     }
 }

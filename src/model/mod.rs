@@ -15,6 +15,8 @@ pub mod reports;
 pub mod friend_requests;
 pub mod invites;
 pub mod messages;
+pub mod scan;
+pub mod scan_cache;
 pub mod uploads;
 pub mod refresh_tokens;
 pub mod users;

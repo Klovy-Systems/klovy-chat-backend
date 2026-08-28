@@ -10,6 +10,8 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::{Collection, Database, IndexModel};
 use serde::{Deserialize, Serialize};
 
+use crate::model::scan::{default_pending_scan_status, ScanStatus};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingUpload {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -26,6 +28,10 @@ pub struct PendingUpload {
     pub file_size: u64,
     #[serde(rename = "fileHash", default)]
     pub file_hash: String,
+    #[serde(rename = "contentType", default)]
+    pub content_type: String,
+    #[serde(rename = "scanStatus", default = "default_pending_scan_status")]
+    pub scan_status: ScanStatus,
     #[serde(rename = "createdAt")]
     pub created_at: DateTime,
 }
@@ -53,6 +59,12 @@ impl PendingUpload {
         Self::collection(db)
             .create_index(IndexModel::builder().keys(doc! { "filePath": 1 }).build())
             .await?;
+        Self::collection(db)
+            .create_index(IndexModel::builder().keys(doc! { "fileHash": 1 }).build())
+            .await?;
+        Self::collection(db)
+            .create_index(IndexModel::builder().keys(doc! { "scanStatus": 1 }).build())
+            .await?;
         Ok(())
     }
 
@@ -70,6 +82,8 @@ impl PendingUpload {
         context_id: &str,
         file_size: u64,
         file_hash: &str,
+        content_type: &str,
+        scan_status: ScanStatus,
     ) -> mongodb::error::Result<()> {
         let pending = Self::count_for_user(db, user_id).await?;
         if pending >= crate::utils::upload::MAX_PENDING_UPLOADS_PER_USER {
@@ -84,6 +98,8 @@ impl PendingUpload {
             context_id: context_id.to_string(),
             file_size,
             file_hash: file_hash.to_string(),
+            content_type: content_type.to_string(),
+            scan_status,
             created_at: DateTime::now(),
         };
         Self::collection(db).insert_one(doc).await?;
@@ -97,6 +113,34 @@ impl PendingUpload {
     ) -> mongodb::error::Result<Option<Self>> {
         Self::collection(db)
             .find_one(doc! { "filePath": file_path, "userId": user_id })
+            .await
+    }
+
+    pub async fn set_scan_status(
+        db: &Database,
+        file_path: &str,
+        scan_status: ScanStatus,
+    ) -> mongodb::error::Result<()> {
+        Self::collection(db)
+            .update_many(
+                doc! { "filePath": file_path },
+                doc! { "$set": { "scanStatus": scan_status.as_str() } },
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn find_pending_scans(db: &Database) -> mongodb::error::Result<Vec<Self>> {
+        use futures_util::TryStreamExt;
+        let cursor = Self::collection(db)
+            .find(doc! { "scanStatus": ScanStatus::Pending.as_str() })
+            .await?;
+        cursor.try_collect().await
+    }
+
+    pub async fn find_by_path(db: &Database, file_path: &str) -> mongodb::error::Result<Option<Self>> {
+        Self::collection(db)
+            .find_one(doc! { "filePath": file_path })
             .await
     }
 
@@ -128,7 +172,7 @@ impl PendingUpload {
                 entry.file_size
             } else {
                 crate::utils::storage::storage()
-                    .head_public_content_length(&entry.file_path)
+                    .head_attachment_content_length(&entry.file_path)
                     .await
                     .ok()
                     .flatten()

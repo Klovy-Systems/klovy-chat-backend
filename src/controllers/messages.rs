@@ -43,6 +43,8 @@ use crate::utils::messages::search::{build_search_index_from_incoming, search_to
 use crate::utils::storage::{
     attachment_dm_key, attachment_group_key, attachment_thumb_key, storage,
 };
+use crate::utils::scan::{enqueue, ScanJob};
+use crate::model::scan::ScanStatus;
 use crate::utils::ratelimit::{
     chat_attachment_retry_after_secs, try_consume_chat_attachment_quota,
 };
@@ -70,7 +72,8 @@ const MAX_MESSAGE_LIMIT: i64 = 50;
 const MAX_PINNED_MESSAGES: i64 = 50;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "pdf", "jpg", "jpeg", "png", "webp", "docx", "xlsx", "txt", "webm", "ogg", "wav", "mp4", "m4a",
+    "pdf", "jpg", "jpeg", "png", "webp", "docx", "xlsx", "pptx", "txt", "csv", "webm", "ogg",
+    "wav", "mp3", "aac", "mp4", "m4a", "mov", "heic", "heif",
 ];
 
 async fn serialize_all(db: &mongodb::Database, msgs: &[Message]) -> Vec<serde_json::Value> {
@@ -212,6 +215,14 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
         return HttpResponse::BadRequest().body("File is required.");
     }
 
+    let user_id = request_user_id(&req).unwrap_or_default();
+    if user_id.is_empty() {
+        return HttpResponse::Unauthorized().body("Authentication required.");
+    }
+    let Ok(user_oid) = ObjectId::parse_str(&user_id) else {
+        return HttpResponse::BadRequest().body("Invalid user.");
+    };
+
     let ext = original_name
         .rsplit('.')
         .next()
@@ -225,7 +236,7 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     if !validate_file_magic_async(upload_path.clone(), ext.clone()).await {
         return HttpResponse::BadRequest().body("Invalid file content.");
     }
-    if matches!(ext.as_str(), "pdf" | "docx" | "xlsx")
+    if matches!(ext.as_str(), "pdf" | "docx" | "xlsx" | "pptx" | "csv")
         && !validate_upload_document_async(upload_path.clone(), ext.clone()).await
     {
         return HttpResponse::BadRequest().body("Invalid file content.");
@@ -249,15 +260,6 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     if original_name.contains("..") || original_name.contains('/') || original_name.contains('\\') {
         return HttpResponse::BadRequest().body("Invalid file name.");
     }
-
-    let user_id = request_user_id(&req).unwrap_or_default();
-    if user_id.is_empty() {
-        return HttpResponse::Unauthorized().body("Authentication required.");
-    }
-
-    let Ok(user_oid) = ObjectId::parse_str(&user_id) else {
-        return HttpResponse::BadRequest().body("Invalid user.");
-    };
 
     let context_type = form.context_type.0.trim().to_ascii_lowercase();
     let context_id = form.context_id.0.trim().to_string();
@@ -364,7 +366,7 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     let client_mime = form.content_type.as_ref().map(|value| value.0.as_str());
     let content_type = resolve_upload_content_type(stored_ext, client_mime, &body);
     if storage()
-        .put_public(&logical_path, body, &content_type)
+        .put_quarantine(&logical_path, body, &content_type)
         .await
         .is_err()
     {
@@ -374,11 +376,11 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     let thumb_path = attachment_thumb_key(&logical_path);
     if let (Some(thumb_bytes), Some(thumb_key)) = (thumb_body, thumb_path.as_ref()) {
         if storage()
-            .put_public(thumb_key, thumb_bytes, "image/webp")
+            .put_quarantine(thumb_key, thumb_bytes, "image/webp")
             .await
             .is_err()
         {
-            let _ = storage().delete_public(&logical_path).await;
+            let _ = storage().delete_attachment_key(&logical_path).await;
             return HttpResponse::InternalServerError().body("Internal Server Error.");
         }
     }
@@ -391,6 +393,8 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
         &context_id,
         total_stored,
         &file_hash,
+        &content_type,
+        ScanStatus::Pending,
     )
     .await
     .is_err()
@@ -416,6 +420,13 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
         return HttpResponse::InternalServerError().body("Internal Server Error.");
     }
 
+    enqueue(ScanJob {
+        file_path: logical_path.clone(),
+        file_hash: file_hash.clone(),
+        content_type: content_type.clone(),
+        attempts: 0,
+    });
+
     log_attachment_upload(
         &req,
         &user_id,
@@ -426,7 +437,10 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     )
     .await;
 
-    HttpResponse::Ok().json(json!({ "filePath": logical_path }))
+    HttpResponse::Ok().json(json!({
+        "filePath": logical_path,
+        "scanStatus": ScanStatus::Pending.as_str(),
+    }))
 }
 
 #[derive(Deserialize)]
