@@ -293,7 +293,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         );
         return;
     }
-    if !validate_message_attachment(
+    let file_url = match validate_message_attachment(
         &db,
         &payload.sender,
         &payload.file_url,
@@ -304,6 +304,8 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
     )
     .await
     {
+        Ok(url) => url,
+        Err(()) => {
         log::warn!(
             "sendMessage rejected INVALID_FILE sender={} file={:?}",
             payload.sender,
@@ -319,7 +321,8 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
             }),
         );
         return;
-    }
+        }
+    };
 
     let quoted = if let Some(ref q) = payload.quoted_message {
         match validate_quote_target_with_access(
@@ -381,7 +384,6 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         }
     };
 
-    let file_url = payload.file_url.clone();
     let scan_status = scan_status_for_attachment(&db, &payload.sender, &file_url).await;
     let input = CreateMessageInput {
         sender,
@@ -675,7 +677,7 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
         return;
     }
 
-    if !validate_message_attachment(
+    let file_url = match validate_message_attachment(
         &db,
         &payload.sender,
         &payload.file_url,
@@ -686,6 +688,8 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
     )
     .await
     {
+        Ok(url) => url,
+        Err(()) => {
         log::warn!(
             "channel message rejected INVALID_FILE sender={} file={:?}",
             payload.sender,
@@ -698,7 +702,8 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
             payload.client_nonce.as_deref(),
         );
         return;
-    }
+        }
+    };
 
     let Ok(channel_oid) = ObjectId::parse_str(&payload.channel_id) else {
         return;
@@ -746,7 +751,7 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
             sender,
             content: payload.content.clone().unwrap_or_default(),
             message_type: parse_message_type(payload.message_type.as_deref().unwrap_or("TEXT")),
-            file_url: payload.file_url,
+            file_url,
             file_type: payload.file_type,
             file_size: payload.file_size,
             file_name: payload.file_name,

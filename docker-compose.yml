@@ -15,9 +15,12 @@ services:
     image: clamav/clamav:1.4
     container_name: klovy-chat-clamav
     restart: unless-stopped
+    # Only localhost — clamd INSTREAM has no auth. Backend (host network):
+    # CLAMAV_HOST=127.0.0.1:3310
     ports:
-      - "3310:3310"
-    # Wymagany do skanu załączników. Backend: CLAMAV_HOST=127.0.0.1:3310
+      - "127.0.0.1:3310:3310"
+    security_opt:
+      - no-new-privileges:true
     # Start: docker compose --profile scan up -d
     profiles:
       - scan

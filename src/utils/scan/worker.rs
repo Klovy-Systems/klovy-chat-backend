@@ -24,7 +24,8 @@ use crate::model::uploads::PendingUpload;
 use crate::utils::db::get_db;
 use crate::utils::hash::sha256_hex;
 use crate::utils::messages::serialize_message;
-use crate::utils::storage::storage;
+use crate::utils::messages::access::canonicalize_message_file_url;
+use crate::utils::storage::{cdn_public_base_url, is_attachment_key, storage};
 use crate::ws::registry;
 
 use super::clamd::{clamd_addr, scan_bytes, ClamVerdict};
@@ -150,9 +151,15 @@ pub async fn requeue_pending() {
     match Message::find_pending_scans(&db).await {
         Ok(messages) => {
             for message in messages {
-                let Some(path) = message.file_url.clone() else {
+                let Some(raw) = message.file_url.as_deref() else {
                     continue;
                 };
+                let Some(path) = canonicalize_message_file_url(raw, &cdn_public_base_url()) else {
+                    continue;
+                };
+                if path.is_empty() || path.starts_with("https://") || !is_attachment_key(&path) {
+                    continue;
+                }
                 let content_type = message.file_type.clone().unwrap_or_default();
                 enqueue(ScanJob {
                     file_path: path,

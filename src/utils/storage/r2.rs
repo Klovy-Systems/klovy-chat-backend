@@ -73,6 +73,20 @@ fn build_client() -> Result<Client, StorageError> {
     Ok(Client::from_conf(config))
 }
 
+fn safe_content_disposition_filename(key: &str) -> Option<String> {
+    let name = key.rsplit('/').next()?.trim();
+    if name.is_empty() || name.len() > 80 || name.contains("..") {
+        return None;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 fn is_not_found(err: &str) -> bool {
     err.contains("NotFound") || err.contains("404") || err.contains("NoSuchKey")
 }
@@ -146,10 +160,13 @@ impl R2Storage {
                 "public, max-age=31536000, immutable"
             } else {
                 "private, no-store"
-            })
-            .metadata("x-content-type-options", "nosniff");
+            });
+        // R2/S3 cannot set X-Content-Type-Options (metadata is x-amz-meta-*, not an HTTP header).
+        // Non-media: force download. Media: inline with a name taken only from the object key.
         if attachment_prefers_download(key) {
             request = request.content_disposition("attachment");
+        } else if let Some(name) = safe_content_disposition_filename(key) {
+            request = request.content_disposition(format!("inline; filename=\"{name}\""));
         }
         request
     }
@@ -463,5 +480,21 @@ mod tests {
         assert!(is_not_found("NotFound"));
         assert!(is_not_found("NoSuchKey"));
         assert!(is_not_found("code: NotFound, status: 404"));
+    }
+
+    #[test]
+    fn disposition_filename_is_key_basename_only() {
+        assert_eq!(
+            safe_content_disposition_filename("attachments/dm/conv_a/abc.webp"),
+            Some("abc.webp".into())
+        );
+        assert_eq!(
+            safe_content_disposition_filename("attachments/dm/conv_a/..webp"),
+            None
+        );
+        assert_eq!(
+            safe_content_disposition_filename("x/foo\"; filename=evil.webp"),
+            None
+        );
     }
 }

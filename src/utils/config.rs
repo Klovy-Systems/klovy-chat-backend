@@ -35,6 +35,23 @@ fn validate_r2_env() {
             );
         }
     }
+
+    let public = env::var("R2_PUBLIC_BUCKET").unwrap_or_default();
+    let public = public.trim();
+    let quarantine = env::var("R2_QUARANTINE_BUCKET").unwrap_or_default();
+    let quarantine = quarantine.trim();
+    if quarantine.is_empty() || quarantine == public {
+        if is_production() {
+            panic!(
+                "R2_QUARANTINE_BUCKET must be a separate private bucket in production \
+                 (not the same as R2_PUBLIC_BUCKET) — otherwise pending files are on the CDN"
+            );
+        }
+        log::error!(
+            "R2_QUARANTINE_BUCKET is missing or equals R2_PUBLIC_BUCKET — \
+             pending attachments may be reachable on the public CDN"
+        );
+    }
 }
 
 fn validate_clamav_env(require: bool) {

@@ -1,19 +1,38 @@
 // url.rs
 // Tylko poprawne https URL.
 // Zakres:
-//  - invite, embed
+//  - invite, embed, zewnętrzne media w wiadomości
 //  - https; http tylko świadomie w DEV
+//  - fileUrl https = allowlista hostów (nie dowolny .png)
 // http tylko świadomie (DEV).
-// Przy zmianach: embeds.ts, invites.
+// Przy zmianach: embeds.ts, invites, FE allowedMedia.ts.
 
-fn host_allowed(host: &str) -> bool {
+fn normalize_host(host: &str) -> String {
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
+    lower
+        .strip_prefix("www.")
+        .unwrap_or(lower.as_str())
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn is_trusted_external_media_host(host: &str) -> bool {
+    let host = normalize_host(host);
+    if host.is_empty() {
+        return false;
+    }
     if host == "media.giphy.com"
         || host == "i.giphy.com"
         || host.ends_with(".giphy.com")
+        || host == "cdn.discordapp.com"
+        || host == "media.discordapp.net"
+        || host == "i.imgur.com"
+        || host == "media.tenor.com"
+        || host == "images.unsplash.com"
+        || host == "raw.githubusercontent.com"
     {
         return true;
     }
-
     false
 }
 
@@ -39,53 +58,39 @@ pub fn is_allowed_external_media_url(url: &str) -> bool {
         return false;
     };
 
-    if host_allowed(host) {
-        return true;
-    }
-
-    is_direct_https_image_url(&parsed)
-}
-
-fn is_direct_https_image_url(parsed: &reqwest::Url) -> bool {
-    if parsed.scheme() != "https" {
+    if !is_trusted_external_media_host(host) {
         return false;
     }
 
-    let path_and_query = format!(
-        "{}{}",
-        parsed.path(),
-        parsed
-            .query()
-            .map(|query| format!("?{query}"))
-            .unwrap_or_default()
-    );
-    let path_lower = path_and_query.to_ascii_lowercase();
+    parsed.path().split('/').any(|part| !part.is_empty())
+}
 
-    if path_lower.ends_with(".gif")
-        || path_lower.contains(".gif?")
-        || path_lower.contains(".gif#")
-        || path_lower.ends_with(".jpg")
-        || path_lower.ends_with(".jpeg")
-        || path_lower.ends_with(".png")
-        || path_lower.ends_with(".webp")
-        || path_lower.contains(".jpg?")
-        || path_lower.contains(".jpeg?")
-        || path_lower.contains(".png?")
-        || path_lower.contains(".webp?")
-    {
-        return true;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_arbitrary_image_hosts() {
+        assert!(!is_allowed_external_media_url(
+            "https://evil.example/payload.png"
+        ));
+        assert!(!is_allowed_external_media_url("https://127.0.0.1/x.png"));
     }
 
-    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    let trusted = matches!(
-        host.as_str(),
-        "cdn.discordapp.com"
-            | "media.discordapp.net"
-            | "i.imgur.com"
-            | "media.tenor.com"
-            | "images.unsplash.com"
-            | "raw.githubusercontent.com"
-    );
-
-    trusted && parsed.path().split('/').any(|part| !part.is_empty())
+    #[test]
+    fn allows_known_cdn_hosts_with_path() {
+        assert!(is_allowed_external_media_url(
+            "https://media.giphy.com/media/abc/giphy.gif"
+        ));
+        assert!(is_allowed_external_media_url(
+            "https://i.imgur.com/abc.png"
+        ));
+        assert!(!is_allowed_external_media_url("https://i.imgur.com/"));
+        assert!(
+            !is_allowed_external_media_url(
+                "https://cdn.klovy.chat/attachments/dm/x/y.webp"
+            ),
+            "own CDN must not skip the attachment scan path"
+        );
+    }
 }

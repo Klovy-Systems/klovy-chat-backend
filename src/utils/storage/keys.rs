@@ -230,6 +230,20 @@ pub fn is_logical_message_path(path: &str) -> bool {
     is_attachment_key(path)
 }
 
+/// Keys Mongo may store for the same object: logical path, slash-prefixed, or CDN-wrapped.
+pub fn attachment_stored_url_aliases(path: &str, cdn_base: &str) -> Vec<String> {
+    let path = normalize_storage_key(path);
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let mut aliases = vec![path.clone(), format!("/{path}")];
+    let base = cdn_base.trim().trim_end_matches('/');
+    if base.starts_with("https://") || base.starts_with("http://") {
+        aliases.push(format!("{base}/{path}"));
+    }
+    aliases
+}
+
 fn attachment_is_inline_media(ext: &str) -> bool {
     matches!(
         ext,

@@ -14,6 +14,7 @@ use mongodb::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use crate::model::scan::ScanStatus;
+use crate::utils::storage::{attachment_stored_url_aliases, cdn_public_base_url};
 
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -473,9 +474,9 @@ impl Message {
     ) -> mongodb::error::Result<Vec<Message>> {
         use futures_util::TryStreamExt;
 
-        let with_slash = format!("/{file_path}");
+        let aliases = attachment_stored_url_aliases(file_path, &cdn_public_base_url());
         let filter = doc! {
-            "fileUrl": { "$in": [file_path, with_slash] },
+            "fileUrl": { "$in": aliases },
             "deleted": { "$ne": true },
         };
         let cursor = Self::collection(db).find(filter.clone()).await?;
