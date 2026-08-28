@@ -79,6 +79,10 @@ pub fn spawn_worker() {
         ),
     }
     tokio::spawn(async move {
+        match super::clamd::ping_clamd().await {
+            Ok(()) => log::info!("clamd ping ok"),
+            Err(err) => log::error!("clamd ping failed: {err}"),
+        }
         while let Some(job) = rx.recv().await {
             if !try_begin(&job.file_path) {
                 continue;

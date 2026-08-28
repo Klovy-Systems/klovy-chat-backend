@@ -47,7 +47,7 @@ jobs:
           sudo systemctl disable rust-backend.service || true
 
           echo "=== Building Docker Image & Starting Container ==="
-          docker compose up -d --build
+          docker compose --profile scan up -d --build
 
           echo "=== Cleaning up old Docker images ==="
           docker image prune -af

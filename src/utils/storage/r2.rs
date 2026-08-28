@@ -12,6 +12,7 @@ use std::env;
 use std::sync::OnceLock;
 
 use aws_credential_types::Credentials;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 
@@ -74,6 +75,19 @@ fn build_client() -> Result<Client, StorageError> {
 
 fn is_not_found(err: &str) -> bool {
     err.contains("NotFound") || err.contains("404") || err.contains("NoSuchKey")
+}
+
+/// AWS SDK Display for S3 404 is just `"service error"` — the real code is in Debug/metadata.
+fn is_missing_object(err: &(impl ProvideErrorMetadata + std::fmt::Debug)) -> bool {
+    match err.code() {
+        Some(code)
+            if code.eq_ignore_ascii_case("NotFound")
+                || code.eq_ignore_ascii_case("NoSuchKey") =>
+        {
+            true
+        }
+        _ => is_not_found(&format!("{err:?}")),
+    }
 }
 
 impl R2Storage {
@@ -194,11 +208,10 @@ impl R2Storage {
                 Ok(Some(aggregated.into_bytes().to_vec()))
             }
             Err(err) => {
-                let msg = err.to_string();
-                if is_not_found(&msg) {
+                if is_missing_object(&err) {
                     Ok(None)
                 } else {
-                    Err(StorageError::OperationFailed(format!("get {key}: {err}")))
+                    Err(StorageError::OperationFailed(format!("get {key}: {err:?}")))
                 }
             }
         }
@@ -272,11 +285,10 @@ impl R2Storage {
         {
             Ok(_) => Ok(()),
             Err(err) => {
-                let msg = err.to_string();
-                if is_not_found(&msg) {
+                if is_missing_object(&err) {
                     Ok(())
                 } else {
-                    Err(StorageError::OperationFailed(format!("delete {key}: {err}")))
+                    Err(StorageError::OperationFailed(format!("delete {key}: {err:?}")))
                 }
             }
         }
@@ -290,8 +302,12 @@ impl R2Storage {
         &self,
         logical_key: &str,
     ) -> Result<Option<u64>, StorageError> {
-        if let Some(len) = self.head_public_content_length(logical_key).await? {
-            return Ok(Some(len));
+        match self.head_public_content_length(logical_key).await {
+            Ok(Some(len)) => return Ok(Some(len)),
+            Ok(None) => {}
+            Err(err) => {
+                log::warn!("public HEAD {logical_key} failed, trying quarantine: {err}");
+            }
         }
         let object_key = self.quarantine_object_key(logical_key);
         self.head_bucket_key(&self.quarantine_bucket, &object_key)
@@ -309,11 +325,10 @@ impl R2Storage {
         {
             Ok(output) => Ok(output.content_length().map(|len| len as u64)),
             Err(err) => {
-                let msg = err.to_string();
-                if is_not_found(&msg) {
+                if is_missing_object(&err) {
                     Ok(None)
                 } else {
-                    Err(StorageError::OperationFailed(format!("head {key}: {err}")))
+                    Err(StorageError::OperationFailed(format!("head {key}: {err:?}")))
                 }
             }
         }
@@ -436,4 +451,17 @@ pub fn public_media_url(key: &str) -> String {
     let base = cdn_public_base_url().trim_end_matches('/').to_string();
     let normalized = key.trim_start_matches('/');
     format!("{base}/{normalized}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sdk_display_service_error_is_not_a_404() {
+        assert!(!is_not_found("service error"));
+        assert!(is_not_found("NotFound"));
+        assert!(is_not_found("NoSuchKey"));
+        assert!(is_not_found("code: NotFound, status: 404"));
+    }
 }

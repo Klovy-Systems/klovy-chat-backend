@@ -253,9 +253,16 @@ async fn attachment_stored_size_is_valid(
         }
     }
 
-            let actual = match storage().head_attachment_content_length(path).await {
+    let actual = match storage().head_attachment_content_length(path).await {
         Ok(Some(len)) => len,
-        _ => return false,
+        Ok(None) => {
+            log::warn!("attachment size check: object missing path={path}");
+            return false;
+        }
+        Err(err) => {
+            log::warn!("attachment size check: HEAD failed path={path}: {err}");
+            return false;
+        }
     };
 
     let max_bytes = if is_image {
@@ -318,6 +325,7 @@ pub async fn validate_message_attachment(
     send_context: Option<AttachmentSendContext>,
 ) -> bool {
     if !validate_message_file_url(user_id, file_url) {
+        log::warn!("attachment rejected INVALID_FILE reason=bad_url user={user_id} file={file_url:?}");
         return false;
     }
 
@@ -347,13 +355,16 @@ pub async fn validate_message_attachment(
 
             let path = url.trim().replace('\\', "/").trim_start_matches('/').to_string();
             if !is_attachment_key(&path) {
+                log::warn!("attachment rejected INVALID_FILE reason=not_attachment_key path={path}");
                 return false;
             }
 
             let Some(send_context) = send_context else {
+                log::warn!("attachment rejected INVALID_FILE reason=no_send_context path={path}");
                 return false;
             };
             if !attachment_matches_send_context(&path, user_id, &send_context) {
+                log::warn!("attachment rejected INVALID_FILE reason=context_mismatch path={path}");
                 return false;
             }
 
@@ -363,7 +374,10 @@ pub async fn validate_message_attachment(
 
             let pending = match PendingUpload::find_for_user_and_path(db, user_oid, &path).await {
                 Ok(Some(entry)) => entry,
-                _ => return false,
+                _ => {
+                    log::warn!("attachment rejected INVALID_FILE reason=no_pending path={path}");
+                    return false;
+                }
             };
 
             let context_ok = match send_context {
@@ -375,18 +389,25 @@ pub async fn validate_message_attachment(
                 }
             };
             if !context_ok {
+                log::warn!("attachment rejected INVALID_FILE reason=pending_context path={path}");
                 return false;
             }
 
             if pending.file_hash.is_empty() {
+                log::warn!("attachment rejected INVALID_FILE reason=empty_hash path={path}");
                 return false;
             }
 
             if !pending.scan_status.allows_send() {
+                log::warn!("attachment rejected INVALID_FILE reason=scan_blocked path={path}");
                 return false;
             }
 
             if !attachment_stored_size_is_valid(&path, file_size, Some(pending.file_size)).await {
+                log::warn!(
+                    "attachment rejected INVALID_FILE reason=size path={path} claimed={file_size:?} pending={}",
+                    pending.file_size
+                );
                 return false;
             }
 

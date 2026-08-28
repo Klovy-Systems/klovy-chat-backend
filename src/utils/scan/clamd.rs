@@ -100,6 +100,36 @@ pub async fn scan_bytes(data: &[u8]) -> Result<ClamVerdict, ClamError> {
     }
 }
 
+pub async fn ping_clamd() -> Result<(), ClamError> {
+    let Some(addr) = clamd_addr() else {
+        return Err(ClamError::Unavailable("CLAMAV_HOST not set".into()));
+    };
+    let ping = async {
+        let mut stream = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| ClamError::Unavailable(e.to_string()))?;
+        stream
+            .write_all(b"zPING\0")
+            .await
+            .map_err(|e| ClamError::Unavailable(e.to_string()))?;
+        let mut buf = Vec::new();
+        stream
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| ClamError::Unavailable(e.to_string()))?;
+        let response = String::from_utf8_lossy(&buf);
+        if response.to_ascii_lowercase().contains("pong") {
+            Ok(())
+        } else {
+            Err(ClamError::Protocol(response.trim().to_string()))
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), ping).await {
+        Ok(result) => result,
+        Err(_) => Err(ClamError::Unavailable("ping timed out".into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
