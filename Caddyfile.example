@@ -1,0 +1,291 @@
+# Example reverse proxy (Caddy).
+# Copy: cp Caddyfile.example Caddyfile
+# Replace app.example.com, ChatApp, and log paths before use.
+# Backend listens on :8080. This file binds :8081 in front of it.
+
+{
+	auto_https off
+	admin off
+
+	order rate_limit first
+
+	servers {
+		trusted_proxies static \
+			173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 \
+			141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 \
+			197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 \
+			104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 \
+			2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 \
+			2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32 \
+			127.0.0.1 0.0.0.0 ::1
+		trusted_proxies_strict
+		client_ip_headers CF-Connecting-IP X-Forwarded-For X-Real-IP
+
+		timeouts {
+			read_header 5s
+			read_body   60s
+			idle        120s
+		}
+
+		max_header_size 16KB
+	}
+}
+
+(proxy_headers) {
+	header_up Host              {host}
+	header_up X-Real-IP         {client_ip}
+	header_up X-Forwarded-For   {client_ip}
+	header_up X-Forwarded-Proto https
+	header_up X-Request-ID      {http.request.uuid}
+	header_up CF-Connecting-IP  {http.request.header.CF-Connecting-IP}
+	header_up CF-Visitor        {http.request.header.CF-Visitor}
+	header_up CF-Ray            {http.request.header.CF-Ray}
+	header_up -True-Client-IP
+}
+
+(reverse_http) {
+	reverse_proxy 0.0.0.0:8080 {
+		import proxy_headers
+
+		transport http {
+			versions                1.1
+			dial_timeout            5s
+			response_header_timeout 60s
+			read_timeout            65s
+			write_timeout           65s
+			keepalive               30s
+			keepalive_idle_conns    16
+		}
+	}
+}
+
+(reverse_ws) {
+	reverse_proxy 0.0.0.0:8080 {
+		import proxy_headers
+		header_up Connection {http.request.header.Connection}
+		header_up Upgrade    {http.request.header.Upgrade}
+
+		flush_interval -1
+
+		transport http {
+			versions      1.1
+			dial_timeout  5s
+			read_timeout  0
+			write_timeout 0
+		}
+	}
+}
+
+(error_json) {
+	header {
+		-Server
+		Content-Type                     application/json
+		Access-Control-Allow-Origin      "https://app.example.com"
+		Access-Control-Allow-Credentials "true"
+		Vary                             Origin
+		Strict-Transport-Security        "max-age=15552000; includeSubDomains"
+	}
+}
+
+:8081 {
+	bind 0.0.0.0
+
+	log {
+		output file /var/log/caddy/api.example.com.log {
+			roll_size     50mb
+			roll_keep     5
+			roll_keep_for 720h
+		}
+		format json
+	}
+
+	header {
+		defer
+		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		X-Robots-Tag noindex, nofollow, nosnippet
+		Referrer-Policy no-referrer
+		Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=(), usb=()"
+		Cross-Origin-Opener-Policy same-origin
+		X-Request-ID {http.request.uuid}
+		Vary Origin
+		Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+		Strict-Transport-Security "max-age=15552000; includeSubDomains"
+	}
+
+	@corsOrigin header Origin https://app.example.com
+	header @corsOrigin {
+		defer
+		Access-Control-Allow-Origin      "https://app.example.com"
+		Access-Control-Allow-Credentials "true"
+	}
+
+	@ws path /ws
+
+	@badWS {
+		path /ws
+		not header Upgrade *
+	}
+
+	@invalidMethod {
+		not method GET HEAD POST PUT PATCH DELETE OPTIONS
+	}
+
+	@probe path \
+		/.env /.env.* /.git* /.htaccess \
+		/wp-admin* /wp-login.php \
+		*.php *.asp *.aspx /xmlrpc.php \
+		/actuator* /server-status
+
+	@missingClient {
+		not method OPTIONS
+		not path / /api /api/ /ws
+		not path /api/security /api/security/*
+		not header X-App-Client ChatApp*
+	}
+
+	@wsNoClient {
+		path /ws
+		not query client=ChatApp
+	}
+
+	@readOnly {
+		not path /ws
+		method GET HEAD OPTIONS DELETE
+	}
+
+	@corsPreflight {
+		method OPTIONS
+		header Origin https://app.example.com
+	}
+
+	rate_limit {
+		log_key
+
+		zone ws_zone {
+			match {
+				path /ws
+			}
+			key         {client_ip}
+			events      15
+			window      10s
+			ipv6_prefix 64
+		}
+
+		zone api_zone {
+			match {
+				not path /ws
+				not method OPTIONS
+			}
+			key         {client_ip}
+			events      120
+			window      10s
+			ipv6_prefix 64
+		}
+
+		zone auth_zone {
+			match {
+				path /api/auth/login /api/auth/sign-in /api/auth/signin \
+				     /api/auth/login/2fa /api/auth/signup /api/auth/register
+				method POST
+			}
+			key         {client_ip}
+			events      10
+			window      1m
+			ipv6_prefix 64
+		}
+
+		zone refresh_zone {
+			match {
+				path /api/auth/refresh
+				method POST
+			}
+			key         {client_ip}
+			events      20
+			window      10s
+			ipv6_prefix 64
+		}
+
+		zone upload_zone {
+			match {
+				path /api/messages/upload* /api/messages/file \
+				     /api/message/upload* /api/message/file \
+				     /api/auth/add-profile-image /api/auth/profile-image /api/auth/avatar \
+				     /api/auth/add-profile-banner /api/auth/profile-banner /api/auth/banner \
+				     /api/channel/*/avatar /api/channels/*/avatar
+				method POST
+			}
+			key         {client_ip}
+			events      30
+			window      10s
+			ipv6_prefix 64
+		}
+	}
+
+	encode zstd gzip
+
+	route {
+		error @invalidMethod "Method not allowed" 405
+		error @probe         "Not found"          404
+		error @missingClient "Unsupported client" 400
+		error @wsNoClient    "Unsupported client" 400
+		error @badWS         "Unsupported client" 400
+
+		header @corsPreflight {
+			Access-Control-Allow-Origin      "https://app.example.com"
+			Access-Control-Allow-Credentials "true"
+			Access-Control-Allow-Methods     "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+			Access-Control-Allow-Headers     "Content-Type, Authorization, Accept, Accept-Language, Accept-Encoding, X-Requested-With, X-CSRF-Token, X-Client-Version, X-App-Client, X-App-User-Agent"
+			Access-Control-Max-Age           "86400"
+			Vary                             Origin
+		}
+		respond @corsPreflight 204
+
+		handle @ws {
+			request_body {
+				max_size 16KB
+			}
+			import reverse_ws
+		}
+
+		handle @readOnly {
+			request_body {
+				max_size 16KB
+			}
+			import reverse_http
+		}
+
+		handle {
+			request_body {
+				max_size 12MB
+			}
+			import reverse_http
+		}
+	}
+
+	handle_errors 400 {
+		import error_json
+		respond `{"error":"Unsupported client"}` 400
+	}
+
+	handle_errors 404 {
+		import error_json
+		respond `{"error":"Not found"}` 404
+	}
+
+	handle_errors 405 {
+		import error_json
+		respond `{"error":"Method not allowed"}` 405
+	}
+
+	handle_errors 429 {
+		import error_json
+		respond `{"error":"Too many requests"}` 429
+	}
+
+	handle_errors {
+		import error_json
+		respond `{"error":"Service unavailable"}`
+	}
+}

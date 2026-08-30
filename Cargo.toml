@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 default-run = "klovy-chat-server"
 description = "Klovy Chat Backend"
-license = "KCL"
+license-file = "LICENSE"
 autobins = false
 
 [lib]
