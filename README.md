@@ -1,4 +1,4 @@
-# klovy-chat-backend
+# backend
 
 [![License: Klovy](https://img.shields.io/badge/License-Klovy-blue.svg)](LICENSE)
 
@@ -20,10 +20,10 @@ Publiczny ruch wchodzi na Axum (CORS, proxy, limity). Wewnętrzne API i upgrade 
 
 | Repo | Rola |
 |------|------|
-| [klovy-chat-backend](https://github.com/Klovy-Systems/klovy-chat-backend) | API i WebSocket |
-| [klovy-chat-frontend](https://github.com/Klovy-Systems/klovy-chat-frontend) | Aplikacja web (`app.klovy.chat`) |
-| [klovy-chat-website](https://github.com/Klovy-Systems/klovy-chat-website) | Strona (`klovy.chat`) |
-| [klovy-chat-application](https://github.com/Klovy-Systems/klovy-chat-application) | Desktop (Tauri) |
+| [backend](https://github.com/klovy-chat/backend) | API i WebSocket |
+| [frontend](https://github.com/klovy-chat/frontend) | Aplikacja web (`app.klovy.chat`) |
+| [website](https://github.com/klovy-chat/website) | Strona (`klovy.chat`) |
+| [application](https://github.com/klovy-chat/application) | Desktop (Tauri) |
 
 ---
 
@@ -52,8 +52,8 @@ Publiczny ruch wchodzi na Axum (CORS, proxy, limity). Wewnętrzne API i upgrade 
 ## Uruchomienie lokalne
 
 ```bash
-git clone https://github.com/Klovy-Systems/klovy-chat-backend.git
-cd klovy-chat-backend
+git clone https://github.com/klovy-chat/backend.git
+cd backend
 cp .env.example .env
 ```
 
@@ -139,7 +139,7 @@ Na produkcji wymagane są m.in. HTTPS w `ORIGIN` i `FRONTEND_URL`, osobny bucket
 ## Struktura projektu
 
 ```
-klovy-chat-backend/
+backend/
 ├── src/
 │   ├── main.rs              # Start: dotenv, Mongo, R2, indeksy, bind
 │   ├── lib.rs               # Crate klovy_chat_server
@@ -167,7 +167,7 @@ Binarka: `klovy-chat-server`. Narzędzie migracji: `encrypt-old-messages`.
 
 Kod jest publiczny na [Klovy License](LICENSE). Issue i pull requesty są mile widziane.
 
-1. Zrób [fork](https://github.com/Klovy-Systems/klovy-chat-backend/fork)
+1. Zrób [fork](https://github.com/klovy-chat/backend/fork)
 2. Utwórz branch: `git checkout -b feature/opis-zmiany`
 3. Commit (bez `.env` i sekretów)
 4. Otwórz pull request do `main`
@@ -178,7 +178,7 @@ Opisz w PR **co** i **dlaczego**. Drobne poprawki (docs, typo) też są OK.
 
 ## Bezpieczeństwo
 
-Luki zgłaszaj prywatnie przez [GitHub Security Advisories](https://github.com/Klovy-Systems/klovy-chat-backend/security/advisories/new). Nie otwieraj publicznego issue z exploitami.
+Luki zgłaszaj prywatnie przez [GitHub Security Advisories](https://github.com/klovy-chat/backend/security/advisories/new). Nie otwieraj publicznego issue z exploitami.
 
 ---
 
@@ -186,4 +186,4 @@ Luki zgłaszaj prywatnie przez [GitHub Security Advisories](https://github.com/K
 
 Kod jest udostępniony na **[Klovy License](LICENSE)** — użycie osobiste, edukacyjne i niekomercyjne. Dystrybucja komercyjna, konkurencyjny komunikator oraz użycie marek Klovy wymagają pisemnej zgody Jakuba Maksymowicza. Zgłoszenie PR, błędu lub audytu bezpieczeństwa oznacza zgodę na warunki kontrybucji z licencji (pkt 7–11).
 
-© 2026 [Jakub Maksymowicz](https://github.com/Klovy-Systems)
+© 2026 [Jakub Maksymowicz](https://github.com/klovy-chat)
