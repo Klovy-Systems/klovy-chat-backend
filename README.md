@@ -4,7 +4,7 @@
 
 The official backend of Klovy Chat.
 
-Oficjalny serwer API i WebSocket komunikatora **Klovy Chat** (Klovy Systems). Napisany w Rust (Axum + Actix-web), z MongoDB Atlas, Cloudflare R2 i skanowaniem załączników ClamAV.
+Oficjalny serwer API i WebSocket komunikatora **Klovy Chat**. Napisany w Rust (Axum + Actix-web), z MongoDB Atlas, Cloudflare R2 i skanowaniem załączników ClamAV.
 
 Produkcja: [api.klovy.chat](https://api.klovy.chat)
 
@@ -186,4 +186,4 @@ Luki zgłaszaj prywatnie przez [GitHub Security Advisories](https://github.com/k
 
 Kod jest udostępniony na **[Klovy License](LICENSE)** — użycie osobiste, edukacyjne i niekomercyjne. Dystrybucja komercyjna, konkurencyjny komunikator oraz użycie marek Klovy wymagają pisemnej zgody Jakuba Maksymowicza. Zgłoszenie PR, błędu lub audytu bezpieczeństwa oznacza zgodę na warunki kontrybucji z licencji (pkt 7–11).
 
-© 2026 [Jakub Maksymowicz](https://github.com/klovy-chat)
+© 2026 [Jakub Maksymowicz](https://github.com/Klovy06)
