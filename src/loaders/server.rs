@@ -608,6 +608,16 @@ pub async fn run_server() -> std::io::Result<()> {
             .map(|info| info.0);
         let client_ip = crate::utils::ip::client_ip_from_headers(&parts.headers, peer);
 
+        if !crate::utils::security::transport::is_secure_client_connection(&parts.headers) {
+            log::warn!(
+                "HTTP request rejected — insecure transport (require HTTPS in production) path={path} ip={client_ip}"
+            );
+            return Ok(proxy_json(
+                http::StatusCode::FORBIDDEN,
+                r#"{"error":"Secure connection required"}"#.to_string(),
+            ));
+        }
+
         if ip_block.is_blocked(&client_ip) {
             return Ok(proxy_json(
                 http::StatusCode::FORBIDDEN,
