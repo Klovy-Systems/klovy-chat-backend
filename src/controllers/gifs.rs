@@ -156,7 +156,7 @@ pub async fn search_gifs(query: web::Query<GifQuery>) -> HttpResponse {
     }
 
     let limit = parse_limit(&query.limit);
-    let lang = normalize_language(query.lang.as_deref().unwrap_or("pl"));
+    let lang = normalize_language(query.lang.as_deref().unwrap_or("en"));
     let params = vec![
         ("api_key", key),
         ("q", q),

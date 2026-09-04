@@ -35,13 +35,13 @@ impl Default for AvailabilityStatus {
 }
 
 fn default_language() -> String {
-    "pl".to_string()
+    "en".to_string()
 }
 
 pub fn normalize_language(lang: &str) -> String {
     match lang.trim().to_lowercase().as_str() {
-        "en" => "en".to_string(),
-        _ => "pl".to_string(),
+        "pl" => "pl".to_string(),
+        _ => "en".to_string(),
     }
 }
 

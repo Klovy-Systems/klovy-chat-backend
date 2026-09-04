@@ -160,7 +160,7 @@ pub async fn search_stickers(query: web::Query<StickerQuery>) -> HttpResponse {
     }
 
     let limit = parse_limit(&query.limit);
-    let lang = normalize_language(query.lang.as_deref().unwrap_or("pl"));
+    let lang = normalize_language(query.lang.as_deref().unwrap_or("en"));
     let params = vec![
         ("api_key", key),
         ("q", q),

@@ -1605,7 +1605,7 @@ pub async fn update_language(req: HttpRequest, body: web::Json<UpdateLanguageBod
         return HttpResponse::NotFound().body("User not found.");
     };
 
-    let language = normalize_language(body.language.as_deref().unwrap_or("pl"));
+    let language = normalize_language(body.language.as_deref().unwrap_or("en"));
     let set = doc! { "language": &language };
 
     let db = get_db();
